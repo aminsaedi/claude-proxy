@@ -5,3 +5,7 @@ services:
       - "8080:8080"
     env_file:
       - .env
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "1"
