@@ -3,8 +3,11 @@ services:
     build: .
     ports:
       - "127.0.0.1:8181:8080"
+      - "${TAILSCALE_IP}:8182:8090"
     env_file:
       - .env
+    volumes:
+      - ./tokens.yaml:/app/tokens.yaml:ro
     logging:
       options:
         max-size: "10m"
