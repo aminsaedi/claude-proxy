@@ -178,17 +178,29 @@ def _update_util_gauges(token_name: str, headers: dict[str, str]) -> None:
 # ---------------------------------------------------------------------------
 
 async def _probe_token(name: str, token: str) -> bool:
-    """GET /v1/models with a 10s timeout. Returns True on HTTP 2xx."""
+    """POST /v1/messages with a minimal 10-token request.
+    Updates _token_headers and utilization gauges from the response headers."""
     try:
-        async with httpx.AsyncClient(timeout=10.0) as c:
-            resp = await c.get(
-                "https://api.anthropic.com/v1/models",
+        async with httpx.AsyncClient(timeout=30.0) as c:
+            resp = await c.post(
+                "https://api.anthropic.com/v1/messages",
                 headers={
                     "authorization": f"Bearer {token}",
                     "anthropic-beta": "oauth-2025-04-20",
                     "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                },
+                json={
+                    "model": "claude-haiku-4-5-20251001",
+                    "max_tokens": 10,
+                    "messages": [{"role": "user", "content": "Say hi"}],
                 },
             )
+        # Capture rate-limit headers regardless of status so utilization is always fresh
+        rl = {k: v for k, v in resp.headers.items() if k.startswith("anthropic-")}
+        if rl:
+            _token_headers[name] = rl
+            _update_util_gauges(name, rl)
         if 200 <= resp.status_code < 300:
             return True
         log.warning("Health probe %s: HTTP %d", name, resp.status_code)
