@@ -1,0 +1,6 @@
+tokens:
+  - name: personal
+    token: "sk-ant-oat-..."
+    default: true
+  - name: work
+    token: "sk-ant-oat-..."

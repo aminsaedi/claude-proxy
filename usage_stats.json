@@ -1,0 +1,67 @@
+{
+  "default": {
+    "claude-sonnet-4-6": {
+      "input_tokens": 77,
+      "output_tokens": 18847,
+      "requests": 59
+    },
+    "claude-haiku-4-5-20251001": {
+      "input_tokens": 1089,
+      "output_tokens": 48,
+      "requests": 3
+    }
+  },
+  "intel-mac": {
+    "claude-haiku-4-5-20251001": {
+      "input_tokens": 34666,
+      "output_tokens": 1799,
+      "requests": 10
+    },
+    "claude-sonnet-4-6": {
+      "input_tokens": 325,
+      "output_tokens": 38730,
+      "requests": 182
+    },
+    "claude-opus-4-6": {
+      "input_tokens": 48,
+      "output_tokens": 4248,
+      "requests": 28
+    }
+  },
+  "ircc": {
+    "claude-haiku-4-5-20251001": {
+      "input_tokens": 182533,
+      "output_tokens": 169908,
+      "requests": 474
+    },
+    "claude-sonnet-4-6": {
+      "input_tokens": 9132,
+      "output_tokens": 573023,
+      "requests": 1684
+    },
+    "claude-opus-4-6": {
+      "input_tokens": 120,
+      "output_tokens": 39099,
+      "requests": 74
+    }
+  },
+  "openclaw": {
+    "claude-opus-4-6": {
+      "input_tokens": 147,
+      "output_tokens": 3370,
+      "requests": 59
+    }
+  },
+  "omid": {
+    "claude-haiku-4-5-20251001": {
+      "input_tokens": 689,
+      "output_tokens": 26,
+      "requests": 2
+    },
+    "claude-sonnet-4-6": {
+      "input_tokens": 68,
+      "output_tokens": 65638,
+      "requests": 50
+    }
+  }
+}

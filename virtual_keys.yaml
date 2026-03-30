@@ -1,0 +1,22 @@
+# Named virtual API keys for the Claude proxy.
+# Clients authenticate with these keys.
+# This file is gitignored — never commit it.
+#
+# Example:
+#   virtual_keys:
+#     - name: my-laptop
+#       key: some-random-string
+#     - name: ci-runner
+#       key: another-random-string
+
+virtual_keys:
+  - name: default
+    key: YYFY68wn0QsmsvEdPQGE1uEu0QkwP0LHdCW-l-SNDm7BfxG4-yfwgtYRolYSpKsF
+  - name: intel-mac
+    key: mg-RWiSyMFc1IyvNy3mAsSpkzibkF7xiTpSxZ4vIJVtAXGv5ro8Sa97eMu1C8riB
+  - name: ircc
+    key: RpkyatsyiUcYKg3MmwMII9MTJlyI35MOV-SW9KuKlTVBXhawHNvFQ52eBK6xP7pz
+  - name: openclaw
+    key: sk-ant-oat01-SjUimKuNoXbIDW25To9E7WBVw24FNQ46EnNVuNrHGs4cVUyi
+  - name: omid
+    key: sk-proxy-_y6B23y2KUxJ2cEz0zQnDX0B0nopAmtM_SJJFnIn1rYaS8fX6_9H9yafJd0DsSAK

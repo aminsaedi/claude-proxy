@@ -8,6 +8,8 @@ services:
       - .env
     volumes:
       - ./tokens.yaml:/app/tokens.yaml:ro
+      - ./virtual_keys.yaml:/app/virtual_keys.yaml:ro
+      - ./usage_stats.json:/app/usage_stats.json
     logging:
       options:
         max-size: "10m"
