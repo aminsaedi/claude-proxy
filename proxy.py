@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -20,6 +21,56 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("proxy")
+
+
+# ---------------------------------------------------------------------------
+# Persistent configuration
+# ---------------------------------------------------------------------------
+
+CONFIG_FILE = Path(__file__).parent / "config.yaml"
+
+DEFAULT_CONFIG: dict = {
+    "auto_rotation": {
+        "enabled": False,
+        "threshold_5h": 0.95,
+        "target_max_util_5h": 0.50,
+        "check_interval_seconds": 30,
+        "probe_before_switch": True,
+        "cooldown_seconds": 120,
+        "notify_only": False,
+    },
+    "health_probe_interval_seconds": 60,
+    "active_probe_interval_seconds": 300,
+    "upstream_timeout_seconds": 600,
+}
+
+
+def load_config() -> dict:
+    cfg = copy.deepcopy(DEFAULT_CONFIG)
+    if CONFIG_FILE.exists():
+        try:
+            data = yaml.safe_load(CONFIG_FILE.read_text()) or {}
+            for k, v in data.items():
+                if isinstance(v, dict) and k in cfg and isinstance(cfg[k], dict):
+                    cfg[k].update(v)
+                else:
+                    cfg[k] = v
+        except Exception as e:
+            log.warning("Failed to load config.yaml: %s — using defaults", e)
+    else:
+        save_config(cfg)
+    return cfg
+
+
+def save_config(cfg: dict) -> None:
+    try:
+        CONFIG_FILE.write_text(yaml.dump(cfg, default_flow_style=False, sort_keys=False))
+    except Exception as e:
+        log.warning("Failed to save config.yaml: %s", e)
+
+
+_config: dict = load_config()
+log.info("Config loaded: auto_rotation.enabled=%s", _config["auto_rotation"]["enabled"])
 
 
 # ---------------------------------------------------------------------------
@@ -53,7 +104,8 @@ _token_health: dict[str, dict] = {
     for name in TOKENS
 }
 
-HEALTH_PROBE_INTERVAL = int(os.environ.get("HEALTH_PROBE_INTERVAL_SECONDS", "60"))
+_last_rotation_time: float = 0.0
+_rotation_log: list[dict] = []
 
 
 def active_token() -> str:
@@ -156,6 +208,9 @@ PROM_TOKEN_HEALTHY = Gauge(
     "proxy_token_healthy", "Whether an upstream OAuth token is healthy (1=healthy, 0=unhealthy)",
     ["token_name"],
 )
+PROM_AUTO_ROTATIONS = Counter(
+    "proxy_auto_rotations_total", "Number of automatic token rotations performed",
+)
 # All tokens assumed healthy at startup
 for _n in TOKENS:
     PROM_TOKEN_HEALTHY.labels(token_name=_n).set(1)
@@ -224,7 +279,7 @@ async def start_health_probes() -> None:
                     _token_health[name]["error_count"] = 0
                     PROM_TOKEN_HEALTHY.labels(token_name=name).set(1)
                     log.info("Token %s recovered (health probe passed)", name)
-        await asyncio.sleep(HEALTH_PROBE_INTERVAL)
+        await asyncio.sleep(_config["health_probe_interval_seconds"])
 
 
 async def start_legacy_token_probe() -> None:
@@ -252,7 +307,98 @@ async def start_legacy_token_probe() -> None:
                 "Active token %s health probe FAILED (consecutive failures: %d)",
                 name, h["error_count"],
             )
-        await asyncio.sleep(300)  # 5 minutes
+        await asyncio.sleep(_config["active_probe_interval_seconds"])
+
+
+# ---------------------------------------------------------------------------
+# Auto-rotation — switch to next token when 5h utilization is high
+# ---------------------------------------------------------------------------
+
+async def _find_rotation_candidate(cfg: dict) -> str | None:
+    """Find a healthy token with 5h utilization below the target threshold."""
+    token_names = list(TOKENS.keys())
+    if len(token_names) < 2:
+        return None
+    current_idx = token_names.index(_active)
+    for i in range(1, len(token_names)):
+        name = token_names[(current_idx + i) % len(token_names)]
+        # Skip unhealthy tokens unless we'll probe anyway
+        if not cfg.get("probe_before_switch") and not _token_health[name]["healthy"]:
+            continue
+        if cfg.get("probe_before_switch"):
+            ok = await _probe_token(name, TOKENS[name])
+            h = _token_health[name]
+            h["last_checked"] = time.time()
+            if ok:
+                h["healthy"] = True
+                h["error_count"] = 0
+                PROM_TOKEN_HEALTHY.labels(token_name=name).set(1)
+            else:
+                h["error_count"] += 1
+                h["healthy"] = False
+                PROM_TOKEN_HEALTHY.labels(token_name=name).set(0)
+                continue
+        # Check candidate's 5h utilization
+        target_headers = _token_headers.get(name, {})
+        target_util_str = target_headers.get("anthropic-ratelimit-unified-5h-utilization")
+        if target_util_str is not None:
+            if float(target_util_str) < cfg.get("target_max_util_5h", 0.5):
+                return name
+        elif cfg.get("probe_before_switch"):
+            # Probed OK but no util data yet — treat as fresh
+            return name
+    return None
+
+
+async def auto_rotation_task() -> None:
+    """Background task: when the active token's 5h utilization exceeds the
+    configured threshold, probe candidates and switch to one with capacity."""
+    global _active, _last_rotation_time
+    await asyncio.sleep(20)  # let startup settle
+    while True:
+        cfg = _config["auto_rotation"]
+        interval = max(cfg.get("check_interval_seconds", 30), 5)
+        if cfg.get("enabled"):
+            current_headers = _token_headers.get(_active, {})
+            util_str = current_headers.get("anthropic-ratelimit-unified-5h-utilization")
+            if util_str is not None:
+                util = float(util_str)
+                if util >= cfg["threshold_5h"]:
+                    now = time.time()
+                    if now - _last_rotation_time >= cfg.get("cooldown_seconds", 120):
+                        candidate = await _find_rotation_candidate(cfg)
+                        if candidate:
+                            event = {
+                                "time": now,
+                                "from": _active,
+                                "to": candidate,
+                                "trigger_util_5h": util,
+                            }
+                            if cfg.get("notify_only"):
+                                log.warning(
+                                    "AUTO-ROTATE (notify-only): would switch %s -> %s (5h util: %.1f%%)",
+                                    _active, candidate, util * 100,
+                                )
+                                event["action"] = "notify_only"
+                            else:
+                                old = _active
+                                _active = candidate
+                                _last_rotation_time = now
+                                PROM_AUTO_ROTATIONS.inc()
+                                log.warning(
+                                    "AUTO-ROTATE: switched %s -> %s (5h util: %.1f%%)",
+                                    old, candidate, util * 100,
+                                )
+                                event["action"] = "switched"
+                            _rotation_log.append(event)
+                            if len(_rotation_log) > 50:
+                                _rotation_log[:] = _rotation_log[-50:]
+                        else:
+                            log.warning(
+                                "AUTO-ROTATE: threshold reached (%.1f%%) but no suitable candidate",
+                                util * 100,
+                            )
+        await asyncio.sleep(interval)
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +406,10 @@ async def start_legacy_token_probe() -> None:
 # ---------------------------------------------------------------------------
 
 UPSTREAM = "https://api.anthropic.com"
-client = httpx.AsyncClient(base_url=UPSTREAM, timeout=httpx.Timeout(600.0))
+client = httpx.AsyncClient(
+    base_url=UPSTREAM,
+    timeout=httpx.Timeout(float(_config.get("upstream_timeout_seconds", 600))),
+)
 
 app = FastAPI()
 
@@ -542,6 +691,45 @@ summary:hover { color: #71717a; }
 .metrics-link { font-size: 0.8rem; color: #52525b; text-align: center; }
 .metrics-link a { color: #7c3aed; text-decoration: none; }
 .metrics-link a:hover { text-decoration: underline; }
+
+/* ── Config form ── */
+.config-group { margin-bottom: 18px; }
+.config-group-title { font-size: 0.78rem; font-weight: 700; color: #71717a; margin-bottom: 10px; text-transform: uppercase; letter-spacing: .05em; }
+.config-row { display: flex; align-items: center; justify-content: space-between; padding: 9px 0; border-bottom: 1px solid #1f1f23; gap: 12px; }
+.config-row:last-child { border-bottom: none; }
+.config-label { font-size: 0.82rem; color: #a1a1aa; }
+.config-hint { font-size: 0.7rem; color: #52525b; margin-top: 2px; }
+.config-input {
+  background: #09090b; border: 1px solid #3f3f46; border-radius: 6px;
+  color: #e4e4e7; font-size: 0.82rem; padding: 5px 10px; width: 80px;
+  text-align: right; font-variant-numeric: tabular-nums;
+}
+.config-input:focus { border-color: #7c3aed; outline: none; }
+.toggle { position: relative; width: 40px; height: 22px; flex-shrink: 0; }
+.toggle input { opacity: 0; width: 0; height: 0; position: absolute; }
+.toggle-slider {
+  position: absolute; inset: 0; background: #3f3f46; border-radius: 99px;
+  cursor: pointer; transition: background .2s;
+}
+.toggle-slider::before {
+  content: ""; position: absolute; left: 3px; top: 3px;
+  width: 16px; height: 16px; border-radius: 50%;
+  background: #71717a; transition: transform .2s, background .2s;
+}
+.toggle input:checked + .toggle-slider { background: #7c3aed; }
+.toggle input:checked + .toggle-slider::before { transform: translateX(18px); background: #fff; }
+.save-btn {
+  background: #7c3aed; color: #fff; border: none; border-radius: 8px;
+  padding: 9px 24px; font-size: 0.85rem; font-weight: 600;
+  cursor: pointer; transition: background .15s; margin-top: 14px;
+}
+.save-btn:hover { background: #6d28d9; }
+.save-btn:disabled { opacity: 0.5; cursor: default; }
+.rotation-entry { padding: 5px 0; border-bottom: 1px solid #1f1f23; font-size: 0.76rem; color: #a1a1aa; }
+.rotation-entry:last-child { border-bottom: none; }
+.rotation-action { font-weight: 600; }
+.rotation-action.switched { color: #4ade80; }
+.rotation-action.notify { color: #fbbf24; }
 </style>
 </head>
 <body>
@@ -566,10 +754,23 @@ summary:hover { color: #71717a; }
     <div id="vkey-list"></div>
   </div>
 
+  <!-- Settings -->
+  <div class="card">
+    <div class="section-title">Settings</div>
+    <div id="config-form"></div>
+    <div class="feedback" id="config-fb"></div>
+  </div>
+
+  <!-- Auto-rotation log -->
+  <div class="card" id="rotation-log-card" style="display:none">
+    <div class="section-title">Auto-Rotation Log</div>
+    <div id="rotation-log"></div>
+  </div>
+
   <div class="metrics-link">Prometheus metrics available at <a href="/metrics" target="_blank">/metrics</a></div>
 </div>
 <script>
-let state = { tokens: [], active: "", headers: {}, health: {}, virtual_keys: [] };
+let state = { tokens: [], active: "", headers: {}, health: {}, virtual_keys: [], config: {}, rotation_log: [] };
 
 async function init() {
   await refresh();
@@ -762,6 +963,102 @@ function renderVirtualKeys() {
 function render() {
   renderOAuthTokens();
   renderVirtualKeys();
+  renderConfig();
+  renderRotationLog();
+}
+
+/* ── Config form ── */
+function cfgToggle(id, label, val, hint) {
+  return `<div class="config-row">
+    <div><div class="config-label">${label}</div>${hint ? `<div class="config-hint">${hint}</div>` : ""}</div>
+    <label class="toggle"><input type="checkbox" id="${id}" ${val ? "checked" : ""}><span class="toggle-slider"></span></label>
+  </div>`;
+}
+function cfgNum(id, label, val, hint, unit) {
+  return `<div class="config-row">
+    <div><div class="config-label">${label}</div>${hint ? `<div class="config-hint">${hint}</div>` : ""}</div>
+    <div style="display:flex;align-items:center;gap:6px">
+      <input type="number" class="config-input" id="${id}" value="${val}" step="any" min="0">
+      ${unit ? `<span style="font-size:0.75rem;color:#52525b">${unit}</span>` : ""}
+    </div>
+  </div>`;
+}
+
+function renderConfig() {
+  const cfg = state.config || {};
+  const ar = cfg.auto_rotation || {};
+  document.getElementById("config-form").innerHTML = `
+    <div class="config-group">
+      <div class="config-group-title">Auto-Rotation</div>
+      ${cfgToggle("ar-enabled", "Enabled", ar.enabled, "Automatically switch tokens when 5h utilization is high")}
+      ${cfgNum("ar-threshold", "Threshold (5h)", ar.threshold_5h, "Trigger when active token 5h util &ge; this (0.0 &ndash; 1.0)", "")}
+      ${cfgNum("ar-target-max", "Target max util (5h)", ar.target_max_util_5h, "Only switch to tokens below this utilization", "")}
+      ${cfgNum("ar-interval", "Check interval", ar.check_interval_seconds, "How often to evaluate utilization", "sec")}
+      ${cfgToggle("ar-probe", "Probe before switch", ar.probe_before_switch, "Health-check candidate token before switching")}
+      ${cfgNum("ar-cooldown", "Cooldown", ar.cooldown_seconds, "Minimum time between auto-rotations", "sec")}
+      ${cfgToggle("ar-notify", "Notify only", ar.notify_only, "Log events without actually switching")}
+    </div>
+    <div class="config-group">
+      <div class="config-group-title">General</div>
+      ${cfgNum("cfg-health-int", "Health probe interval", cfg.health_probe_interval_seconds, "Re-probe unhealthy tokens", "sec")}
+      ${cfgNum("cfg-active-int", "Active probe interval", cfg.active_probe_interval_seconds, "Validate active token periodically", "sec")}
+      ${cfgNum("cfg-timeout", "Upstream timeout", cfg.upstream_timeout_seconds, "HTTP timeout for API calls (restart required)", "sec")}
+    </div>
+    <button class="save-btn" id="save-cfg-btn" onclick="saveConfig()">Save Settings</button>
+  `;
+}
+
+function renderRotationLog() {
+  const logs = state.rotation_log || [];
+  const card = document.getElementById("rotation-log-card");
+  if (logs.length === 0) { card.style.display = "none"; return; }
+  card.style.display = "";
+  document.getElementById("rotation-log").innerHTML = logs.slice().reverse().map(e => {
+    const d = new Date(e.time * 1000);
+    const ts = d.toLocaleString();
+    const isSwitched = e.action === "switched";
+    const cls = isSwitched ? "switched" : "notify";
+    const label = isSwitched ? "Switched" : "Would switch";
+    return `<div class="rotation-entry">${ts} &mdash; <span class="rotation-action ${cls}">${label}</span> <b>${e.from}</b> &rarr; <b>${e.to}</b> (5h: ${(e.trigger_util_5h * 100).toFixed(1)}%)</div>`;
+  }).join("");
+}
+
+async function saveConfig() {
+  const btn = document.getElementById("save-cfg-btn");
+  btn.disabled = true; btn.textContent = "Saving\u2026";
+  const cfg = {
+    auto_rotation: {
+      enabled: document.getElementById("ar-enabled").checked,
+      threshold_5h: parseFloat(document.getElementById("ar-threshold").value),
+      target_max_util_5h: parseFloat(document.getElementById("ar-target-max").value),
+      check_interval_seconds: parseInt(document.getElementById("ar-interval").value),
+      probe_before_switch: document.getElementById("ar-probe").checked,
+      cooldown_seconds: parseInt(document.getElementById("ar-cooldown").value),
+      notify_only: document.getElementById("ar-notify").checked,
+    },
+    health_probe_interval_seconds: parseInt(document.getElementById("cfg-health-int").value),
+    active_probe_interval_seconds: parseInt(document.getElementById("cfg-active-int").value),
+    upstream_timeout_seconds: parseInt(document.getElementById("cfg-timeout").value),
+  };
+  const fb = document.getElementById("config-fb");
+  try {
+    const r = await fetch("/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(cfg),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || r.statusText);
+    state.config = data.config || cfg;
+    fb.textContent = "Settings saved";
+    fb.className = "feedback ok";
+  } catch (e) {
+    fb.textContent = `Error: ${e.message}`;
+    fb.className = "feedback err";
+  } finally {
+    btn.disabled = false; btn.textContent = "Save Settings";
+  }
+  setTimeout(() => { fb.className = "feedback"; }, 3000);
 }
 
 async function probe(name) {
@@ -837,6 +1134,8 @@ async def admin_state():
             {"name": name, "usage": _usage_stats.get(name, {})}
             for name in VIRTUAL_KEYS
         ],
+        "config": _config,
+        "rotation_log": _rotation_log,
     })
 
 
@@ -873,6 +1172,47 @@ async def admin_select(request: Request):
     return JSONResponse({"active": _active})
 
 
+@admin_app.get("/config")
+async def admin_get_config():
+    return JSONResponse(_config)
+
+
+@admin_app.post("/config")
+async def admin_set_config(request: Request):
+    global _config
+    body = await request.json()
+    new_cfg = copy.deepcopy(_config)
+    # Merge auto_rotation sub-dict
+    ar = body.get("auto_rotation")
+    if isinstance(ar, dict):
+        new_cfg["auto_rotation"].update(ar)
+    # Merge top-level scalar keys
+    for k in ("health_probe_interval_seconds", "active_probe_interval_seconds",
+              "upstream_timeout_seconds"):
+        if k in body:
+            new_cfg[k] = body[k]
+    # Validate
+    a = new_cfg["auto_rotation"]
+    if not (0 <= a["threshold_5h"] <= 1):
+        return JSONResponse(status_code=400, content={"error": "threshold_5h must be 0.0-1.0"})
+    if not (0 <= a["target_max_util_5h"] <= 1):
+        return JSONResponse(status_code=400, content={"error": "target_max_util_5h must be 0.0-1.0"})
+    if a["check_interval_seconds"] < 5:
+        return JSONResponse(status_code=400, content={"error": "check_interval_seconds must be >= 5"})
+    if a["cooldown_seconds"] < 0:
+        return JSONResponse(status_code=400, content={"error": "cooldown_seconds must be >= 0"})
+    if new_cfg["health_probe_interval_seconds"] < 10:
+        return JSONResponse(status_code=400, content={"error": "health_probe_interval_seconds must be >= 10"})
+    if new_cfg["active_probe_interval_seconds"] < 30:
+        return JSONResponse(status_code=400, content={"error": "active_probe_interval_seconds must be >= 30"})
+    if new_cfg["upstream_timeout_seconds"] < 10:
+        return JSONResponse(status_code=400, content={"error": "upstream_timeout_seconds must be >= 10"})
+    _config = new_cfg
+    save_config(_config)
+    log.info("Config updated via admin API")
+    return JSONResponse({"ok": True, "config": _config})
+
+
 @admin_app.get("/metrics")
 async def admin_metrics():
     return Response(generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)
@@ -894,6 +1234,7 @@ async def _main():
         admin_srv.serve(),
         start_health_probes(),
         start_legacy_token_probe(),
+        auto_rotation_task(),
     )
 
 
