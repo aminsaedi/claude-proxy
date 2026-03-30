@@ -48,6 +48,12 @@ def load_tokens() -> tuple[dict[str, str], str]:
 TOKENS: dict[str, str]
 TOKENS, _active = load_tokens()
 _token_headers: dict[str, dict[str, str]] = {name: {} for name in TOKENS}
+_token_health: dict[str, dict] = {
+    name: {"healthy": True, "error_count": 0, "last_checked": 0.0}
+    for name in TOKENS
+}
+
+HEALTH_PROBE_INTERVAL = int(os.environ.get("HEALTH_PROBE_INTERVAL_SECONDS", "60"))
 
 
 def active_token() -> str:
@@ -146,6 +152,13 @@ PROM_UPSTREAM_UTIL_7D = Gauge(
     "proxy_upstream_utilization_7d_ratio", "Upstream OAuth token 7-day utilization ratio",
     ["token_name"],
 )
+PROM_TOKEN_HEALTHY = Gauge(
+    "proxy_token_healthy", "Whether an upstream OAuth token is healthy (1=healthy, 0=unhealthy)",
+    ["token_name"],
+)
+# All tokens assumed healthy at startup
+for _n in TOKENS:
+    PROM_TOKEN_HEALTHY.labels(token_name=_n).set(1)
 
 
 def _update_util_gauges(token_name: str, headers: dict[str, str]) -> None:
@@ -158,6 +171,76 @@ def _update_util_gauges(token_name: str, headers: dict[str, str]) -> None:
             PROM_UPSTREAM_UTIL_7D.labels(token_name=token_name).set(float(u7d))
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Health probes
+# ---------------------------------------------------------------------------
+
+async def _probe_token(name: str, token: str) -> bool:
+    """GET /v1/models with a 10s timeout. Returns True on HTTP 2xx."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as c:
+            resp = await c.get(
+                "https://api.anthropic.com/v1/models",
+                headers={
+                    "authorization": f"Bearer {token}",
+                    "anthropic-beta": "oauth-2025-04-20",
+                    "anthropic-version": "2023-06-01",
+                },
+            )
+        if 200 <= resp.status_code < 300:
+            return True
+        log.warning("Health probe %s: HTTP %d", name, resp.status_code)
+        return False
+    except Exception as e:
+        log.warning("Health probe %s error: %s", name, e)
+        return False
+
+
+async def start_health_probes() -> None:
+    """Every HEALTH_PROBE_INTERVAL seconds, probe tokens that are marked unhealthy so they
+    can recover.  Healthy tokens are skipped to avoid unnecessary upstream traffic."""
+    await asyncio.sleep(15)  # wait for startup to settle
+    while True:
+        for name, token in list(TOKENS.items()):
+            if not _token_health[name]["healthy"]:
+                ok = await _probe_token(name, token)
+                _token_health[name]["last_checked"] = time.time()
+                if ok:
+                    _token_health[name]["healthy"] = True
+                    _token_health[name]["error_count"] = 0
+                    PROM_TOKEN_HEALTHY.labels(token_name=name).set(1)
+                    log.info("Token %s recovered (health probe passed)", name)
+        await asyncio.sleep(HEALTH_PROBE_INTERVAL)
+
+
+async def start_legacy_token_probe() -> None:
+    """Every 5 minutes, validate the currently-active token regardless of its health state.
+    Updates anthropic_token_healthy Prometheus metric and logs warnings on failure."""
+    await asyncio.sleep(30)  # brief startup delay
+    while True:
+        name = _active
+        token = TOKENS[name]
+        ok = await _probe_token(name, token)
+        h = _token_health[name]
+        h["last_checked"] = time.time()
+        if ok:
+            was_unhealthy = not h["healthy"]
+            h["healthy"] = True
+            h["error_count"] = 0
+            PROM_TOKEN_HEALTHY.labels(token_name=name).set(1)
+            if was_unhealthy:
+                log.info("Active token %s is now healthy", name)
+        else:
+            h["error_count"] += 1
+            h["healthy"] = False
+            PROM_TOKEN_HEALTHY.labels(token_name=name).set(0)
+            log.warning(
+                "Active token %s health probe FAILED (consecutive failures: %d)",
+                name, h["error_count"],
+            )
+        await asyncio.sleep(300)  # 5 minutes
 
 
 # ---------------------------------------------------------------------------
@@ -379,6 +462,8 @@ body {
 .badge-warning  { background: #78350f33; color: #fbbf24; }
 .badge-rejected { background: #7f1d1d33; color: #f87171; }
 .badge-nodata   { background: #27272a;   color: #52525b; }
+.badge-healthy   { background: #052e1633; color: #4ade80; }
+.badge-unhealthy { background: #450a0a33; color: #f87171; }
 .token-body { padding: 16px 18px 14px; background: #0d0d10; border-top: 1px solid #27272a; display: flex; flex-direction: column; gap: 12px; }
 .usage-row { display: flex; flex-direction: column; gap: 5px; }
 .usage-label-row { display: flex; align-items: center; gap: 8px; font-size: 0.78rem; }
@@ -432,6 +517,15 @@ summary:hover { color: #71717a; }
 .feedback.ok  { background: #052e16; color: #4ade80; border: 1px solid #14532d; display: block; }
 .feedback.err { background: #450a0a; color: #f87171; border: 1px solid #7f1d1d; display: block; }
 
+/* ── Probe button ── */
+.probe-btn {
+  font-size: 0.7rem; padding: 2px 9px; border-radius: 6px; border: 1px solid #3f3f46;
+  background: #27272a; color: #a1a1aa; cursor: pointer; font-weight: 600;
+  transition: background .15s, color .15s;
+}
+.probe-btn:hover:not(:disabled) { background: #3f3f46; color: #e4e4e7; }
+.probe-btn:disabled { opacity: 0.5; cursor: default; }
+
 /* ── Prometheus link ── */
 .metrics-link { font-size: 0.8rem; color: #52525b; text-align: center; }
 .metrics-link a { color: #7c3aed; text-decoration: none; }
@@ -463,7 +557,7 @@ summary:hover { color: #71717a; }
   <div class="metrics-link">Prometheus metrics available at <a href="/metrics" target="_blank">/metrics</a></div>
 </div>
 <script>
-let state = { tokens: [], active: "", headers: {}, virtual_keys: [] };
+let state = { tokens: [], active: "", headers: {}, health: {}, virtual_keys: [] };
 
 async function init() {
   await refresh();
@@ -566,6 +660,15 @@ function renderRawHeaders(h) {
     </details>`;
 }
 
+function healthBadge(n) {
+  const h = (state.health || {})[n];
+  if (!h) return "";
+  if (h.last_checked === 0) return `<span class="badge-status badge-nodata">unchecked</span>`;
+  const cls = h.healthy ? "badge-healthy" : "badge-unhealthy";
+  const label = h.healthy ? "healthy" : `unhealthy (${h.error_count} err)`;
+  return `<span class="badge-status ${cls}">${label}</span>`;
+}
+
 function renderOAuthTokens() {
   document.getElementById("token-list").innerHTML = state.tokens.map(n => {
     const isActive = n === state.active;
@@ -587,7 +690,9 @@ function renderOAuthTokens() {
           <span class="indicator"></span>
           <span class="token-name">${n}</span>
           ${isActive ? '<span class="badge-active">active</span>' : ""}
+          ${healthBadge(n)}
           ${statusBadge}
+          <button class="probe-btn" id="probe-btn-${n}" onclick="event.stopPropagation();probe('${n}')" title="Run health probe now">Test</button>
         </button>
         ${body}
       </div>`;
@@ -647,6 +752,30 @@ function render() {
   renderVirtualKeys();
 }
 
+async function probe(name) {
+  const btn = document.getElementById(`probe-btn-${name}`);
+  if (btn) { btn.disabled = true; btn.textContent = "…"; }
+  const fb = document.getElementById("fb");
+  try {
+    const r = await fetch("/probe", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || r.statusText);
+    await refresh();
+    fb.textContent = data.healthy ? `"${name}" is healthy` : `"${name}" probe failed (errors: ${data.error_count})`;
+    fb.className = data.healthy ? "feedback ok" : "feedback err";
+  } catch (e) {
+    fb.textContent = `Probe error: ${e.message}`;
+    fb.className = "feedback err";
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = "Test"; }
+  }
+  setTimeout(() => { fb.className = "feedback"; }, 4000);
+}
+
 async function pick(name) {
   const fb = document.getElementById("fb");
   try {
@@ -684,11 +813,40 @@ async def admin_state():
         "tokens": list(TOKENS.keys()),
         "active": _active,
         "headers": _token_headers,
+        "health": {
+            name: {
+                "healthy": _token_health[name]["healthy"],
+                "error_count": _token_health[name]["error_count"],
+                "last_checked": _token_health[name]["last_checked"],
+            }
+            for name in TOKENS
+        },
         "virtual_keys": [
             {"name": name, "usage": _usage_stats.get(name, {})}
             for name in VIRTUAL_KEYS
         ],
     })
+
+
+@admin_app.post("/probe")
+async def admin_probe(request: Request):
+    body = await request.json()
+    name = body.get("name", "")
+    if name not in TOKENS:
+        return JSONResponse(status_code=400, content={"error": f"Unknown token: {name!r}"})
+    ok = await _probe_token(name, TOKENS[name])
+    h = _token_health[name]
+    h["last_checked"] = time.time()
+    if ok:
+        h["healthy"] = True
+        h["error_count"] = 0
+        PROM_TOKEN_HEALTHY.labels(token_name=name).set(1)
+    else:
+        h["error_count"] += 1
+        h["healthy"] = False
+        PROM_TOKEN_HEALTHY.labels(token_name=name).set(0)
+    log.info("Manual probe %s: %s", name, "ok" if ok else "failed")
+    return JSONResponse({"healthy": ok, "error_count": h["error_count"]})
 
 
 @admin_app.post("/select")
@@ -719,7 +877,12 @@ async def _main():
     proxy_srv = uvicorn.Server(proxy_cfg)
     admin_srv = uvicorn.Server(admin_cfg)
     admin_srv.install_signal_handlers = lambda: None  # type: ignore[method-assign]
-    await asyncio.gather(proxy_srv.serve(), admin_srv.serve())
+    await asyncio.gather(
+        proxy_srv.serve(),
+        admin_srv.serve(),
+        start_health_probes(),
+        start_legacy_token_probe(),
+    )
 
 
 if __name__ == "__main__":
