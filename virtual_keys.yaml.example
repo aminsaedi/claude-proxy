@@ -1,0 +1,5 @@
+virtual_keys:
+  - name: alice
+    key: "vk-alice-secret-key"
+  - name: ci
+    key: "vk-ci-secret-key"
