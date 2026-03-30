@@ -119,6 +119,25 @@ Available at `http://<tailscale-ip>:8182/metrics`:
 | `proxy_upstream_utilization_5h_ratio` | `token_name` | 5-hour utilization (0–1) |
 | `proxy_upstream_utilization_7d_ratio` | `token_name` | 7-day utilization (0–1) |
 
+## TUI Manager
+
+A Textual terminal UI is bundled in the container for managing keys and tokens
+without hand-editing YAML files.
+
+```bash
+docker compose exec -it proxy python manage.py
+```
+
+Features:
+- **Virtual Keys tab** — list, add (with auto-generated key option), reveal full key, delete
+- **Upstream Tokens tab** — list, add, reveal, set default, delete
+- **Restart button** — sends SIGTERM to the proxy process; Docker restarts the container automatically (`restart: unless-stopped`)
+
+Keyboard shortcuts: `q` quit · `r` restart · `Tab` switch tabs · `↑↓` navigate rows
+
+Changes are written immediately to the bind-mounted YAML files on the host.
+A container restart is required for key/token changes to take effect.
+
 ## Files
 
 | File | Purpose | Gitignored |
@@ -131,5 +150,6 @@ Available at `http://<tailscale-ip>:8182/metrics`:
 | `.env.example` | Template for .env | No |
 | `usage_stats.json` | Persisted usage data | No |
 | `proxy.py` | Proxy + admin server | — |
+| `manage.py` | Textual TUI manager | — |
 | `docker-compose.yml` | Container config | — |
 | `Dockerfile` | Image build | — |

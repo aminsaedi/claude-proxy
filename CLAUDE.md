@@ -10,6 +10,7 @@ a proxy on port 8080 and an admin UI on port 8090.
 ## Key files
 
 - `proxy.py` — entire application logic (proxy + admin)
+- `manage.py` — Textual TUI for managing keys/tokens and restarting
 - `tokens.yaml` — upstream OAuth tokens (**gitignored**, never commit)
 - `virtual_keys.yaml` — client virtual key definitions
 - `usage_stats.json` — persisted per-key usage counters (updated live)
@@ -27,11 +28,17 @@ Requires `tokens.yaml` and `virtual_keys.yaml` in the same directory.
 
 ## Common tasks
 
-### Add a new virtual key
+### Add / remove keys or tokens — TUI (preferred)
+```bash
+docker compose exec -it proxy python manage.py
+```
+Virtual Keys and Upstream Tokens tabs handle all CRUD. Restart button is built in.
+
+### Add a new virtual key — manual
 Edit `virtual_keys.yaml` and restart the container (`docker compose restart`).
 The proxy loads keys once at startup.
 
-### Add / rotate an OAuth token
+### Add / rotate an OAuth token — manual
 Edit `tokens.yaml` and restart. The active token can be switched live via
 the admin UI without restart.
 
