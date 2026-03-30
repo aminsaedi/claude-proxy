@@ -69,13 +69,38 @@ def gen_key() -> str:
 # Admin API helpers (talks to the running proxy)
 # ---------------------------------------------------------------------------
 
-def get_active_token() -> str | None:
-    """Return the name of the currently active upstream token, or None on error."""
+def get_state() -> dict | None:
+    """Return the full /state payload from the admin API, or None on error."""
     try:
         with urllib.request.urlopen(f"{ADMIN_URL}/state", timeout=2) as r:
-            return json.loads(r.read())["active"]
+            return json.loads(r.read())
     except Exception:
         return None
+
+
+def get_active_token() -> str | None:
+    """Return the name of the currently active upstream token, or None on error."""
+    s = get_state()
+    return s["active"] if s else None
+
+
+def probe_token(name: str) -> dict | None:
+    """Call POST /probe for the given token. Returns {healthy, error_count} or None."""
+    try:
+        data = json.dumps({"name": name}).encode()
+        req = urllib.request.Request(
+            f"{ADMIN_URL}/probe",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=35) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        console.print(f"[red]API error {e.code}: {e.read().decode()}[/]")
+    except Exception as e:
+        console.print(f"[red]Could not reach admin API ({ADMIN_URL}): {e}[/]")
+    return None
 
 
 def set_active_token(name: str) -> bool:
@@ -222,21 +247,36 @@ def menu_virtual_keys() -> None:
 # Upstream Tokens menu
 # ---------------------------------------------------------------------------
 
-def show_tokens_table(tokens: list[dict], active: str | None = None) -> None:
+def _health_cell(health: dict | None) -> str:
+    if health is None:
+        return "[dim]?[/]"
+    if health.get("last_checked", 0) == 0:
+        return "[dim]unchecked[/]"
+    if health.get("healthy"):
+        return "[bold green]✓ healthy[/]"
+    errs = health.get("error_count", 0)
+    return f"[bold red]✗ unhealthy ({errs})[/]"
+
+
+def show_tokens_table(tokens: list[dict], active: str | None = None,
+                      health: dict | None = None) -> None:
     t = Table(show_header=True, header_style="bold dim", box=None, padding=(0, 2))
     t.add_column("#", style="dim", width=4)
     t.add_column("Name", style="bold")
     t.add_column("Token (masked)", style="green")
     t.add_column("Default", justify="center")
     t.add_column("Active", justify="center")
+    t.add_column("Health", justify="center")
     for i, tk in enumerate(tokens, 1):
         is_active = active is not None and tk["name"] == active
+        h = (health or {}).get(tk["name"])
         t.add_row(
             str(i),
             tk["name"],
             mask(tk["token"]),
             "✓" if tk.get("default") else "",
             "[bold green]▶ live[/]" if is_active else "",
+            _health_cell(h),
         )
     if tokens:
         console.print(t)
@@ -254,11 +294,14 @@ def menu_tokens() -> None:
         clear()
         header("Upstream Tokens")
         tokens = load_tokens()
-        active = get_active_token()
-        show_tokens_table(tokens, active)
+        state = get_state()
+        active = state["active"] if state else None
+        health = state.get("health") if state else None
+        show_tokens_table(tokens, active, health)
 
         idx = pick("Action", [
             "Select active token (live switch)",
+            "Run health probe",
             "Add token",
             "Show full token",
             "Set default (on restart)",
@@ -285,7 +328,26 @@ def menu_tokens() -> None:
                 console.print(f"[green]Switched live traffic to '{name}'.[/]")
             console.input("Press Enter to continue…")
 
-        elif idx == 1:  # Add
+        elif idx == 1:  # Run health probe
+            if not tokens:
+                console.input("No tokens. Press Enter…")
+                continue
+            console.print()
+            n = pick("Probe which token", [t["name"] for t in tokens])
+            if n is None:
+                continue
+            name = tokens[n]["name"]
+            console.print(f"[dim]Probing '{name}' (may take up to 30 s)…[/]")
+            result = probe_token(name)
+            if result is None:
+                pass  # error already printed
+            elif result["healthy"]:
+                console.print(f"[bold green]✓ '{name}' is healthy[/]")
+            else:
+                console.print(f"[bold red]✗ '{name}' probe failed (errors: {result['error_count']})[/]")
+            console.input("Press Enter to continue…")
+
+        elif idx == 2:  # Add
             console.print()
             name = ask("Name (e.g. personal)")
             if not name:
@@ -337,7 +399,7 @@ def menu_tokens() -> None:
             console.print(f"[green]'{tokens[n]['name']}' set as default.[/]")
             console.input("Press Enter to continue…")
 
-        elif idx == 4:  # Delete
+        elif idx == 5:  # Delete
             if not tokens:
                 console.input("No tokens to delete. Press Enter…")
                 continue
