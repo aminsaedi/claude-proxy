@@ -105,7 +105,9 @@ class ConfirmModal(ModalScreen[bool]):
     ConfirmModal Horizontal {
         height: auto;
         align: right middle;
-        gap: 1;
+    }
+    ConfirmModal Horizontal Button {
+        margin-right: 1;
     }
     """
     BINDINGS = [Binding("escape", "dismiss_false", "Cancel")]
@@ -201,8 +203,10 @@ class AddVirtualKeyModal(ModalScreen[dict | None]):
     AddVirtualKeyModal Horizontal {
         height: auto;
         align: right middle;
-        gap: 1;
         margin-top: 1;
+    }
+    AddVirtualKeyModal Horizontal Button {
+        margin-right: 1;
     }
     AddVirtualKeyModal #err {
         color: $error;
@@ -274,8 +278,10 @@ class AddTokenModal(ModalScreen[dict | None]):
     AddTokenModal Horizontal {
         height: auto;
         align: right middle;
-        gap: 1;
         margin-top: 1;
+    }
+    AddTokenModal Horizontal Button {
+        margin-right: 1;
     }
     AddTokenModal #err {
         color: $error;
@@ -348,7 +354,9 @@ class VirtualKeysPane(Container):
     VirtualKeysPane #toolbar {
         height: 3;
         margin-bottom: 1;
-        gap: 1;
+    }
+    VirtualKeysPane #toolbar Button {
+        margin-right: 1;
     }
     VirtualKeysPane DataTable {
         height: 1fr;
@@ -421,7 +429,9 @@ class TokensPane(Container):
     TokensPane #toolbar {
         height: 3;
         margin-bottom: 1;
-        gap: 1;
+    }
+    TokensPane #toolbar Button {
+        margin-right: 1;
     }
     TokensPane DataTable {
         height: 1fr;
