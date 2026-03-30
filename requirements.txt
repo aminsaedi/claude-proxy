@@ -3,3 +3,4 @@ uvicorn
 httpx
 pyyaml
 prometheus_client
+textual

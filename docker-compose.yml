@@ -1,14 +1,15 @@
 services:
   proxy:
     build: .
+    restart: unless-stopped
     ports:
       - "127.0.0.1:8181:8080"
       - "${TAILSCALE_IP}:8182:8090"
     env_file:
       - .env
     volumes:
-      - ./tokens.yaml:/app/tokens.yaml:ro
-      - ./virtual_keys.yaml:/app/virtual_keys.yaml:ro
+      - ./tokens.yaml:/app/tokens.yaml
+      - ./virtual_keys.yaml:/app/virtual_keys.yaml
       - ./usage_stats.json:/app/usage_stats.json
     logging:
       options:
