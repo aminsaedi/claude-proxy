@@ -21,6 +21,7 @@ from rich.table import Table
 BASE = Path(__file__).parent
 VKEYS_FILE = BASE / "virtual_keys.yaml"
 TOKENS_FILE = BASE / "tokens.yaml"
+CONFIG_FILE = BASE / "config.yaml"
 ADMIN_PORT = int(os.environ.get("ADMIN_PORT", "8090"))
 ADMIN_URL = f"http://localhost:{ADMIN_PORT}"
 
@@ -101,6 +102,57 @@ def probe_token(name: str) -> dict | None:
     except Exception as e:
         console.print(f"[red]Could not reach admin API ({ADMIN_URL}): {e}[/]")
     return None
+
+
+def get_config() -> dict | None:
+    """Return the current config from the admin API, or None on error."""
+    try:
+        with urllib.request.urlopen(f"{ADMIN_URL}/config", timeout=2) as r:
+            return json.loads(r.read())
+    except Exception:
+        return None
+
+
+def save_config_api(cfg: dict) -> bool:
+    """Save config via the admin API. Returns True on success."""
+    try:
+        data = json.dumps(cfg).encode()
+        req = urllib.request.Request(
+            f"{ADMIN_URL}/config",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=2) as r:
+            result = json.loads(r.read())
+            return result.get("ok", False)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode()
+        try:
+            err = json.loads(body).get("error", body)
+        except Exception:
+            err = body
+        console.print(f"[red]Config save failed: {err}[/]")
+    except Exception as e:
+        console.print(f"[red]Could not reach admin API ({ADMIN_URL}): {e}[/]")
+    return False
+
+
+def load_config_file() -> dict:
+    """Load config directly from YAML file (when admin API is unavailable)."""
+    if CONFIG_FILE.exists():
+        try:
+            return yaml.safe_load(CONFIG_FILE.read_text()) or {}
+        except Exception:
+            pass
+    return {}
+
+
+def save_config_file(cfg: dict) -> None:
+    """Save config directly to YAML file."""
+    CONFIG_FILE.write_text(
+        yaml.dump(cfg, default_flow_style=False, sort_keys=False, allow_unicode=True)
+    )
 
 
 def set_active_token(name: str) -> bool:
@@ -415,6 +467,132 @@ def menu_tokens() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Settings menu
+# ---------------------------------------------------------------------------
+
+_SETTINGS_SCHEMA = [
+    # (key_path, label, type, hint)
+    ("auto_rotation.enabled",              "Auto-rotation enabled",        "bool",  "Automatically switch tokens when 5h utilization is high"),
+    ("auto_rotation.threshold_5h",         "Threshold (5h)",               "float", "Trigger when 5h util >= this (0.0-1.0)"),
+    ("auto_rotation.target_max_util_5h",   "Target max util (5h)",         "float", "Only switch to tokens below this (0.0-1.0)"),
+    ("auto_rotation.check_interval_seconds", "Check interval",             "int",   "Seconds between utilization checks"),
+    ("auto_rotation.probe_before_switch",  "Probe before switch",          "bool",  "Health-check candidate before switching"),
+    ("auto_rotation.cooldown_seconds",     "Cooldown",                     "int",   "Seconds between auto-rotations"),
+    ("auto_rotation.notify_only",          "Notify only",                  "bool",  "Log events without actually switching"),
+    ("health_probe_interval_seconds",      "Health probe interval",        "int",   "Seconds between unhealthy token re-probes"),
+    ("active_probe_interval_seconds",      "Active probe interval",        "int",   "Seconds between active token probes"),
+    ("upstream_timeout_seconds",           "Upstream timeout",             "int",   "HTTP timeout for API calls (restart req.)"),
+]
+
+
+def _cfg_get(cfg: dict, path: str):
+    parts = path.split(".")
+    v = cfg
+    for p in parts:
+        if isinstance(v, dict):
+            v = v.get(p)
+        else:
+            return None
+    return v
+
+
+def _cfg_set(cfg: dict, path: str, val) -> None:
+    parts = path.split(".")
+    d = cfg
+    for p in parts[:-1]:
+        if p not in d or not isinstance(d[p], dict):
+            d[p] = {}
+        d = d[p]
+    d[parts[-1]] = val
+
+
+def _fmt_val(val, typ: str) -> str:
+    if typ == "bool":
+        return "[bold green]ON[/]" if val else "[bold red]OFF[/]"
+    if typ == "float":
+        return f"[bold]{val:.2f}[/]" if val is not None else "[dim]?[/]"
+    return f"[bold]{val}[/]" if val is not None else "[dim]?[/]"
+
+
+def menu_settings() -> None:
+    while True:
+        clear()
+        header("Settings")
+
+        # Try admin API first, fall back to file
+        cfg = get_config()
+        via_api = cfg is not None
+        if cfg is None:
+            cfg = load_config_file()
+            console.print("  [dim yellow]Admin API unavailable — reading config.yaml directly[/]\n")
+
+        t = Table(show_header=True, header_style="bold dim", box=None, padding=(0, 2))
+        t.add_column("#", style="dim", width=4)
+        t.add_column("Setting", style="bold")
+        t.add_column("Value", justify="right")
+        t.add_column("", style="dim")
+        for i, (path, label, typ, hint) in enumerate(_SETTINGS_SCHEMA, 1):
+            val = _cfg_get(cfg, path)
+            t.add_row(str(i), label, _fmt_val(val, typ), hint)
+        console.print(t)
+        console.print()
+
+        options = [f"Edit: {s[1]}" for s in _SETTINGS_SCHEMA]
+        idx = pick("Action", options)
+        if idx is None:
+            return
+
+        path, label, typ, hint = _SETTINGS_SCHEMA[idx]
+        current = _cfg_get(cfg, path)
+        console.print(f"\n  [bold]{label}[/]: {_fmt_val(current, typ)}")
+        console.print(f"  [dim]{hint}[/]\n")
+
+        if typ == "bool":
+            new_val = not current if current is not None else True
+            console.print(f"  Toggling to {_fmt_val(new_val, typ)}")
+        elif typ == "float":
+            raw = ask(f"New value (current: {current})")
+            if not raw:
+                continue
+            try:
+                new_val = float(raw)
+            except ValueError:
+                console.print("[red]Invalid number.[/]")
+                console.input("Press Enter to continue…")
+                continue
+        elif typ == "int":
+            raw = ask(f"New value (current: {current})")
+            if not raw:
+                continue
+            try:
+                new_val = int(raw)
+            except ValueError:
+                console.print("[red]Invalid integer.[/]")
+                console.input("Press Enter to continue…")
+                continue
+        else:
+            raw = ask(f"New value (current: {current})")
+            if not raw:
+                continue
+            new_val = raw
+
+        _cfg_set(cfg, path, new_val)
+
+        if via_api:
+            if save_config_api(cfg):
+                console.print(f"[green]Saved (live).[/]")
+            else:
+                # Fall back to file
+                save_config_file(cfg)
+                console.print(f"[yellow]Saved to file (restart needed to apply).[/]")
+        else:
+            save_config_file(cfg)
+            console.print(f"[yellow]Saved to file (restart needed to apply).[/]")
+
+        console.input("\nPress Enter to continue…")
+
+
+# ---------------------------------------------------------------------------
 # Restart
 # ---------------------------------------------------------------------------
 
@@ -451,11 +629,12 @@ def main() -> None:
         idx = pick("Choose", [
             "Manage Virtual Keys",
             "Manage Upstream Tokens",
+            "Settings",
             "Restart Proxy",
             "Quit",
         ])
 
-        if idx is None or idx == 3:
+        if idx is None or idx == 4:
             clear()
             console.print("[dim]Bye.[/]")
             sys.exit(0)
@@ -464,6 +643,8 @@ def main() -> None:
         elif idx == 1:
             menu_tokens()
         elif idx == 2:
+            menu_settings()
+        elif idx == 3:
             do_restart()
 
 

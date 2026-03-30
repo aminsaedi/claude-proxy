@@ -1,0 +1,14 @@
+# Claude Proxy configuration — all settings are hot-reloaded unless noted.
+
+auto_rotation:
+  enabled: false                  # Master switch for automatic token rotation
+  threshold_5h: 0.95             # Trigger when active token's 5h utilization >= this (0.0–1.0)
+  target_max_util_5h: 0.50       # Only switch to tokens with 5h util below this (0.0–1.0)
+  check_interval_seconds: 30     # How often to check utilization
+  probe_before_switch: true      # Health-check candidate token before switching
+  cooldown_seconds: 120          # Minimum seconds between auto-rotations
+  notify_only: false             # If true, log rotation events but don't actually switch
+
+health_probe_interval_seconds: 60    # Re-probe unhealthy tokens every N seconds
+active_probe_interval_seconds: 300   # Validate the active token periodically
+upstream_timeout_seconds: 600        # HTTP timeout for upstream API calls (requires restart)
