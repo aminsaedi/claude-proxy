@@ -4,21 +4,25 @@ Claude Proxy Manager — interactive menu
 Run: docker compose exec -it proxy python manage.py
 """
 
+import json
 import os
 import secrets
 import signal
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 import yaml
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from rich import print as rprint
 
 BASE = Path(__file__).parent
 VKEYS_FILE = BASE / "virtual_keys.yaml"
 TOKENS_FILE = BASE / "tokens.yaml"
+ADMIN_PORT = int(os.environ.get("ADMIN_PORT", "8090"))
+ADMIN_URL = f"http://localhost:{ADMIN_PORT}"
 
 console = Console()
 
@@ -59,6 +63,38 @@ def mask(s: str, show: int = 12) -> str:
 
 def gen_key() -> str:
     return "vk-" + secrets.token_urlsafe(24)
+
+
+# ---------------------------------------------------------------------------
+# Admin API helpers (talks to the running proxy)
+# ---------------------------------------------------------------------------
+
+def get_active_token() -> str | None:
+    """Return the name of the currently active upstream token, or None on error."""
+    try:
+        with urllib.request.urlopen(f"{ADMIN_URL}/state", timeout=2) as r:
+            return json.loads(r.read())["active"]
+    except Exception:
+        return None
+
+
+def set_active_token(name: str) -> bool:
+    """Switch the active upstream token via the admin API. Returns True on success."""
+    try:
+        data = json.dumps({"name": name}).encode()
+        req = urllib.request.Request(
+            f"{ADMIN_URL}/select",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=2):
+            return True
+    except urllib.error.HTTPError as e:
+        console.print(f"[red]API error {e.code}: {e.read().decode()}[/]")
+    except Exception as e:
+        console.print(f"[red]Could not reach admin API ({ADMIN_URL}): {e}[/]")
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -186,18 +222,30 @@ def menu_virtual_keys() -> None:
 # Upstream Tokens menu
 # ---------------------------------------------------------------------------
 
-def show_tokens_table(tokens: list[dict]) -> None:
+def show_tokens_table(tokens: list[dict], active: str | None = None) -> None:
     t = Table(show_header=True, header_style="bold dim", box=None, padding=(0, 2))
     t.add_column("#", style="dim", width=4)
     t.add_column("Name", style="bold")
     t.add_column("Token (masked)", style="green")
     t.add_column("Default", justify="center")
+    t.add_column("Active", justify="center")
     for i, tk in enumerate(tokens, 1):
-        t.add_row(str(i), tk["name"], mask(tk["token"]), "✓" if tk.get("default") else "")
+        is_active = active is not None and tk["name"] == active
+        t.add_row(
+            str(i),
+            tk["name"],
+            mask(tk["token"]),
+            "✓" if tk.get("default") else "",
+            "[bold green]▶ live[/]" if is_active else "",
+        )
     if tokens:
         console.print(t)
     else:
         console.print("  [dim](no tokens)[/]")
+    if active:
+        console.print(f"  [dim]Active (live): [bold]{active}[/][/]")
+    elif active is None:
+        console.print("  [dim yellow]Admin API unreachable — active token unknown[/]")
     console.print()
 
 
@@ -206,13 +254,38 @@ def menu_tokens() -> None:
         clear()
         header("Upstream Tokens")
         tokens = load_tokens()
-        show_tokens_table(tokens)
+        active = get_active_token()
+        show_tokens_table(tokens, active)
 
-        idx = pick("Action", ["Add token", "Show full token", "Set default", "Delete token"])
+        idx = pick("Action", [
+            "Select active token (live switch)",
+            "Add token",
+            "Show full token",
+            "Set default (on restart)",
+            "Delete token",
+        ])
         if idx is None:
             return
 
-        if idx == 0:  # Add
+        if idx == 0:  # Select active
+            if not tokens:
+                console.input("No tokens. Press Enter…")
+                continue
+            console.print()
+            n = pick("Switch live traffic to", [
+                f"{tk['name']}  {'[dim](currently active)[/]' if tk['name'] == active else ''}"
+                for tk in tokens
+            ])
+            if n is None:
+                continue
+            name = tokens[n]["name"]
+            if name == active:
+                console.print(f"[yellow]'{name}' is already active.[/]")
+            elif set_active_token(name):
+                console.print(f"[green]Switched live traffic to '{name}'.[/]")
+            console.input("Press Enter to continue…")
+
+        elif idx == 1:  # Add
             console.print()
             name = ask("Name (e.g. personal)")
             if not name:
@@ -238,7 +311,7 @@ def menu_tokens() -> None:
             console.print(f"\n[green]Added '{name}'.[/]")
             console.input("\nPress Enter to continue…")
 
-        elif idx == 1:  # Show full token
+        elif idx == 2:  # Show full token
             if not tokens:
                 console.input("No tokens to show. Press Enter…")
                 continue
@@ -249,12 +322,12 @@ def menu_tokens() -> None:
             console.print(f"\n[bold]{tokens[n]['name']}[/]: [green]{tokens[n]['token']}[/]")
             console.input("\nPress Enter to continue…")
 
-        elif idx == 2:  # Set default
+        elif idx == 3:  # Set default
             if not tokens:
                 console.input("No tokens. Press Enter…")
                 continue
             console.print()
-            n = pick("Set which token as default", [t["name"] for t in tokens])
+            n = pick("Set which token as default (used on next restart)", [t["name"] for t in tokens])
             if n is None:
                 continue
             for t in tokens:
@@ -264,7 +337,7 @@ def menu_tokens() -> None:
             console.print(f"[green]'{tokens[n]['name']}' set as default.[/]")
             console.input("Press Enter to continue…")
 
-        elif idx == 3:  # Delete
+        elif idx == 4:  # Delete
             if not tokens:
                 console.input("No tokens to delete. Press Enter…")
                 continue
