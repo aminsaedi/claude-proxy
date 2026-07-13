@@ -2,9 +2,11 @@
 #   API   -> internet via Traefik Ingress + Cloudflare Tunnel (claude-proxy.aminsaedi.com)
 #   Admin -> tailnet only via a Tailscale L4 LoadBalancer (claude-proxy-admin.<tailnet>.ts.net)
 #
-# Two secrets are created out-of-band (kept out of git):
-#   claude-proxy-admin : ADMIN_USER / ADMIN_PASSWORD  (env)
-#   claude-proxy-seed  : claude_proxy.db              (one-time PVC seed; delete after first deploy)
+# Admin UI is unauthenticated by design — reachable only via the tailnet-only
+# Tailscale LoadBalancer. Re-enable HTTP Basic auth by adding ADMIN_USER /
+# ADMIN_PASSWORD env to the container (e.g. from a Secret).
+# One-time seed Secret (kept out of git; delete after first deploy):
+#   claude-proxy-seed : claude_proxy.db  ->  PVC
 ---
 apiVersion: v1
 kind: Namespace
@@ -68,7 +70,7 @@ spec:
       initContainers:
         # Seed the SQLite DB into the PVC on first run only (idempotent).
         - name: seed-db
-          image: 100.69.180.101:31500/claude-proxy:v3
+          image: 100.69.180.101:31500/claude-proxy:v4
           command: ["sh", "-c", "test -f /data/claude_proxy.db || cp /seed/claude_proxy.db /data/claude_proxy.db"]
           volumeMounts:
             - name: data
@@ -78,23 +80,16 @@ spec:
               readOnly: true
       containers:
         - name: proxy
-          image: 100.69.180.101:31500/claude-proxy:v3
+          image: 100.69.180.101:31500/claude-proxy:v4
           imagePullPolicy: Always
           env:
             - name: CLAUDE_PROXY_DATA_DIR
               value: /data
             - name: CLAUDE_PROXY_DB
               value: /data/claude_proxy.db
-            - name: ADMIN_USER
-              valueFrom:
-                secretKeyRef:
-                  name: claude-proxy-admin
-                  key: ADMIN_USER
-            - name: ADMIN_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: claude-proxy-admin
-                  key: ADMIN_PASSWORD
+            # Admin UI has no auth by design — it's only reachable via the
+            # tailnet-only Tailscale LoadBalancer below. To re-enable HTTP Basic
+            # auth, add ADMIN_USER / ADMIN_PASSWORD env (e.g. from a Secret).
           ports:
             - name: proxy
               containerPort: 8080

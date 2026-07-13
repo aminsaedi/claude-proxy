@@ -703,7 +703,7 @@ async function refresh(){
     document.querySelectorAll(".stale").forEach(e=>e.classList.remove("stale"));
     renderSystem(); renderHero(); renderTiles(); renderTokens(); renderClients(); renderLog();
     if(!cfgDirty) buildForm();
-    $("#authnote").textContent = state.auth_enabled ? "Admin auth: on" : "Admin auth: OFF — set ADMIN_PASSWORD";
+    $("#authnote").textContent = state.auth_enabled ? "Admin auth: on" : "Tailnet-only · no admin auth";
   }catch(err){
     $("#bannerText").textContent = "Can't reach the proxy — retrying. ("+err.message+")";
     $("#banner").classList.add("show");
