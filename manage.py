@@ -134,7 +134,7 @@ def menu_virtual_keys() -> None:
         console.print(t if keys else "  [dim](no virtual keys)[/]")
         console.print()
 
-        idx = pick("Action", ["Add key", "Reveal full key", "Delete key"])
+        idx = pick("Action", ["Add key", "Reveal full key", "Rotate key", "Rename key", "Delete key"])
         if idx is None:
             return
         if idx == 0:
@@ -150,6 +150,21 @@ def menu_virtual_keys() -> None:
             if n is not None:
                 console.print(f"\n[bold]{keys[n]['name']}[/]: [green]{keys[n]['key']}[/]"); pause()
         elif idx == 2 and keys:
+            n = pick("Rotate which key", [k["name"] for k in keys])
+            if n is not None and confirm(f"Rotate '{keys[n]['name']}'? The old key stops working."):
+                new = gen_key()
+                db.set_virtual_key(keys[n]["name"], new)
+                console.print(f"\n[green]Rotated '{keys[n]['name']}'.[/]  New key: [green]{new}[/]")
+                console.print("[dim](hot-reloaded within ~5s — update the client)[/]"); pause()
+        elif idx == 3 and keys:
+            n = pick("Rename which key", [k["name"] for k in keys])
+            if n is not None:
+                new = ask("New name")
+                if not new or any(k["name"] == new for k in keys):
+                    console.print("[red]Missing or duplicate name.[/]"); pause(); continue
+                db.rename_virtual_key(keys[n]["name"], new)
+                console.print(f"[green]Renamed '{keys[n]['name']}' → '{new}'.[/]"); pause()
+        elif idx == 4 and keys:
             n = pick("Delete which key", [k["name"] for k in keys])
             if n is not None and confirm(f"Delete '{keys[n]['name']}'?"):
                 db.delete_virtual_key(keys[n]["name"])

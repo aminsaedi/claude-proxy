@@ -57,6 +57,7 @@ class TokenStore:
         self._tokens: dict[str, str] = {}
         self._order: list[str] = []
         self.active: str = ""
+        self.default: str = ""
         self.health: dict[str, TokenHealth] = {}
         self.load()
 
@@ -69,15 +70,29 @@ class TokenStore:
         self._tokens = tokens
         self._order = list(tokens)
         self.active = default
+        self.default = default
         # preserve existing health across reloads; init new tokens
         self.health = {n: self.health.get(n, TokenHealth()) for n in tokens}
         log.info("Loaded %d token(s), default: %s", len(tokens), default)
+
+    def reload(self) -> None:
+        """Re-read tokens from the DB after a CRUD change, keeping the live active
+        selection if that token still exists (``load`` alone resets it to default)."""
+        prev = self.active
+        self.load()
+        if prev in self._tokens:
+            self.active = prev
 
     def names(self) -> list[str]:
         return list(self._order)
 
     def secret(self, name: str) -> str:
         return self._tokens[name]
+
+    def preview(self, name: str, show: int = 12) -> str:
+        """A masked prefix of the secret, safe to show in the console at a glance."""
+        s = self._tokens.get(name, "")
+        return s[:show] + "…" if len(s) > show + 1 else s
 
     def active_secret(self) -> str:
         return self._tokens[self.active]
@@ -185,5 +200,15 @@ class VirtualKeyStore:
             return None
         return self._by_key.get(key)
 
+    def __contains__(self, name: str) -> bool:
+        return name in self._by_name
+
     def names(self) -> list[str]:
         return list(self._by_name)
+
+    def secret(self, name: str) -> str | None:
+        return self._by_name.get(name)
+
+    def preview(self, name: str, show: int = 12) -> str:
+        s = self._by_name.get(name, "")
+        return s[:show] + "…" if len(s) > show + 1 else s

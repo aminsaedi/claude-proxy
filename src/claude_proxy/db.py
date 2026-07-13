@@ -108,6 +108,28 @@ def set_default_token(name: str, path: Path | None = None) -> None:
         conn.execute("UPDATE tokens SET is_default = 1 WHERE name = ?", (name,))
 
 
+def update_token(
+    name: str,
+    token: str | None = None,
+    is_default: bool | None = None,
+    path: Path | None = None,
+) -> bool:
+    """Update a token's secret and/or promote it to default. Returns False if unknown.
+
+    ``token=None`` keeps the current secret; ``is_default`` only acts when True
+    (promoting one token demotes the rest) — pass ``set_default_token`` semantics.
+    """
+    with cursor(path) as conn:
+        if not conn.execute("SELECT 1 FROM tokens WHERE name = ?", (name,)).fetchone():
+            return False
+        if token is not None:
+            conn.execute("UPDATE tokens SET token = ? WHERE name = ?", (token, name))
+        if is_default:
+            conn.execute("UPDATE tokens SET is_default = 0")
+            conn.execute("UPDATE tokens SET is_default = 1 WHERE name = ?", (name,))
+        return True
+
+
 # --- virtual keys ---------------------------------------------------------
 
 def list_virtual_keys(path: Path | None = None) -> list[dict]:
@@ -124,6 +146,27 @@ def add_virtual_key(name: str, key: str, path: Path | None = None) -> None:
 def delete_virtual_key(name: str, path: Path | None = None) -> None:
     with cursor(path) as conn:
         conn.execute("DELETE FROM virtual_keys WHERE name = ?", (name,))
+
+
+def set_virtual_key(name: str, key: str, path: Path | None = None) -> bool:
+    """Replace a virtual key's secret value (rotation). Name and usage are kept."""
+    with cursor(path) as conn:
+        cur = conn.execute("UPDATE virtual_keys SET key = ? WHERE name = ?", (key, name))
+        return cur.rowcount > 0
+
+
+def rename_virtual_key(old: str, new: str, path: Path | None = None) -> bool:
+    """Rename a virtual key, migrating its usage rows so history follows the client.
+
+    Returns False if ``old`` is unknown. Raises ``sqlite3.IntegrityError`` if
+    ``new`` already exists (PRIMARY KEY collision).
+    """
+    with cursor(path) as conn:
+        if not conn.execute("SELECT 1 FROM virtual_keys WHERE name = ?", (old,)).fetchone():
+            return False
+        conn.execute("UPDATE virtual_keys SET name = ? WHERE name = ?", (new, old))
+        conn.execute("UPDATE usage SET key_name = ? WHERE key_name = ?", (new, old))
+        return True
 
 
 # --- config ---------------------------------------------------------------
