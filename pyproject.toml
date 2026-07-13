@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-proxy"
+version = "2.0.0"
+description = "Self-hosted Anthropic API proxy with virtual keys, usage tracking, and token failover/rotation"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi==0.136.0",
+  "uvicorn==0.45.0",
+  "httpx==0.28.1",
+  "PyYAML==6.0.3",
+  "pydantic==2.13.3",
+  "prometheus-client==0.21.1",
+  "rich==15.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==8.3.4",
+  "pytest-asyncio==0.25.2",
+  "ruff==0.9.2",
+  "mypy==1.14.1",
+]
+
+[project.scripts]
+claude-proxy = "claude_proxy.app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+claude_proxy = ["static/*.html"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "ASYNC", "BLE"]
+# B008: FastAPI's `Depends()` default-argument idiom.
+ignore = ["B008"]
+
+[tool.ruff.lint.per-file-ignores]
+# manage.py is a compact interactive TUI script.
+"manage.py" = ["E701", "E702", "BLE001"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+disable_error_code = ["import-untyped"]
+files = ["src"]

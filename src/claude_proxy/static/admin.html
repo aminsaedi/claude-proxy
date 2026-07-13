@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Claude Proxy — Admin</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%237c3aed'/%3E%3Ctext x='16' y='22' font-family='system-ui,sans-serif' font-size='18' font-weight='700' fill='white' text-anchor='middle'%3EC%3C/text%3E%3C/svg%3E">
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  background: #0d0d0f; color: #d4d4d8; min-height: 100vh;
+  display: flex; align-items: flex-start; justify-content: center; padding: 40px 16px;
+}
+.page { width: 100%; max-width: 680px; display: flex; flex-direction: column; gap: 24px; }
+.card { background: #18181b; border: 1px solid #27272a; border-radius: 14px; padding: 28px 32px; box-shadow: 0 4px 32px rgba(0,0,0,.4); }
+.section-title { font-size: 0.72rem; font-weight: 700; color: #52525b; letter-spacing: .08em; text-transform: uppercase; margin-bottom: 14px; }
+.logo { font-size: 1.2rem; font-weight: 700; color: #fff; margin-bottom: 4px; }
+.sub { font-size: 0.82rem; color: #71717a; }
+.token-card { border: 1.5px solid #27272a; border-radius: 10px; overflow: hidden; margin-bottom: 10px; transition: border-color .15s; }
+.token-card.active { border-color: #7c3aed; }
+.token-header { display: flex; align-items: center; gap: 12px; padding: 13px 16px; background: #09090b; cursor: pointer; width: 100%; text-align: left; border: none; color: #a1a1aa; font-size: 0.9rem; transition: background .15s; }
+.token-header:hover { background: #111113; }
+.token-card.active .token-header { background: #130f1e; color: #e4e4e7; }
+.indicator { width: 9px; height: 9px; border-radius: 50%; background: #3f3f46; flex-shrink: 0; }
+.token-card.active .indicator { background: #7c3aed; }
+.token-name { font-weight: 600; flex: 1; }
+.badge-active { font-size: 0.7rem; padding: 2px 8px; border-radius: 99px; background: #7c3aed22; color: #a78bfa; font-weight: 600; }
+.badge-status { font-size: 0.7rem; padding: 2px 8px; border-radius: 99px; font-weight: 600; }
+.badge-allowed  { background: #14532d33; color: #4ade80; }
+.badge-warning  { background: #78350f33; color: #fbbf24; }
+.badge-rejected { background: #7f1d1d33; color: #f87171; }
+.badge-nodata   { background: #27272a;   color: #52525b; }
+.badge-healthy   { background: #052e1633; color: #4ade80; }
+.badge-ratelimited { background: #78350f33; color: #fbbf24; }
+.badge-unhealthy { background: #450a0a33; color: #f87171; }
+.token-body { padding: 16px 18px 14px; background: #0d0d10; border-top: 1px solid #27272a; display: flex; flex-direction: column; gap: 12px; }
+.usage-row { display: flex; flex-direction: column; gap: 5px; }
+.usage-label-row { display: flex; align-items: center; gap: 8px; font-size: 0.78rem; }
+.period-label { font-weight: 700; color: #71717a; width: 22px; flex-shrink: 0; }
+.pct-label { font-weight: 700; font-size: 0.82rem; min-width: 36px; }
+.reset-label { color: #52525b; font-size: 0.76rem; margin-left: auto; }
+.bar-track { height: 6px; background: #27272a; border-radius: 99px; overflow: hidden; }
+.bar-fill  { height: 100%; border-radius: 99px; transition: width .4s ease; }
+.meta-row  { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 0.76rem; color: #71717a; padding-top: 4px; border-top: 1px solid #1f1f23; }
+.meta-item { display: flex; gap: 5px; }
+.meta-key  { color: #52525b; }
+.meta-val.green { color: #4ade80; }
+.meta-val.amber { color: #fbbf24; }
+.meta-val.red   { color: #f87171; }
+details { margin-top: 4px; }
+summary { font-size: 0.76rem; color: #52525b; cursor: pointer; user-select: none; padding: 2px 0; }
+summary:hover { color: #71717a; }
+.raw-table { margin-top: 8px; width: 100%; border-collapse: collapse; font-size: 0.72rem; font-family: monospace; }
+.raw-table td { padding: 3px 6px; vertical-align: top; border-bottom: 1px solid #1f1f23; }
+.raw-table td:first-child { color: #71717a; white-space: nowrap; padding-right: 12px; }
+.raw-table td:last-child  { color: #a1a1aa; word-break: break-all; }
+.vkey-card { border: 1px solid #27272a; border-radius: 10px; overflow: hidden; margin-bottom: 10px; }
+.vkey-header { display: flex; align-items: center; gap: 12px; padding: 12px 16px; background: #09090b; }
+.vkey-name { font-weight: 700; font-size: 0.92rem; color: #e4e4e7; flex: 1; }
+.vkey-totals { display: flex; gap: 14px; font-size: 0.75rem; }
+.vkey-stat { display: flex; flex-direction: column; align-items: flex-end; }
+.vkey-stat-val { font-weight: 700; color: #e4e4e7; }
+.vkey-stat-lbl { font-size: 0.68rem; color: #52525b; }
+.vkey-body { padding: 12px 16px; background: #0d0d10; border-top: 1px solid #27272a; overflow-x: auto; }
+.vkey-nodata { padding: 12px 16px; background: #0d0d10; border-top: 1px solid #27272a; font-size: 0.8rem; color: #52525b; font-style: italic; }
+.usage-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; }
+.usage-table th { text-align: left; padding: 4px 8px 6px; color: #52525b; font-weight: 600; font-size: 0.7rem; text-transform: uppercase; letter-spacing: .05em; border-bottom: 1px solid #1f1f23; }
+.usage-table td { padding: 6px 8px; border-bottom: 1px solid #1a1a1d; color: #a1a1aa; }
+.usage-table tr:last-child td { border-bottom: none; }
+.usage-table td.model-cell { color: #7c3aed; font-family: monospace; font-size: 0.76rem; }
+.usage-table td.num { text-align: right; font-variant-numeric: tabular-nums; color: #d4d4d8; }
+.feedback { margin-top: 14px; padding: 9px 14px; border-radius: 8px; font-size: 0.82rem; display: none; }
+.feedback.ok  { background: #052e16; color: #4ade80; border: 1px solid #14532d; display: block; }
+.feedback.err { background: #450a0a; color: #f87171; border: 1px solid #7f1d1d; display: block; }
+.probe-btn { font-size: 0.7rem; padding: 2px 9px; border-radius: 6px; border: 1px solid #3f3f46; background: #27272a; color: #a1a1aa; cursor: pointer; font-weight: 600; transition: background .15s, color .15s; }
+.probe-btn:hover:not(:disabled) { background: #3f3f46; color: #e4e4e7; }
+.probe-btn:disabled { opacity: 0.5; cursor: default; }
+.metrics-link { font-size: 0.8rem; color: #52525b; text-align: center; }
+.metrics-link a { color: #7c3aed; text-decoration: none; }
+.metrics-link a:hover { text-decoration: underline; }
+.config-group { margin-bottom: 18px; }
+.config-group-title { font-size: 0.78rem; font-weight: 700; color: #71717a; margin-bottom: 10px; text-transform: uppercase; letter-spacing: .05em; }
+.config-row { display: flex; align-items: center; justify-content: space-between; padding: 9px 0; border-bottom: 1px solid #1f1f23; gap: 12px; }
+.config-row:last-child { border-bottom: none; }
+.config-label { font-size: 0.82rem; color: #a1a1aa; }
+.config-hint { font-size: 0.7rem; color: #52525b; margin-top: 2px; }
+.config-input { background: #09090b; border: 1px solid #3f3f46; border-radius: 6px; color: #e4e4e7; font-size: 0.82rem; padding: 5px 10px; width: 80px; text-align: right; font-variant-numeric: tabular-nums; }
+.config-input:focus { border-color: #7c3aed; outline: none; }
+.toggle { position: relative; width: 40px; height: 22px; flex-shrink: 0; }
+.toggle input { opacity: 0; width: 0; height: 0; position: absolute; }
+.toggle-slider { position: absolute; inset: 0; background: #3f3f46; border-radius: 99px; cursor: pointer; transition: background .2s; }
+.toggle-slider::before { content: ""; position: absolute; left: 3px; top: 3px; width: 16px; height: 16px; border-radius: 50%; background: #71717a; transition: transform .2s, background .2s; }
+.toggle input:checked + .toggle-slider { background: #7c3aed; }
+.toggle input:checked + .toggle-slider::before { transform: translateX(18px); background: #fff; }
+.save-btn { background: #7c3aed; color: #fff; border: none; border-radius: 8px; padding: 9px 24px; font-size: 0.85rem; font-weight: 600; cursor: pointer; transition: background .15s; margin-top: 14px; }
+.save-btn:hover { background: #6d28d9; }
+.save-btn:disabled { opacity: 0.5; cursor: default; }
+.rotation-entry { padding: 5px 0; border-bottom: 1px solid #1f1f23; font-size: 0.76rem; color: #a1a1aa; }
+.rotation-entry:last-child { border-bottom: none; }
+.rotation-action { font-weight: 600; }
+.rotation-action.switched { color: #4ade80; }
+.rotation-action.notify { color: #fbbf24; }
+</style>
+</head>
+<body>
+<div class="page">
+  <div class="card" style="padding:20px 32px">
+    <div class="logo">Claude Proxy</div>
+    <div class="sub">Admin dashboard · auto-refreshes every 5 s</div>
+  </div>
+  <div class="card">
+    <div class="section-title">Upstream OAuth Tokens</div>
+    <div id="token-list"></div>
+    <div class="feedback" id="fb"></div>
+  </div>
+  <div class="card">
+    <div class="section-title">Virtual API Keys — Token Usage</div>
+    <div id="vkey-list"></div>
+  </div>
+  <div class="card">
+    <div class="section-title">Settings</div>
+    <div id="config-form"></div>
+    <div class="feedback" id="config-fb"></div>
+  </div>
+  <div class="card" id="rotation-log-card" style="display:none">
+    <div class="section-title">Auto-Rotation Log</div>
+    <div id="rotation-log"></div>
+  </div>
+  <div class="metrics-link">Prometheus metrics available at <a href="/metrics" target="_blank">/metrics</a></div>
+</div>
+<script>
+let state = { tokens: [], active: "", headers: {}, health: {}, virtual_keys: [], config: {}, rotation_log: [] };
+
+async function init() { await refresh(); setInterval(refresh, 5000); }
+async function refresh() {
+  try { const r = await fetch("/state"); state = await r.json(); render(); }
+  catch (e) { /* ignore transient errors */ }
+}
+function fmtTokens(n) {
+  n = n || 0;
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
+  return String(n);
+}
+function fmtReset(ts) {
+  if (!ts) return "";
+  const secs = Math.max(0, parseInt(ts) - Date.now() / 1000);
+  if (secs < 60) return "< 1 min";
+  const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60);
+  if (h >= 24) { const d = Math.floor(h / 24); return `${d}d ${h % 24}h`; }
+  return h > 0 ? `${h}h ${m}m` : `${m}m`;
+}
+function barColor(util) {
+  const u = parseFloat(util) || 0;
+  if (u >= 0.9) return "#ef4444";
+  if (u >= 0.7) return "#f59e0b";
+  return "#4ade80";
+}
+function statusClass(s) {
+  if (!s) return "badge-nodata";
+  if (s === "allowed") return "badge-allowed";
+  if (s.includes("warning")) return "badge-warning";
+  return "badge-rejected";
+}
+function metaValClass(key, val) {
+  if (key.includes("fallback") && val === "available") return "green";
+  if (key.includes("overage-status") && val === "rejected") return "red";
+  if (key.includes("overage-status") && val === "allowed") return "green";
+  if (val === "allowed") return "green";
+  if (val && val.includes("warning")) return "amber";
+  if (val === "rejected" || val === "blocked") return "red";
+  return "";
+}
+function usageBar(h, period) {
+  const util  = h[`anthropic-ratelimit-unified-${period}-utilization`];
+  const reset = h[`anthropic-ratelimit-unified-${period}-reset`];
+  const status = h[`anthropic-ratelimit-unified-${period}-status`];
+  if (util === undefined) return "";
+  const pct = Math.round(parseFloat(util) * 100);
+  const color = barColor(util);
+  return `
+    <div class="usage-row">
+      <div class="usage-label-row">
+        <span class="period-label">${period}</span>
+        <span class="pct-label" style="color:${color}">${pct}%</span>
+        <span class="badge-status ${statusClass(status)}">${status || ""}</span>
+        <span class="reset-label">resets in ${fmtReset(reset)}</span>
+      </div>
+      <div class="bar-track"><div class="bar-fill" style="width:${Math.min(pct,100)}%;background:${color}"></div></div>
+    </div>`;
+}
+function renderRawHeaders(h) {
+  if (!h || Object.keys(h).length === 0) return "";
+  const metaKeys = [
+    "anthropic-ratelimit-unified-status","anthropic-ratelimit-unified-representative-claim",
+    "anthropic-ratelimit-unified-fallback","anthropic-ratelimit-unified-fallback-percentage",
+    "anthropic-ratelimit-unified-overage-status","anthropic-ratelimit-unified-overage-disabled-reason",
+  ];
+  const metaItems = metaKeys.filter(k => h[k] !== undefined).map(k => {
+    const shortKey = k.replace("anthropic-ratelimit-unified-", "");
+    const cls = metaValClass(k, h[k]);
+    return `<span class="meta-item"><span class="meta-key">${shortKey}:</span> <span class="meta-val ${cls}">${h[k]}</span></span>`;
+  }).join("");
+  const rows = Object.entries(h).sort(([a],[b]) => a.localeCompare(b))
+    .map(([k,v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
+  return `
+    ${metaItems ? `<div class="meta-row">${metaItems}</div>` : ""}
+    <details><summary>Raw headers (${Object.keys(h).length})</summary><table class="raw-table">${rows}</table></details>`;
+}
+function healthBadge(n) {
+  const h = (state.health || {})[n];
+  if (!h) return "";
+  const s = h.status || (h.healthy ? "healthy" : "unhealthy");
+  if (s === "unchecked" || h.last_checked === 0) return `<span class="badge-status badge-nodata">unchecked</span>`;
+  if (s === "healthy") return `<span class="badge-status badge-healthy">healthy</span>`;
+  if (s === "rate_limited") return `<span class="badge-status badge-ratelimited">rate-limited</span>`;
+  return `<span class="badge-status badge-unhealthy">unhealthy (${h.error_count} err)</span>`;
+}
+function renderOAuthTokens() {
+  document.getElementById("token-list").innerHTML = state.tokens.map(n => {
+    const isActive = n === state.active;
+    const h = state.headers[n] || {};
+    const overallStatus = h["anthropic-ratelimit-unified-status"];
+    const hasData = Object.keys(h).length > 0;
+    const statusBadge = hasData
+      ? `<span class="badge-status ${statusClass(overallStatus)}">${overallStatus || "?"}</span>`
+      : `<span class="badge-status badge-nodata">no data</span>`;
+    const body = hasData ? `<div class="token-body">${usageBar(h,"5h")}${usageBar(h,"7d")}${renderRawHeaders(h)}</div>` : "";
+    return `
+      <div class="token-card ${isActive ? "active" : ""}">
+        <button class="token-header" onclick="pick('${n}')">
+          <span class="indicator"></span>
+          <span class="token-name">${n}</span>
+          ${isActive ? '<span class="badge-active">active</span>' : ""}
+          ${healthBadge(n)}
+          ${statusBadge}
+          <button class="probe-btn" id="probe-btn-${n}" onclick="event.stopPropagation();probe('${n}')" title="Run health probe now">Test</button>
+        </button>
+        ${body}
+      </div>`;
+  }).join("");
+}
+function renderVirtualKeys() {
+  const vkeys = state.virtual_keys || [];
+  document.getElementById("vkey-list").innerHTML = vkeys.map(vk => {
+    const usage = vk.usage || {};
+    const models = Object.keys(usage).sort();
+    const sum = (f) => models.reduce((s, m) => s + (usage[m][f] || 0), 0);
+    const totalReq = sum("requests"), totalIn = sum("input_tokens"), totalOut = sum("output_tokens");
+    const totalCacheR = sum("cache_read_input_tokens"), totalCacheW = sum("cache_creation_input_tokens");
+    const modelRows = models.map(m => `
+      <tr>
+        <td class="model-cell">${m}</td>
+        <td class="num">${usage[m].requests || 0}</td>
+        <td class="num">${fmtTokens(usage[m].input_tokens)}</td>
+        <td class="num">${fmtTokens(usage[m].output_tokens)}</td>
+        <td class="num">${fmtTokens(usage[m].cache_read_input_tokens)}</td>
+        <td class="num">${fmtTokens(usage[m].cache_creation_input_tokens)}</td>
+      </tr>`).join("");
+    return `
+      <div class="vkey-card">
+        <div class="vkey-header">
+          <span class="vkey-name">${vk.name}</span>
+          <div class="vkey-totals">
+            <div class="vkey-stat"><span class="vkey-stat-val">${totalReq}</span><span class="vkey-stat-lbl">requests</span></div>
+            <div class="vkey-stat"><span class="vkey-stat-val">${fmtTokens(totalIn)}</span><span class="vkey-stat-lbl">input</span></div>
+            <div class="vkey-stat"><span class="vkey-stat-val">${fmtTokens(totalOut)}</span><span class="vkey-stat-lbl">output</span></div>
+            <div class="vkey-stat"><span class="vkey-stat-val">${fmtTokens(totalCacheR)}</span><span class="vkey-stat-lbl">cache rd</span></div>
+            <div class="vkey-stat"><span class="vkey-stat-val">${fmtTokens(totalCacheW)}</span><span class="vkey-stat-lbl">cache wr</span></div>
+          </div>
+        </div>
+        ${models.length > 0 ? `
+        <div class="vkey-body">
+          <table class="usage-table">
+            <thead><tr><th>Model</th><th>Req</th><th>Input</th><th>Output</th><th>Cache rd</th><th>Cache wr</th></tr></thead>
+            <tbody>${modelRows}</tbody>
+          </table>
+        </div>` : `<div class="vkey-nodata">No usage recorded yet</div>`}
+      </div>`;
+  }).join("");
+}
+function render() { renderOAuthTokens(); renderVirtualKeys(); renderConfig(); renderRotationLog(); }
+function cfgToggle(id, label, val, hint) {
+  return `<div class="config-row"><div><div class="config-label">${label}</div>${hint ? `<div class="config-hint">${hint}</div>` : ""}</div>
+    <label class="toggle"><input type="checkbox" id="${id}" ${val ? "checked" : ""}><span class="toggle-slider"></span></label></div>`;
+}
+function cfgNum(id, label, val, hint, unit) {
+  return `<div class="config-row"><div><div class="config-label">${label}</div>${hint ? `<div class="config-hint">${hint}</div>` : ""}</div>
+    <div style="display:flex;align-items:center;gap:6px"><input type="number" class="config-input" id="${id}" value="${val}" step="any" min="0">
+    ${unit ? `<span style="font-size:0.75rem;color:#52525b">${unit}</span>` : ""}</div></div>`;
+}
+function renderConfig() {
+  const cfg = state.config || {}; const ar = cfg.auto_rotation || {};
+  document.getElementById("config-form").innerHTML = `
+    <div class="config-group">
+      <div class="config-group-title">Auto-Rotation</div>
+      ${cfgToggle("ar-enabled", "Enabled", ar.enabled, "Switch tokens on high 5h utilization or when the active token is dead/rate-limited")}
+      ${cfgNum("ar-threshold", "Threshold (5h)", ar.threshold_5h, "Trigger when active token 5h util &ge; this (0.0&ndash;1.0)", "")}
+      ${cfgNum("ar-target-max", "Target max util (5h)", ar.target_max_util_5h, "On high-util rotation, only switch to tokens below this", "")}
+      ${cfgNum("ar-interval", "Check interval", ar.check_interval_seconds, "How often to evaluate", "sec")}
+      ${cfgToggle("ar-probe", "Probe before switch", ar.probe_before_switch, "Health-check candidate before switching")}
+      ${cfgNum("ar-cooldown", "Cooldown", ar.cooldown_seconds, "Min time between util-based rotations", "sec")}
+      ${cfgToggle("ar-notify", "Notify only", ar.notify_only, "Log events without actually switching")}
+    </div>
+    <div class="config-group">
+      <div class="config-group-title">General</div>
+      ${cfgNum("cfg-health-int", "Health probe interval", cfg.health_probe_interval_seconds, "Re-probe unhealthy tokens", "sec")}
+      ${cfgNum("cfg-active-int", "Active probe interval", cfg.active_probe_interval_seconds, "Validate active token periodically", "sec")}
+      ${cfgNum("cfg-timeout", "Upstream timeout", cfg.upstream_timeout_seconds, "HTTP timeout for API calls (restart required)", "sec")}
+    </div>
+    <button class="save-btn" id="save-cfg-btn" onclick="saveConfig()">Save Settings</button>`;
+}
+function renderRotationLog() {
+  const logs = state.rotation_log || [];
+  const card = document.getElementById("rotation-log-card");
+  if (logs.length === 0) { card.style.display = "none"; return; }
+  card.style.display = "";
+  document.getElementById("rotation-log").innerHTML = logs.slice().reverse().map(e => {
+    const ts = new Date(e.time * 1000).toLocaleString();
+    const isSwitched = e.action === "switched";
+    const cls = isSwitched ? "switched" : "notify";
+    const label = isSwitched ? "Switched" : "Would switch";
+    const reason = e.reason === "active_unusable" ? "active dead/rate-limited" : `5h ${(e.trigger_util_5h*100).toFixed(0)}%`;
+    return `<div class="rotation-entry">${ts} &mdash; <span class="rotation-action ${cls}">${label}</span> <b>${e.from}</b> &rarr; <b>${e.to}</b> (${reason})</div>`;
+  }).join("");
+}
+async function saveConfig() {
+  const btn = document.getElementById("save-cfg-btn");
+  btn.disabled = true; btn.textContent = "Saving…";
+  const cfg = {
+    auto_rotation: {
+      enabled: document.getElementById("ar-enabled").checked,
+      threshold_5h: parseFloat(document.getElementById("ar-threshold").value),
+      target_max_util_5h: parseFloat(document.getElementById("ar-target-max").value),
+      check_interval_seconds: parseInt(document.getElementById("ar-interval").value),
+      probe_before_switch: document.getElementById("ar-probe").checked,
+      cooldown_seconds: parseInt(document.getElementById("ar-cooldown").value),
+      notify_only: document.getElementById("ar-notify").checked,
+    },
+    health_probe_interval_seconds: parseInt(document.getElementById("cfg-health-int").value),
+    active_probe_interval_seconds: parseInt(document.getElementById("cfg-active-int").value),
+    upstream_timeout_seconds: parseInt(document.getElementById("cfg-timeout").value),
+  };
+  const fb = document.getElementById("config-fb");
+  try {
+    const r = await fetch("/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cfg) });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || r.statusText);
+    state.config = data.config || cfg;
+    fb.textContent = "Settings saved"; fb.className = "feedback ok";
+  } catch (e) { fb.textContent = `Error: ${e.message}`; fb.className = "feedback err"; }
+  finally { btn.disabled = false; btn.textContent = "Save Settings"; }
+  setTimeout(() => { fb.className = "feedback"; }, 3000);
+}
+async function probe(name) {
+  const btn = document.getElementById(`probe-btn-${name}`);
+  if (btn) { btn.disabled = true; btn.textContent = "…"; }
+  const fb = document.getElementById("fb");
+  try {
+    const r = await fetch("/probe", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || r.statusText);
+    await refresh();
+    fb.textContent = data.healthy ? `"${name}" is healthy` : `"${name}" probe: ${data.status} (errors: ${data.error_count})`;
+    fb.className = data.healthy ? "feedback ok" : "feedback err";
+  } catch (e) { fb.textContent = `Probe error: ${e.message}`; fb.className = "feedback err"; }
+  finally { if (btn) { btn.disabled = false; btn.textContent = "Test"; } }
+  setTimeout(() => { fb.className = "feedback"; }, 4000);
+}
+async function pick(name) {
+  const fb = document.getElementById("fb");
+  try {
+    const r = await fetch("/select", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
+    if (!r.ok) throw new Error(await r.text());
+    state.active = name; render();
+    fb.textContent = `Switched to "${name}"`; fb.className = "feedback ok";
+  } catch (e) { fb.textContent = `Error: ${e.message}`; fb.className = "feedback err"; }
+  setTimeout(() => { fb.className = "feedback"; }, 3000);
+}
+init();
+</script>
+</body>
+</html>

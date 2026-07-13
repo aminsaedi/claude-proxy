@@ -2,16 +2,17 @@ services:
   proxy:
     build: .
     restart: unless-stopped
+    # Runs as the non-root uid baked into the image; ./data is chowned to 10001.
+    user: "10001:10001"
     ports:
-      - "127.0.0.1:8181:8080"
-      - "${TAILSCALE_IP}:8182:8090"
+      - "127.0.0.1:8181:8080"          # proxy — localhost
+      - "${TAILSCALE_IP}:8181:8080"    # proxy — tailnet
+      - "${TAILSCALE_IP}:8182:8090"    # admin — tailnet only, never public
     env_file:
       - .env
     volumes:
-      - ./tokens.yaml:/app/tokens.yaml
-      - ./virtual_keys.yaml:/app/virtual_keys.yaml
-      - ./usage_stats.json:/app/usage_stats.json
-      - ./config.yaml:/app/config.yaml
+      # Single data dir (not per-file) so atomic temp+rename writes work.
+      - ./data:/app/data
     logging:
       options:
         max-size: "10m"

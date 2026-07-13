@@ -1,9 +1,11 @@
 # claude-proxy
 
-A lightweight self-hosted proxy for the Anthropic Claude API. It sits between
-your clients and `api.anthropic.com`, authenticating upstream with OAuth tokens
-while exposing simple API keys to your clients. Multiple upstream tokens can be
-configured and switched live from an admin UI.
+A self-hosted proxy for the Anthropic Claude API. It sits between your clients
+and `api.anthropic.com`, authenticating upstream with subscription **OAuth
+tokens** while exposing simple **virtual API keys** to your clients. Multiple
+upstream tokens can be configured; the proxy transparently **fails over** on
+rate-limits/errors, tracks per-key usage (including cache tokens), and can
+**auto-rotate** the active token from a Tailscale-only admin UI.
 
 ## Architecture
 
@@ -11,25 +13,54 @@ configured and switched live from an admin UI.
 clients (virtual API key)
         │
         ▼
-  proxy :8080  ──OAuth──►  api.anthropic.com
-        │
-  admin :8090  (Tailscale only)
+  proxy :8080 ──OAuth──►  api.anthropic.com
+        │   └─ per-request failover across tokens on 429/5xx
+  admin :8090  (Tailscale only, HTTP Basic auth)
 ```
 
-- **Proxy** (`port 8080 → host 8181`): Accepts `x-api-key` or `Authorization: Bearer` with a virtual key, proxies to Anthropic with the active OAuth token. Supports streaming.
-- **Admin UI** (`port 8090 → host 8182`): Shows OAuth token utilization/rate-limit headers, lets you switch the active token, and displays per-virtual-key usage. Bound to `$TAILSCALE_IP` only.
-- **Prometheus metrics** at `/metrics` on the admin port.
+- **Proxy** (`8080 → host 8181`): accepts `x-api-key` or `Authorization: Bearer`
+  with a virtual key, forwards to Anthropic with the active OAuth token. Streams
+  SSE. On a retryable upstream error it retries the request on the next healthy
+  token before the client ever sees a failure.
+- **Admin UI** (`8090 → host 8182`, Tailscale-only): token utilization/health,
+  live token switch, per-virtual-key usage (input/output **and cache** tokens),
+  settings, and Prometheus metrics. Protected by HTTP Basic auth when
+  `ADMIN_PASSWORD` is set.
+
+The app is a typed Python package under `src/claude_proxy/` (see `CLAUDE.md` for
+the module map). It runs as a **non-root** user in the container.
+
+## Layout
+
+Runtime data lives in a single bind-mounted `data/` directory (so writes are
+atomic — temp file + rename):
+
+| File | Purpose | Gitignored |
+|------|---------|------------|
+| `data/tokens.yaml` | Upstream OAuth tokens | Yes |
+| `data/virtual_keys.yaml` | Client virtual keys | Yes |
+| `data/config.yaml` | Hot-reloadable settings | Yes |
+| `data/usage_stats.json` | Persisted usage counters | Yes |
+| `.env` | `TAILSCALE_IP`, `ADMIN_USER`, `ADMIN_PASSWORD` | Yes |
+
+> ⚠️ Everything under `data/` and `.env` is secret — all gitignored. Never commit them.
 
 ## Setup
 
-### 1. Upstream OAuth tokens — `tokens.yaml`
-
-Copy the example and fill in your Anthropic OAuth tokens:
-
 ```bash
-cp tokens.yaml.example tokens.yaml
+cp .env.example .env                       # set TAILSCALE_IP + ADMIN_PASSWORD
+mkdir -p data
+cp tokens.yaml.example        data/tokens.yaml
+cp virtual_keys.yaml.example  data/virtual_keys.yaml
+cp config.yaml.example        data/config.yaml
+echo '{}' > data/usage_stats.json
+sudo chown -R 10001:10001 data             # container runs as uid 10001
+docker compose up -d --build
 ```
 
+Or run the guided installer: `./install.sh`.
+
+**`data/tokens.yaml`**
 ```yaml
 tokens:
   - name: personal
@@ -39,46 +70,14 @@ tokens:
     token: "sk-ant-oat-..."
 ```
 
-At least one entry is required. The entry with `default: true` is used on
-startup; if none is marked, the first entry is used.
-
-### 2. Virtual API keys — `virtual_keys.yaml`
-
-Copy the example and define keys for your clients:
-
-```bash
-cp virtual_keys.yaml.example virtual_keys.yaml
-```
-
+**`data/virtual_keys.yaml`** (hot-reloaded within ~5s — no restart needed)
 ```yaml
 virtual_keys:
   - name: alice
     key: "vk-alice-secret-key"
-  - name: ci
-    key: "vk-ci-secret-key"
 ```
-
-Clients send these in `x-api-key` (or `Authorization: Bearer`). Usage is
-tracked per name.
-
-### 3. Environment — `.env`
-
-```bash
-cp .env.example .env
-# edit .env and set your Tailscale node IP
-```
-
-### 4. Run
-
-```bash
-docker compose up -d
-```
-
-The proxy is available at `http://localhost:8181/v1/...`.
 
 ## Usage
-
-Point any Anthropic SDK or tool at the proxy:
 
 ```bash
 ANTHROPIC_BASE_URL=http://localhost:8181 \
@@ -86,70 +85,32 @@ ANTHROPIC_API_KEY=vk-alice-secret-key \
   claude ...
 ```
 
-Or in code:
-
-```python
-import anthropic
-client = anthropic.Anthropic(
-    base_url="http://localhost:8181",
-    api_key="vk-alice-secret-key",
-)
-```
-
 ## Admin UI
 
-Open `http://<tailscale-ip>:8182` in a browser to:
+Open `http://<tailscale-ip>:8182` (Basic auth). Shows 5h/7d utilization, health
+(healthy / rate-limited / unhealthy), live token switch, per-key usage with cache
+columns, settings, and an auto-rotation log. Auto-refreshes every 5s.
 
-- See 5h / 7d rate-limit utilization bars for each OAuth token
-- Switch the active upstream token live
-- View per-virtual-key request counts and token usage by model
-- Access raw Anthropic rate-limit response headers
+## Prometheus metrics
 
-Auto-refreshes every 5 seconds.
+At `http://<tailscale-ip>:8182/metrics` (no auth, for scraping):
+`proxy_requests_total`, `proxy_{input,output,cache_read,cache_creation}_tokens_total`,
+`proxy_upstream_utilization_{5h,7d}_ratio`, `proxy_token_healthy`,
+`proxy_auto_rotations_total`, `proxy_failovers_total`, `proxy_request_latency_seconds`.
 
-## Prometheus Metrics
-
-Available at `http://<tailscale-ip>:8182/metrics`:
-
-| Metric | Labels | Description |
-|--------|--------|-------------|
-| `proxy_requests_total` | `key_name`, `model`, `status` | Total requests |
-| `proxy_input_tokens_total` | `key_name`, `model` | Input tokens consumed |
-| `proxy_output_tokens_total` | `key_name`, `model` | Output tokens consumed |
-| `proxy_upstream_utilization_5h_ratio` | `token_name` | 5-hour utilization (0–1) |
-| `proxy_upstream_utilization_7d_ratio` | `token_name` | 7-day utilization (0–1) |
-
-## TUI Manager
-
-A Textual terminal UI is bundled in the container for managing keys and tokens
-without hand-editing YAML files.
+## Managing keys/tokens (TUI)
 
 ```bash
 docker compose exec -it proxy python manage.py
 ```
 
-Features:
-- **Virtual Keys tab** — list, add (with auto-generated key option), reveal full key, delete
-- **Upstream Tokens tab** — list, add, reveal, set default, delete
-- **Restart button** — sends SIGTERM to the proxy process; Docker restarts the container automatically (`restart: unless-stopped`)
+## Development
 
-Keyboard shortcuts: `q` quit · `r` restart · `Tab` switch tabs · `↑↓` navigate rows
-
-Changes are written immediately to the bind-mounted YAML files on the host.
-A container restart is required for key/token changes to take effect.
-
-## Files
-
-| File | Purpose | Gitignored |
-|------|---------|------------|
-| `tokens.yaml` | Upstream OAuth tokens | Yes |
-| `tokens.yaml.example` | Template for tokens.yaml | No |
-| `virtual_keys.yaml` | Client virtual keys | No |
-| `virtual_keys.yaml.example` | Template for virtual_keys.yaml | No |
-| `.env` | `TAILSCALE_IP` | Yes |
-| `.env.example` | Template for .env | No |
-| `usage_stats.json` | Persisted usage data | No |
-| `proxy.py` | Proxy + admin server | — |
-| `manage.py` | Textual TUI manager | — |
-| `docker-compose.yml` | Container config | — |
-| `Dockerfile` | Image build | — |
+```bash
+python -m venv .venv && . .venv/bin/activate
+pip install -e ".[dev]"
+CLAUDE_PROXY_DATA_DIR=./data python -m claude_proxy   # run locally
+pytest            # tests
+ruff check .      # lint
+mypy              # type-check
+```

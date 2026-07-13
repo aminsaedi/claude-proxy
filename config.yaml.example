@@ -1,0 +1,16 @@
+# Hot-reloadable proxy configuration. Copy to data/config.yaml (the proxy also
+# writes a default one on first run). All values are validated on load and on
+# every admin-UI save.
+
+auto_rotation:
+  enabled: false               # master switch for automatic token rotation
+  threshold_5h: 0.95           # rotate when the active token's 5h util >= this (0.0–1.0)
+  target_max_util_5h: 0.50     # on high-util rotation, only switch to tokens below this
+  check_interval_seconds: 30   # how often to evaluate (>= 5)
+  probe_before_switch: true    # health-check the candidate before switching
+  cooldown_seconds: 120        # min seconds between util-based rotations (dead/rate-limited active bypasses this)
+  notify_only: false           # log rotation decisions without actually switching
+
+health_probe_interval_seconds: 60    # re-probe unhealthy tokens (>= 10)
+active_probe_interval_seconds: 300   # validate the active token periodically (>= 30)
+upstream_timeout_seconds: 600        # HTTP timeout for upstream calls (restart to apply)

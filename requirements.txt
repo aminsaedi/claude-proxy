@@ -1,6 +1,9 @@
-fastapi
-uvicorn
-httpx
-pyyaml
-prometheus_client
-textual
+# Runtime dependencies, pinned for reproducible Docker builds.
+# Dev/test tooling lives in pyproject.toml ([project.optional-dependencies].dev).
+fastapi==0.136.0
+uvicorn==0.45.0
+httpx==0.28.1
+PyYAML==6.0.3
+pydantic==2.13.3
+prometheus-client==0.21.1
+rich==15.0.0

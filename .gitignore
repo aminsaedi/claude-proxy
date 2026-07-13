@@ -1,2 +1,18 @@
+# Secrets & local state — never commit.
 .env
+data/
 tokens.yaml
+virtual_keys.yaml
+usage_stats.json
+config.yaml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.coverage
