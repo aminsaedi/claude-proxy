@@ -7,7 +7,11 @@ a ``finally`` block — the proxy/rotation tests depend on alice/bob being intac
 
 from __future__ import annotations
 
+import asyncio
+import json
+
 import httpx
+import uvicorn
 
 from claude_proxy import db
 from claude_proxy.admin_app import build_admin_app
@@ -16,6 +20,22 @@ from claude_proxy.app import AppState
 
 def _asgi(app):
     return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://admin")
+
+
+async def _read_event(lines) -> tuple[str | None, str]:
+    """Pull one SSE frame (event:/data: lines up to the blank separator)."""
+    ev, data = None, []
+    async for raw in lines:
+        line = raw.rstrip("\r")
+        if line == "":
+            if ev is not None:
+                return ev, "\n".join(data)
+            continue
+        if line.startswith("event:"):
+            ev = line[len("event:"):].strip()
+        elif line.startswith("data:"):
+            data.append(line[len("data:"):].lstrip())
+    return ev, "\n".join(data)
 
 
 async def test_token_crud_reveal_and_default():
@@ -111,3 +131,59 @@ async def test_vkey_delete_last_is_blocked():
         finally:
             if "bob" not in {v["name"] for v in db.list_virtual_keys()}:
                 db.add_virtual_key("bob", "vk-bob")
+
+
+def test_appstate_pubsub_notify():
+    """subscribe/notify/unsubscribe: notify() sets every live subscriber."""
+    state = AppState()
+    a = state.subscribe()
+    b = state.subscribe()
+    assert not a.is_set() and not b.is_set()
+    state.notify()
+    assert a.is_set() and b.is_set()
+    state.unsubscribe(a)
+    a.clear()
+    b.clear()
+    state.notify()
+    assert b.is_set() and not a.is_set()  # unsubscribed one is no longer nudged
+    state.unsubscribe(b)
+
+
+async def test_events_initial_state_and_push_on_mutation():
+    """The SSE stream sends current state on connect, then pushes on mutation.
+
+    httpx's ASGITransport buffers infinite responses, so SSE must be exercised
+    against a real server on an ephemeral port.
+    """
+    state = AppState()
+    app = build_admin_app(state)
+    cfg = uvicorn.Config(app, host="127.0.0.1", port=0, log_level="error", lifespan="off")
+    server = uvicorn.Server(cfg)
+    server.install_signal_handlers = lambda: None  # type: ignore[method-assign]
+    serve = asyncio.create_task(server.serve())
+    try:
+        while not server.started:  # noqa: ASYNC110 - poll uvicorn's bind flag
+            await asyncio.sleep(0.02)
+        port = server.servers[0].sockets[0].getsockname()[1]
+        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}") as ac:
+            async with ac.stream("GET", "/events") as r:
+                assert r.status_code == 200
+                assert r.headers["content-type"].startswith("text/event-stream")
+                lines = r.aiter_lines()
+                # first frame is the current state
+                ev, data = await asyncio.wait_for(_read_event(lines), timeout=5)
+                assert ev == "state"
+                assert "alice" in {v["name"] for v in json.loads(data)["virtual_keys"]}
+                # a mutation must produce a fresh state push (via notify)
+                assert (await ac.post("/virtual-keys", json={"name": "zsse"})).status_code == 200
+                found = False
+                for _ in range(8):  # tolerate a heartbeat/unchanged frame or two
+                    ev, data = await asyncio.wait_for(_read_event(lines), timeout=5)
+                    if ev == "state" and "zsse" in {v["name"] for v in json.loads(data)["virtual_keys"]}:
+                        found = True
+                        break
+                assert found, "expected a state push carrying the new key"
+    finally:
+        db.delete_virtual_key("zsse")
+        server.should_exit = True
+        await asyncio.wait_for(serve, timeout=5)

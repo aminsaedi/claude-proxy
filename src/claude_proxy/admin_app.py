@@ -7,13 +7,15 @@ Optional HTTP Basic auth protects the dashboard and all mutating endpoints when
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import secrets
 import sqlite3
+from collections.abc import AsyncIterator
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, generate_latest
 from pydantic import ValidationError
@@ -30,6 +32,32 @@ log = logging.getLogger("claude_proxy.admin")
 def _gen_vk() -> str:
     """Generate a fresh downstream virtual key (matches manage.py)."""
     return "vk-" + secrets.token_urlsafe(24)
+
+
+# Seconds the SSE stream waits for a mutation nudge before recomputing on its
+# own — bounds how long background changes (health probes, usage) take to reach
+# a viewer. Also the heartbeat cadence that keeps the connection warm.
+_SSE_HEARTBEAT = 3.0
+
+
+async def _snapshot(state) -> dict:  # noqa: ANN001
+    """The full dashboard state — shared by GET /state and the SSE stream."""
+    usage = await state.usage.snapshot()
+    return {
+        "tokens": state.tokens.names(),
+        "active": state.tokens.active,
+        "default_token": state.tokens.default,
+        "token_previews": {n: state.tokens.preview(n) for n in state.tokens.names()},
+        "headers": {n: state.tokens.health[n].headers for n in state.tokens.names()},
+        "health": state.tokens.state_payload(),
+        "virtual_keys": [
+            {"name": n, "preview": state.vkeys.preview(n), "usage": usage.get(n, {})}
+            for n in state.vkeys.names()
+        ],
+        "config": state.config.model_dump(),
+        "rotation_log": state.rotation_log,
+        "auth_enabled": admin_auth_enabled(),
+    }
 
 _ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 _ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
@@ -61,22 +89,56 @@ def build_admin_app(state) -> FastAPI:  # noqa: ANN001
 
     @app.get("/state", dependencies=protected)
     async def get_state() -> JSONResponse:
-        usage = await state.usage.snapshot()
-        return JSONResponse({
-            "tokens": state.tokens.names(),
-            "active": state.tokens.active,
-            "default_token": state.tokens.default,
-            "token_previews": {n: state.tokens.preview(n) for n in state.tokens.names()},
-            "headers": {n: state.tokens.health[n].headers for n in state.tokens.names()},
-            "health": state.tokens.state_payload(),
-            "virtual_keys": [
-                {"name": n, "preview": state.vkeys.preview(n), "usage": usage.get(n, {})}
-                for n in state.vkeys.names()
-            ],
-            "config": state.config.model_dump(),
-            "rotation_log": state.rotation_log,
-            "auth_enabled": admin_auth_enabled(),
-        })
+        return JSONResponse(await _snapshot(state))
+
+    @app.get("/events", dependencies=protected)
+    async def events(request: Request) -> StreamingResponse:
+        """Live dashboard feed over Server-Sent Events.
+
+        The browser opens one long-lived ``EventSource`` instead of polling. We
+        push a ``state`` event only when the snapshot actually changes (compared
+        by hash), so an idle dashboard never re-renders — that's what keeps
+        scroll position, open panels, and in-progress forms from resetting.
+        A ``ping`` event every few seconds tells the client the link is live,
+        and ``state.notify()`` from a mutation wakes the loop for instant push.
+        """
+
+        async def gen() -> AsyncIterator[str]:
+            ev = state.subscribe()
+            last_hash: int | None = None
+            try:
+                # Prime the client with the current state immediately on connect.
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    ev.clear()  # clear before snapshotting so a concurrent
+                    #             notify() during this pass isn't lost
+                    snap = await _snapshot(state)
+                    payload = json.dumps(snap, default=str, sort_keys=True)
+                    digest = hash(payload)
+                    if digest != last_hash:
+                        last_hash = digest
+                        yield f"event: state\ndata: {payload}\n\n"
+                    else:
+                        yield "event: ping\ndata: 1\n\n"
+                    try:
+                        await asyncio.wait_for(ev.wait(), timeout=_SSE_HEARTBEAT)
+                    except TimeoutError:
+                        pass
+            except asyncio.CancelledError:  # client dropped / server shutdown
+                raise
+            finally:
+                state.unsubscribe(ev)
+
+        return StreamingResponse(
+            gen(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",  # defeat any proxy response buffering
+            },
+        )
 
     # --- upstream tokens: CRUD -------------------------------------------
     @app.post("/tokens", dependencies=protected)
@@ -91,6 +153,7 @@ def build_admin_app(state) -> FastAPI:  # noqa: ANN001
         await asyncio.to_thread(db.add_token, name, token, bool(body.get("default")))
         state.tokens.reload()
         metrics.TOKEN_HEALTHY.labels(token_name=name).set(1)
+        state.notify()
         log.info("Token added via admin API: %s", name)
         return JSONResponse({"ok": True, "name": name})
 
@@ -109,6 +172,7 @@ def build_admin_app(state) -> FastAPI:  # noqa: ANN001
         state.tokens.reload()
         if token is not None:  # secret changed — old health/rate-limit no longer applies
             state.tokens.health[name] = TokenHealth()
+        state.notify()
         log.info("Token updated via admin API: %s", name)
         return JSONResponse({"ok": True, "name": name, "default": state.tokens.default})
 
@@ -120,6 +184,7 @@ def build_admin_app(state) -> FastAPI:  # noqa: ANN001
             return JSONResponse(status_code=400, content={"error": "Can't delete the last upstream token"})
         await asyncio.to_thread(db.delete_token, name)
         state.tokens.reload()
+        state.notify()
         log.info("Token deleted via admin API: %s", name)
         return JSONResponse({"ok": True, "active": state.tokens.active})
 
@@ -144,6 +209,7 @@ def build_admin_app(state) -> FastAPI:  # noqa: ANN001
         except sqlite3.IntegrityError:
             return JSONResponse(status_code=409, content={"error": "That key value is already in use"})
         state.vkeys.reload_if_changed()
+        state.notify()
         log.info("Virtual key added via admin API: %s", name)
         return JSONResponse({"ok": True, "name": name, "key": key})
 
@@ -163,6 +229,7 @@ def build_admin_app(state) -> FastAPI:  # noqa: ANN001
         except sqlite3.IntegrityError:
             return JSONResponse(status_code=409, content={"error": f"Key {new!r} already exists"})
         state.vkeys.reload_if_changed()
+        state.notify()
         log.info("Virtual key renamed via admin API: %s -> %s", name, new)
         return JSONResponse({"ok": True, "name": new})
 
@@ -174,6 +241,7 @@ def build_admin_app(state) -> FastAPI:  # noqa: ANN001
             return JSONResponse(status_code=400, content={"error": "Can't delete the last virtual key"})
         await asyncio.to_thread(db.delete_virtual_key, name)
         state.vkeys.reload_if_changed()
+        state.notify()
         log.info("Virtual key deleted via admin API: %s", name)
         return JSONResponse({"ok": True})
 
@@ -184,6 +252,7 @@ def build_admin_app(state) -> FastAPI:  # noqa: ANN001
         new_key = _gen_vk()
         await asyncio.to_thread(db.set_virtual_key, name, new_key)
         state.vkeys.reload_if_changed()
+        state.notify()
         log.info("Virtual key rotated via admin API: %s", name)
         return JSONResponse({"ok": True, "name": name, "key": new_key})
 
@@ -199,6 +268,7 @@ def build_admin_app(state) -> FastAPI:  # noqa: ANN001
         if name not in state.tokens:
             return JSONResponse(status_code=400, content={"error": f"Unknown token: {name!r}"})
         state.tokens.set_active(name)
+        state.notify()
         log.info("Token switched to: %s", name)
         return JSONResponse({"active": state.tokens.active})
 
@@ -209,6 +279,7 @@ def build_admin_app(state) -> FastAPI:  # noqa: ANN001
             return JSONResponse(status_code=400, content={"error": f"Unknown token: {name!r}"})
         ok = await health.probe(state.tokens, state.probe_client, name)
         h = state.tokens.health[name]
+        state.notify()
         return JSONResponse({"healthy": ok, "status": h.status, "error_count": h.error_count})
 
     @app.get("/config", dependencies=protected)
@@ -233,6 +304,7 @@ def build_admin_app(state) -> FastAPI:  # noqa: ANN001
             return JSONResponse(status_code=400, content={"error": msg})
         state.config = cfg
         save_config(cfg)
+        state.notify()
         log.info("Config updated via admin API")
         return JSONResponse({"ok": True, "config": cfg.model_dump()})
 

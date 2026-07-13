@@ -34,6 +34,24 @@ class AppState:
         self.last_rotation_time: float = 0.0
         self.client: httpx.AsyncClient | None = None
         self.probe_client: httpx.AsyncClient | None = None
+        # Live push (SSE): each open /events stream registers a wakeup Event so a
+        # mutation can nudge every viewer to re-send immediately instead of
+        # waiting for its periodic recompute. asyncio.Event binds to the running
+        # loop lazily, so constructing this outside a loop (e.g. tests) is fine.
+        self._subscribers: set[asyncio.Event] = set()
+
+    def subscribe(self) -> asyncio.Event:
+        ev = asyncio.Event()
+        self._subscribers.add(ev)
+        return ev
+
+    def unsubscribe(self, ev: asyncio.Event) -> None:
+        self._subscribers.discard(ev)
+
+    def notify(self) -> None:
+        """Wake every live viewer so it re-checks state and pushes if changed."""
+        for ev in self._subscribers:
+            ev.set()
 
 
 async def _vkey_reload_loop(state: AppState) -> None:

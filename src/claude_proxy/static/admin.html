@@ -427,12 +427,19 @@ const SVG = {
 };
 
 // ---- clipboard (works on plain-http tailnet, where navigator.clipboard is absent) ----
-async function copyText(text){
-  try{ if(navigator.clipboard && window.isSecureContext){ await navigator.clipboard.writeText(text); return true; } }catch(e){}
+// Two things bite us here: (1) navigator.clipboard only exists in a secure
+// context, which a plain-http tailnet URL is not; (2) the execCommand fallback
+// needs its temp field inside the open <dialog> — showModal() makes the rest of
+// the document inert, so a textarea on <body> can't be selected or copied.
+async function copyText(text, host){
+  try{ if(window.isSecureContext && navigator.clipboard){ await navigator.clipboard.writeText(text); return true; } }catch(e){}
+  const root = host || document.querySelector("dialog[open]") || document.body;
   try{
-    const ta=document.createElement("textarea"); ta.value=text;
-    ta.style.position="fixed"; ta.style.opacity="0"; document.body.appendChild(ta);
-    ta.focus(); ta.select(); const ok=document.execCommand("copy"); ta.remove(); return ok;
+    const ta=document.createElement("textarea"); ta.value=text; ta.setAttribute("readonly","");
+    ta.style.cssText="position:fixed;top:0;left:0;width:1px;height:1px;padding:0;border:0;opacity:0";
+    root.appendChild(ta);
+    ta.focus(); ta.select(); try{ ta.setSelectionRange(0, text.length); }catch(e){}
+    const ok=document.execCommand("copy"); ta.remove(); return ok;
   }catch(e){ return false; }
 }
 
@@ -489,7 +496,11 @@ function revealDialog({title, label, value, note=""}){
     </div></div>
     <div class="dlg-foot"><button type="button" class="btn primary" data-x>Done</button></div>`);
   const input=d.querySelector("input");
-  d.querySelector("[data-copy]").onclick=async()=>{ const ok=await copyText(value); toast(ok?"ok":"err", ok?"Copied to clipboard":"Couldn't copy — select and copy manually"); };
+  d.querySelector("[data-copy]").onclick=async()=>{
+    const ok=await copyText(value, d);   // copy from inside this dialog (top layer, not inert)
+    if(!ok){ input.focus(); input.select(); try{ input.setSelectionRange(0, value.length); }catch(e){} }
+    toast(ok?"ok":"err", ok?"Copied to clipboard":"Couldn't copy — text is selected, press ⌘/Ctrl-C");
+  };
   d.querySelector("[data-x]").onclick=()=>d.close();
   d.showModal(); input.focus(); input.select();
 }
@@ -508,7 +519,10 @@ const enc = encodeURIComponent;
 // ---- state ----
 let state = null;
 let cfgDirty = false;       // don't clobber the form while the operator edits
-let lastOk = 0;
+let lastCfgJSON = null;     // only rebuild the form when config actually changed
+let lastOk = 0;             // last state change received
+let lastBeat = 0;           // last sign of life (state OR heartbeat) from the stream
+let es = null;              // the live EventSource
 const CIRC = 2 * Math.PI * 62 * 0.5;  // semicircle arc length for r=62
 
 // =====================================================================
@@ -659,10 +673,12 @@ function renderTokens(){
       tokRefs.set(name, card);
       box.appendChild(card);
     }
+    card.classList.toggle("is-active", name===state.active);
+    const html = tokenCardHTML(name);
+    if(card._html === html) return;   // nothing changed — don't clobber focus/selection
     // preserve <details open> across re-render
     const wasOpen = card.querySelector("details.raw")?.open;
-    card.classList.toggle("is-active", name===state.active);
-    card.innerHTML = tokenCardHTML(name);
+    card.innerHTML = html; card._html = html;
     if(wasOpen){ const d=card.querySelector("details.raw"); if(d) d.open=true; }
     card.querySelector(".act-select").onclick = ()=>selectToken(name);
     card.querySelector(".act-probe").onclick = (e)=>probeToken(name, e.currentTarget);
@@ -677,6 +693,44 @@ function renderTokens(){
 // Clients  (usage per virtual key, magnitude share bar + expandable)
 // =====================================================================
 const clientOpen = new Set();
+const clientRefs = new Map();   // name -> wrapper element (with ._html cache)
+function clientInnerHTML(t, max){
+  const rows = t.models.map(([mn,m])=>`<tr><td>${esc(mn)}</td><td>${m.requests||0}</td><td>${fmt(m.input_tokens)}</td><td>${fmt(m.output_tokens)}</td><td>${fmt(m.cache_read_input_tokens)}</td><td>${fmt(m.cache_creation_input_tokens)}</td></tr>`).join("");
+  const share = Math.round(t.tot/max*100);
+  return `<button class="client-head" aria-expanded="${clientOpen.has(t.name)}" style="--sh:${share}%" title="${share}% of the busiest client's tokens">
+      <span class="client-id">
+        <svg class="caret" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
+        <span class="name">${esc(t.name)}</span>
+      </span>
+      <span class="client-nums">
+        <span class="cn"><div class="v">${t.req}</div><div class="k">req</div></span>
+        <span class="cn"><div class="v">${fmt(t.inp)}</div><div class="k">in</div></span>
+        <span class="cn"><div class="v">${fmt(t.out)}</div><div class="k">out</div></span>
+        <span class="cn"><div class="v">${fmt(t.cr)}</div><div class="k">cache</div></span>
+      </span>
+    </button>
+    <div class="client-body">
+      <div class="client-actions">
+        <button class="btn ck-reveal" type="button">${SVG.eye} Reveal key</button>
+        <button class="btn ck-rotate" type="button">${SVG.rotate} Rotate</button>
+        <button class="btn ck-rename" type="button">${SVG.rename} Rename</button>
+        <button class="btn danger ck-delete" type="button">${SVG.trash} Delete</button>
+        <span class="ckey" title="Masked — use Reveal for the full key">${esc(t.preview||"vk-…")}</span>
+      </div>
+      ${t.models.length?`<table class="utable"><thead><tr><th>Model</th><th>Req</th><th>Input</th><th>Output</th><th>Cache rd</th><th>Cache wr</th></tr></thead><tbody>${rows}</tbody></table>`:`<div class="empty">No usage recorded yet.</div>`}
+    </div>`;
+}
+function bindClient(el, nm){
+  el.querySelector(".client-head").onclick = ()=>{
+    if(clientOpen.has(nm)) clientOpen.delete(nm); else clientOpen.add(nm);
+    el.classList.toggle("open");
+    el.querySelector(".client-head").setAttribute("aria-expanded", clientOpen.has(nm));
+  };
+  el.querySelector(".ck-reveal")?.addEventListener("click", ()=>revealKey(nm));
+  el.querySelector(".ck-rotate")?.addEventListener("click", ()=>rotateKey(nm));
+  el.querySelector(".ck-rename")?.addEventListener("click", ()=>renameKey(nm));
+  el.querySelector(".ck-delete")?.addEventListener("click", ()=>deleteKey(nm));
+}
 function renderClients(){
   const box = $("#clients");
   const vks = state.virtual_keys || [];
@@ -688,48 +742,31 @@ function renderClients(){
     tot = inp+out+cr+cw;
     return {name:vk.name, preview:vk.preview||"", req,inp,out,cr,cw,tot,models};
   }).sort((a,b)=>b.tot-a.tot);
+  if(!totals.length){
+    box.innerHTML = `<div class="client"><div class="empty">No clients configured.</div></div>`;
+    clientRefs.clear();
+    return;
+  }
   const max = Math.max(1, ...totals.map(t=>t.tot));
-  box.innerHTML = totals.map(t=>{
-    const rows = t.models.map(([mn,m])=>`<tr><td>${esc(mn)}</td><td>${m.requests||0}</td><td>${fmt(m.input_tokens)}</td><td>${fmt(m.output_tokens)}</td><td>${fmt(m.cache_read_input_tokens)}</td><td>${fmt(m.cache_creation_input_tokens)}</td></tr>`).join("");
-    const open = clientOpen.has(t.name);
-    const share = Math.round(t.tot/max*100);
-    return `<div class="client ${open?'open':''}" data-name="${esc(t.name)}">
-      <button class="client-head" aria-expanded="${open}" style="--sh:${share}%" title="${share}% of the busiest client's tokens">
-        <span class="client-id">
-          <svg class="caret" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
-          <span class="name">${esc(t.name)}</span>
-        </span>
-        <span class="client-nums">
-          <span class="cn"><div class="v">${t.req}</div><div class="k">req</div></span>
-          <span class="cn"><div class="v">${fmt(t.inp)}</div><div class="k">in</div></span>
-          <span class="cn"><div class="v">${fmt(t.out)}</div><div class="k">out</div></span>
-          <span class="cn"><div class="v">${fmt(t.cr)}</div><div class="k">cache</div></span>
-        </span>
-      </button>
-      <div class="client-body">
-        <div class="client-actions">
-          <button class="btn ck-reveal" type="button">${SVG.eye} Reveal key</button>
-          <button class="btn ck-rotate" type="button">${SVG.rotate} Rotate</button>
-          <button class="btn ck-rename" type="button">${SVG.rename} Rename</button>
-          <button class="btn danger ck-delete" type="button">${SVG.trash} Delete</button>
-          <span class="ckey" title="Masked — use Reveal for the full key">${esc(t.preview||"vk-…")}</span>
-        </div>
-        ${t.models.length?`<table class="utable"><thead><tr><th>Model</th><th>Req</th><th>Input</th><th>Output</th><th>Cache rd</th><th>Cache wr</th></tr></thead><tbody>${rows}</tbody></table>`:`<div class="empty">No usage recorded yet.</div>`}
-      </div>
-    </div>`;
-  }).join("") || `<div class="client"><div class="empty">No clients configured.</div></div>`;
-  box.querySelectorAll(".client").forEach(el=>{
-    const nm = el.dataset.name;
-    el.querySelector(".client-head").onclick = ()=>{
-      if(clientOpen.has(nm)) clientOpen.delete(nm); else clientOpen.add(nm);
-      el.classList.toggle("open");
-      el.querySelector(".client-head").setAttribute("aria-expanded", clientOpen.has(nm));
-    };
-    el.querySelector(".ck-reveal")?.addEventListener("click", ()=>revealKey(nm));
-    el.querySelector(".ck-rotate")?.addEventListener("click", ()=>rotateKey(nm));
-    el.querySelector(".ck-rename")?.addEventListener("click", ()=>renameKey(nm));
-    el.querySelector(".ck-delete")?.addEventListener("click", ()=>deleteKey(nm));
+  const seen = new Set();
+  // keyed patch: reuse each client's wrapper node, only rewrite its innards when
+  // the content actually changed — an unchanged row keeps its focus & selection.
+  totals.forEach(t=>{
+    seen.add(t.name);
+    let el = clientRefs.get(t.name);
+    if(!el){
+      el = document.createElement("div");
+      el.className = "client"; el.dataset.name = t.name;
+      clientRefs.set(t.name, el);
+    }
+    const html = clientInnerHTML(t, max);
+    if(el._html !== html){ el.innerHTML = html; el._html = html; bindClient(el, t.name); }
+    el.classList.toggle("open", clientOpen.has(t.name));
+    box.appendChild(el);   // reorder into sorted position; a no-op if already there
   });
+  for(const [name,el] of clientRefs){ if(!seen.has(name)){ el.remove(); clientRefs.delete(name); } }
+  const live = new Set(clientRefs.values());
+  Array.from(box.children).forEach(c=>{ if(!live.has(c)) c.remove(); });  // drop stale placeholder
 }
 
 // =====================================================================
@@ -754,6 +791,7 @@ const CFG = [
 const cget = (o,p)=>p.split(".").reduce((a,k)=>a&&a[k]!==undefined?a[k]:undefined,o);
 function buildForm(){
   const cfg = state.config||{};
+  lastCfgJSON = JSON.stringify(cfg);   // mark this config as rendered
   const f = $("#cfgForm");
   f.innerHTML = CFG.map(grp=>`<div class="cfg-group"><div class="glabel">${grp.g}</div>${grp.rows.map(([path,type,label,hint])=>{
     const v = cget(cfg,path);
@@ -946,32 +984,58 @@ function renderSystem(){
 }
 
 // =====================================================================
-// fetch + render loop
+// live feed (SSE) + render
 // =====================================================================
+function renderAll(){
+  renderSystem(); renderHero(); renderTiles(); renderTokens(); renderClients(); renderLog();
+  const cfgJSON = JSON.stringify(state.config||{});
+  if(!cfgDirty && cfgJSON!==lastCfgJSON) buildForm();   // never clobber a form being edited
+  $("#authnote").textContent = state.auth_enabled ? "Admin auth: on" : "Tailnet-only · no admin auth";
+}
+function clearStale(){
+  $("#banner").classList.remove("show");
+  document.querySelectorAll(".stale").forEach(e=>e.classList.remove("stale"));
+}
+function applyState(data){
+  state = data; lastOk = Date.now(); lastBeat = Date.now();
+  clearStale(); renderAll();
+}
+function connError(msg){
+  $("#bannerText").textContent = "Live connection lost — reconnecting… ("+msg+")";
+  $("#banner").classList.add("show");
+  // keep the last good frame, dim it (interaction.md: refetch keeps the frame)
+  ["hero","tokens","clients","tiles"].forEach(id=>{ if(state) $("#"+id).classList.add("stale"); });
+}
+
+// One-shot GET /state — instant first paint and the manual "refresh" button.
 async function refresh(){
   try{
     const r = await fetch("/state",{cache:"no-store"});
     if(!r.ok) throw new Error("HTTP "+r.status);
-    state = await r.json();
-    lastOk = Date.now();
-    $("#banner").classList.remove("show");
-    document.querySelectorAll(".stale").forEach(e=>e.classList.remove("stale"));
-    renderSystem(); renderHero(); renderTiles(); renderTokens(); renderClients(); renderLog();
-    if(!cfgDirty) buildForm();
-    $("#authnote").textContent = state.auth_enabled ? "Admin auth: on" : "Tailnet-only · no admin auth";
-  }catch(err){
-    $("#bannerText").textContent = "Can't reach the proxy — retrying. ("+err.message+")";
-    $("#banner").classList.add("show");
-    // keep the last good frame, dim it (interaction.md: refetch keeps the frame)
-    ["hero","tokens","clients","tiles"].forEach(id=>{ if(state) $("#"+id).classList.add("stale"); });
-  }
+    applyState(await r.json());
+  }catch(err){ connError(err.message); }
 }
 
-// live countdowns + "synced Ns ago" between fetches
+// The live channel: one long-lived EventSource replaces the old 5s poll. A
+// `state` event only arrives when something actually changed, so the page sits
+// still (scroll, open panels, forms intact) until there's real news. `ping`
+// keeps the "live" indicator honest. EventSource auto-reconnects on drop.
+function connectSSE(){
+  try{ if(es) es.close(); }catch(e){}
+  es = new EventSource("/events");
+  es.addEventListener("state", e=>{
+    let data; try{ data=JSON.parse(e.data); }catch(err){ return; }
+    applyState(data);
+  });
+  es.addEventListener("ping", ()=>{ lastBeat=Date.now(); clearStale(); });
+  es.onopen = ()=>{ lastBeat=Date.now(); clearStale(); };
+  es.onerror = ()=>{ connError("stream closed"); };  // browser retries automatically
+}
+
+// live countdowns + "live / Ns ago" indicator between pushes
 function tick(){
-  if(lastOk){ const s=Math.round((Date.now()-lastOk)/1000); $("#synctext").textContent = s<2?"live":`${s}s ago`; }
+  if(lastBeat){ const s=Math.round((Date.now()-lastBeat)/1000); $("#synctext").textContent = s<5?"live":`${s}s ago`; }
   document.querySelectorAll("[data-reset]").forEach(el=>{ const ts=el.getAttribute("data-reset"); if(ts) el.textContent="resets "+fmtReset(ts); });
-  const rs=$("#hero")?.querySelector(".reset5"); // hero 5h countdown handled on full render; cheap enough
 }
 
 // ---- toasts ----
@@ -995,13 +1059,17 @@ function applyTheme(t){ document.documentElement.dataset.theme=t; localStorage.s
 }
 applyTheme(localStorage.getItem("cp-theme") || (matchMedia("(prefers-color-scheme: light)").matches?"light":"dark"));
 $("#themeBtn").onclick = ()=>applyTheme(document.documentElement.dataset.theme==="dark"?"light":"dark");
-$("#refreshBtn").onclick = ()=>{ $("#refreshBtn").style.transform="rotate(360deg)"; setTimeout(()=>$("#refreshBtn").style.transform="",400); refresh(); };
+$("#refreshBtn").onclick = ()=>{
+  $("#refreshBtn").style.transform="rotate(360deg)"; setTimeout(()=>$("#refreshBtn").style.transform="",400);
+  refresh();                                        // instant one-shot
+  if(!es || es.readyState===2) connectSSE();        // revive a dead stream
+};
 $("#addTokenBtn").onclick = addToken;
 $("#addKeyBtn").onclick = addKey;
 
 // ---- boot ----
-refresh();
-setInterval(refresh, 5000);
+refresh();          // instant first paint via GET /state
+connectSSE();       // then switch to the live push feed
 setInterval(tick, 1000);
 </script>
 </body>
