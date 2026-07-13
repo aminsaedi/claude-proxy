@@ -7,9 +7,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Literal
 
-import yaml
-
-from .paths import TOKENS_FILE, VKEYS_FILE
+from . import db
 
 log = logging.getLogger("claude_proxy.stores")
 
@@ -63,13 +61,10 @@ class TokenStore:
         self.load()
 
     def load(self) -> None:
-        if not TOKENS_FILE.exists():
-            raise RuntimeError(f"{TOKENS_FILE} not found — create it with at least one token")
-        data = yaml.safe_load(TOKENS_FILE.read_text()) or {}
-        entries = data.get("tokens", [])
+        entries = db.list_tokens()
         tokens = {t["name"]: t["token"] for t in entries}
         if not tokens:
-            raise RuntimeError("tokens.yaml must contain at least one token")
+            raise RuntimeError("No upstream tokens in the database — add one via manage.py")
         default = next((t["name"] for t in entries if t.get("default")), next(iter(tokens)))
         self._tokens = tokens
         self._order = list(tokens)
@@ -153,38 +148,35 @@ class TokenStore:
 
 
 class VirtualKeyStore:
-    """Downstream client keys, hot-reloaded from virtual_keys.yaml on mtime change."""
+    """Downstream client keys, cached in memory and refreshed from the DB."""
 
     def __init__(self) -> None:
         self._by_name: dict[str, str] = {}
         self._by_key: dict[str, str] = {}
-        self._mtime: float = 0.0
+        self._sig: frozenset = frozenset()
         self.load()
 
     def load(self) -> None:
-        by_name: dict[str, str] = {}
-        if VKEYS_FILE.exists():
-            data = yaml.safe_load(VKEYS_FILE.read_text()) or {}
-            by_name = {vk["name"]: vk["key"] for vk in data.get("virtual_keys", [])}
-            self._mtime = VKEYS_FILE.stat().st_mtime
+        by_name = {vk["name"]: vk["key"] for vk in db.list_virtual_keys()}
         if not by_name:
-            raise RuntimeError("No virtual keys configured: create virtual_keys.yaml")
+            raise RuntimeError("No virtual keys in the database — add one via manage.py")
         self._by_name = by_name
         self._by_key = {v: k for k, v in by_name.items()}
+        self._sig = frozenset(by_name.items())
 
     def reload_if_changed(self) -> bool:
         try:
-            mtime = VKEYS_FILE.stat().st_mtime
-        except OSError:
+            by_name = {vk["name"]: vk["key"] for vk in db.list_virtual_keys()}
+        except Exception as e:  # noqa: BLE001 - keep serving cached keys on DB error
+            log.warning("Failed to reload virtual keys: %s", e)
             return False
-        if mtime == self._mtime:
+        sig = frozenset(by_name.items())
+        if sig == self._sig or not by_name:
             return False
-        try:
-            self.load()
-        except Exception as e:  # noqa: BLE001 - keep serving old keys on bad file
-            log.warning("Failed to reload virtual_keys.yaml: %s", e)
-            return False
-        log.info("Reloaded virtual_keys.yaml (%d keys)", len(self._by_name))
+        self._by_name = by_name
+        self._by_key = {v: k for k, v in by_name.items()}
+        self._sig = sig
+        log.info("Reloaded virtual keys from DB (%d keys)", len(by_name))
         return True
 
     def resolve(self, key: str | None) -> str | None:

@@ -1,22 +1,19 @@
 """Per-virtual-key, per-model usage tracking.
 
-Thread-safe under an ``asyncio.Lock`` and persisted with a debounced background
-flusher (atomic write, off the event loop) so the hot request path never blocks
-on disk I/O. Tracks cache tokens in addition to input/output — with Claude's
-prompt caching these dominate real spend, so ignoring them (as the original
-did) badly undercounts usage.
+Thread-safe under an ``asyncio.Lock`` and persisted to SQLite with a debounced
+background flusher (off the event loop) so the hot request path never blocks on
+I/O. Tracks cache tokens in addition to input/output — with Claude's prompt
+caching these dominate real spend, so ignoring them (as the original did) badly
+undercounts usage.
 """
 
 from __future__ import annotations
 
 import asyncio
 import copy
-import json
 import logging
 
-from . import metrics
-from .atomicio import atomic_write_text
-from .paths import USAGE_FILE
+from . import db, metrics
 
 log = logging.getLogger("claude_proxy.usage")
 
@@ -38,12 +35,11 @@ class UsageTracker:
 
     @staticmethod
     def _load() -> dict:
-        if USAGE_FILE.exists():
-            try:
-                return json.loads(USAGE_FILE.read_text())
-            except Exception:  # noqa: BLE001
-                log.warning("usage_stats.json unreadable — starting fresh")
-        return {}
+        try:
+            return db.load_usage()
+        except Exception:  # noqa: BLE001
+            log.warning("usage table unreadable — starting fresh")
+            return {}
 
     async def record(
         self,
@@ -87,10 +83,10 @@ class UsageTracker:
         async with self._lock:
             if not self._dirty:
                 return
-            data = json.dumps(self._stats, indent=2)
+            snapshot = copy.deepcopy(self._stats)
             self._dirty = False
         try:
-            await asyncio.to_thread(atomic_write_text, USAGE_FILE, data)
+            await asyncio.to_thread(db.replace_usage, snapshot)
         except Exception as e:  # noqa: BLE001
             log.warning("Failed to persist usage stats: %s", e)
             async with self._lock:

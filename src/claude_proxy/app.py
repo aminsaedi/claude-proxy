@@ -9,7 +9,7 @@ import os
 import httpx
 import uvicorn
 
-from . import health, metrics, rotation
+from . import db, health, metrics, rotation
 from .admin_app import admin_auth_enabled, build_admin_app
 from .config import load_config
 from .proxy_app import build_proxy_app
@@ -25,6 +25,7 @@ class AppState:
     """Container for all shared, mutable runtime state (no module globals)."""
 
     def __init__(self) -> None:
+        db.init_schema()
         self.config = load_config()
         self.tokens = TokenStore()
         self.vkeys = VirtualKeyStore()

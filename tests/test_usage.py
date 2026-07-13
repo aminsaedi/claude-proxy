@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import json
-
-from claude_proxy.paths import USAGE_FILE
+from claude_proxy import db
 from claude_proxy.usage import UsageTracker
 
 
@@ -28,13 +26,13 @@ async def test_record_ignores_empty():
     assert await u.snapshot() == {}
 
 
-async def test_flush_is_atomic_and_reloads():
+async def test_flush_persists_to_db_and_reloads():
     u = UsageTracker()
     await u.record("bob", "claude-haiku-4-5", input_tokens=7, output_tokens=8)
     await u.flush()
-    on_disk = json.loads(USAGE_FILE.read_text())
+    on_disk = db.load_usage()
     assert on_disk["bob"]["claude-haiku-4-5"]["input_tokens"] == 7
-    # a fresh tracker loads what was flushed
+    # a fresh tracker loads what was flushed from the DB
     u2 = UsageTracker()
     snap = await u2.snapshot()
     assert snap["bob"]["claude-haiku-4-5"]["output_tokens"] == 8

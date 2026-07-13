@@ -54,7 +54,6 @@ EOF
 fi
 
 [[ -f data/config.yaml ]] || { cp config.yaml.example data/config.yaml; success "data/config.yaml created."; }
-[[ -f data/usage_stats.json ]] || echo "{}" > data/usage_stats.json
 
 # --- .env (admin UI / Tailscale) -----------------------------------------
 if [[ -f .env ]]; then
@@ -73,12 +72,20 @@ EOF
     echo -e "${DIM}  Password: ${ADMIN_PASSWORD}${RESET}"
 fi
 
-# --- ownership + start ----------------------------------------------------
+# --- ownership + seed DB + start ------------------------------------------
 info "Setting data/ ownership to container uid ${APP_UID}…"
 chown -R "${APP_UID}:${APP_UID}" data 2>/dev/null || sudo chown -R "${APP_UID}:${APP_UID}" data
 
-info "Building and starting…"; echo
-docker compose up -d --build
+info "Building image…"; echo
+docker compose build
+
+if [[ ! -f data/claude_proxy.db ]]; then
+    info "Seeding SQLite DB from YAML…"
+    docker compose run --rm proxy python -m claude_proxy.migrate
+fi
+
+info "Starting…"; echo
+docker compose up -d
 
 echo; success "claude-proxy is running."
 echo -e "  ${BOLD}Proxy:${RESET}    http://localhost:8181"

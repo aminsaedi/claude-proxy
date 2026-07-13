@@ -19,17 +19,29 @@ an admin UI on port 8090 — plus background tasks, all under one asyncio loop.
 - `usage.py` — `UsageTracker`: async-locked, debounced, atomic; tracks cache tokens.
 - `health.py` — token probing (429 → rate_limited, 401/403 → unhealthy) + `health_loop`.
 - `rotation.py` — health-aware auto-rotation (`rotation_loop`).
-- `config.py` / `models.py` — pydantic `AppConfig` load/save (atomic) with validation.
-- `metrics.py` — Prometheus. `atomicio.py` — temp-file+rename writes. `paths.py` — data-dir resolution.
+- `db.py` — SQLite layer (schema + CRUD); the single source of truth.
+- `config.py` / `models.py` — pydantic `AppConfig`, persisted as a JSON row in the DB.
+- `migrate.py` — one-time YAML/JSON → SQLite importer (`python -m claude_proxy.migrate`).
+- `metrics.py` — Prometheus. `paths.py` — data-dir / DB-path resolution.
 - `static/admin.html` — the dashboard (extracted from Python).
-- `manage.py` (repo root) — rich TUI, talks to the admin API + edits YAML.
+- `manage.py` (repo root) — rich TUI; CRUD via `db`, live actions via the admin API.
 
-## Data files (bind-mounted `data/`, all gitignored)
+## Storage (SQLite)
 
-`data/tokens.yaml`, `data/virtual_keys.yaml`, `data/config.yaml`,
-`data/usage_stats.json`. Path root is `CLAUDE_PROXY_DATA_DIR` (`/app/data` in the
-container). A single directory is mounted (not individual files) so atomic
-temp+rename writes work.
+Everything lives in one SQLite DB, `CLAUDE_PROXY_DB` (default
+`$CLAUDE_PROXY_DATA_DIR/claude_proxy.db`; `/data/claude_proxy.db` in k8s). Tables:
+`tokens`, `virtual_keys`, `config` (single JSON row), `usage`. WAL mode lets the
+app and a `manage.py` process share the file. The request path never hits the DB
+— tokens/keys/config are cached in memory (vkeys refreshed from the DB every ~5s),
+usage is flushed on a debounced background task via `asyncio.to_thread`.
+
+## Deployment (k3s)
+
+Manifests in `k8s/claude-proxy.yaml`. API is public via Traefik Ingress
+(`claude-proxy.aminsaedi.com`) behind the in-cluster Cloudflare Tunnel; admin is
+tailnet-only via a Tailscale L4 `LoadBalancer` service. DB on a `local-path` PVC
+(pod pinned to its node), seeded once from a `claude-proxy-seed` Secret via an
+initContainer, non-root uid 10001. Also runnable via `docker compose` (see README).
 
 ## Common tasks
 

@@ -1,0 +1,189 @@
+# claude-proxy on k3s.
+#   API   -> internet via Traefik Ingress + Cloudflare Tunnel (claude-proxy.aminsaedi.com)
+#   Admin -> tailnet only via a Tailscale L4 LoadBalancer (claude-proxy-admin.<tailnet>.ts.net)
+#
+# Two secrets are created out-of-band (kept out of git):
+#   claude-proxy-admin : ADMIN_USER / ADMIN_PASSWORD  (env)
+#   claude-proxy-seed  : claude_proxy.db              (one-time PVC seed; delete after first deploy)
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: claude-proxy
+---
+# Per-namespace wildcard TLS (cert-manager auto-renews); Traefik serves it for the Ingress host.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: wildcard-aminsaedi-com
+  namespace: claude-proxy
+spec:
+  secretName: wildcard-aminsaedi-com-tls
+  issuerRef:
+    kind: ClusterIssuer
+    name: letsencrypt-dns-prod
+  dnsNames:
+    - "*.aminsaedi.com"
+    - "aminsaedi.com"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: claude-proxy-data
+  namespace: claude-proxy
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: claude-proxy
+  namespace: claude-proxy
+  labels:
+    app: claude-proxy
+spec:
+  replicas: 1
+  # RWO local-path volume lives on one node; never run two pods against it.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: claude-proxy
+  template:
+    metadata:
+      labels:
+        app: claude-proxy
+    spec:
+      # local-path PVC binds to a node; toronto is the public front door with clean egress.
+      nodeSelector:
+        kubernetes.io/hostname: toronto
+      securityContext:
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+      initContainers:
+        # Seed the SQLite DB into the PVC on first run only (idempotent).
+        - name: seed-db
+          image: 100.69.180.101:31500/claude-proxy:v2
+          command: ["sh", "-c", "test -f /data/claude_proxy.db || cp /seed/claude_proxy.db /data/claude_proxy.db"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: seed
+              mountPath: /seed
+              readOnly: true
+      containers:
+        - name: proxy
+          image: 100.69.180.101:31500/claude-proxy:v2
+          imagePullPolicy: Always
+          env:
+            - name: CLAUDE_PROXY_DATA_DIR
+              value: /data
+            - name: CLAUDE_PROXY_DB
+              value: /data/claude_proxy.db
+            - name: ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: claude-proxy-admin
+                  key: ADMIN_USER
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: claude-proxy-admin
+                  key: ADMIN_PASSWORD
+          ports:
+            - name: proxy
+              containerPort: 8080
+            - name: admin
+              containerPort: 8090
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: claude-proxy-data
+        - name: seed
+          secret:
+            secretName: claude-proxy-seed
+            optional: true
+---
+# API service (ClusterIP) — target of the Traefik Ingress.
+apiVersion: v1
+kind: Service
+metadata:
+  name: claude-proxy
+  namespace: claude-proxy
+spec:
+  selector:
+    app: claude-proxy
+  ports:
+    - name: proxy
+      port: 8080
+      targetPort: 8080
+---
+# Admin service — Tailscale L4 LoadBalancer, tailnet-only (never internet).
+apiVersion: v1
+kind: Service
+metadata:
+  name: claude-proxy-admin
+  namespace: claude-proxy
+  annotations:
+    tailscale.com/hostname: claude-proxy-admin
+spec:
+  type: LoadBalancer
+  loadBalancerClass: tailscale
+  selector:
+    app: claude-proxy
+  ports:
+    - name: admin
+      port: 8090
+      targetPort: 8090
+---
+# Public API ingress via Traefik (Cloudflare Tunnel routes to traefik → this Ingress by host).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: claude-proxy
+  namespace: claude-proxy
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts:
+        - claude-proxy.aminsaedi.com
+      secretName: wildcard-aminsaedi-com-tls
+  rules:
+    - host: claude-proxy.aminsaedi.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: claude-proxy
+                port:
+                  number: 8080

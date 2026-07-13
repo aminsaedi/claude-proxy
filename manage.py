@@ -2,8 +2,10 @@
 """Claude Proxy Manager — interactive TUI for keys, tokens, and settings.
 
 Run inside the container:  docker compose exec -it proxy python manage.py
-Talks to the live admin API for token selection / probing / config, and edits
-the YAML files directly for key/token CRUD.
+CRUD goes straight to the SQLite DB; live actions (switch token, probe, save
+config) go through the admin API so the running proxy picks them up immediately.
+Virtual-key changes are hot-reloaded by the proxy within ~5s; token changes
+need a restart.
 """
 
 from __future__ import annotations
@@ -18,21 +20,22 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-import yaml
-from rich.console import Console
-from rich.panel import Panel
-from rich.table import Table
+# Allow running from a raw checkout (no install): put src/ on the path.
+sys.path.insert(0, str(Path(__file__).parent / "src"))
 
-DATA_DIR = Path(os.environ.get("CLAUDE_PROXY_DATA_DIR", Path(__file__).parent))
-VKEYS_FILE = DATA_DIR / "virtual_keys.yaml"
-TOKENS_FILE = DATA_DIR / "tokens.yaml"
-CONFIG_FILE = DATA_DIR / "config.yaml"
+from rich.console import Console  # noqa: E402
+from rich.panel import Panel  # noqa: E402
+from rich.table import Table  # noqa: E402
+
+from claude_proxy import db  # noqa: E402
+
 ADMIN_PORT = int(os.environ.get("ADMIN_PORT", "8090"))
 ADMIN_URL = f"http://localhost:{ADMIN_PORT}"
 _ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 _ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 
 console = Console()
+db.init_schema()
 
 
 # --- admin API helpers -----------------------------------------------------
@@ -40,8 +43,8 @@ console = Console()
 def _headers(extra: dict | None = None) -> dict:
     h = dict(extra or {})
     if _ADMIN_PASSWORD:
-        token = base64.b64encode(f"{_ADMIN_USER}:{_ADMIN_PASSWORD}".encode()).decode()
-        h["Authorization"] = f"Basic {token}"
+        tok = base64.b64encode(f"{_ADMIN_USER}:{_ADMIN_PASSWORD}".encode()).decode()
+        h["Authorization"] = f"Basic {tok}"
     return h
 
 
@@ -57,10 +60,8 @@ def _get(path: str, timeout: float = 2.0):
 def _post(path: str, payload: dict, timeout: float = 5.0):
     try:
         req = urllib.request.Request(
-            f"{ADMIN_URL}{path}",
-            data=json.dumps(payload).encode(),
-            headers=_headers({"Content-Type": "application/json"}),
-            method="POST",
+            f"{ADMIN_URL}{path}", data=json.dumps(payload).encode(),
+            headers=_headers({"Content-Type": "application/json"}), method="POST",
         )
         with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read())
@@ -69,20 +70,6 @@ def _post(path: str, payload: dict, timeout: float = 5.0):
     except Exception as e:
         console.print(f"[red]Could not reach admin API ({ADMIN_URL}): {e}[/]")
     return None
-
-
-# --- YAML helpers ----------------------------------------------------------
-
-def load_yaml(path: Path, key: str) -> list[dict]:
-    if not path.exists():
-        return []
-    return (yaml.safe_load(path.read_text()) or {}).get(key, [])
-
-
-def save_yaml(path: Path, key: str, items: list[dict]) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(yaml.dump({key: items}, default_flow_style=False, allow_unicode=True))
-    tmp.replace(path)
 
 
 def mask(s: str, show: int = 12) -> str:
@@ -122,10 +109,7 @@ def pick(prompt: str, options: list[str]) -> int | None:
 
 
 def header(title: str) -> None:
-    console.clear()
-    console.print()
-    console.rule(f"[bold magenta]{title}[/]")
-    console.print()
+    console.clear(); console.print(); console.rule(f"[bold magenta]{title}[/]"); console.print()
 
 
 def pause() -> None:
@@ -140,7 +124,7 @@ def pause() -> None:
 def menu_virtual_keys() -> None:
     while True:
         header("Virtual Keys")
-        keys = load_yaml(VKEYS_FILE, "virtual_keys")
+        keys = db.list_virtual_keys()
         t = Table(box=None, padding=(0, 2), header_style="bold dim")
         t.add_column("#", style="dim", width=4)
         t.add_column("Name", style="bold")
@@ -158,11 +142,9 @@ def menu_virtual_keys() -> None:
             if not name or any(k["name"] == name for k in keys):
                 console.print("[red]Missing or duplicate name.[/]"); pause(); continue
             key = ask("Key (blank = auto-generate)") or gen_key()
-            keys.append({"name": name, "key": key})
-            save_yaml(VKEYS_FILE, "virtual_keys", keys)
+            db.add_virtual_key(name, key)
             console.print(f"\n[green]Added '{name}'.[/]  [dim]{key}[/]")
-            console.print("[dim](hot-reloaded within ~5s — no restart needed)[/]")
-            pause()
+            console.print("[dim](hot-reloaded within ~5s — no restart needed)[/]"); pause()
         elif idx == 1 and keys:
             n = pick("Reveal which key", [k["name"] for k in keys])
             if n is not None:
@@ -170,9 +152,8 @@ def menu_virtual_keys() -> None:
         elif idx == 2 and keys:
             n = pick("Delete which key", [k["name"] for k in keys])
             if n is not None and confirm(f"Delete '{keys[n]['name']}'?"):
-                name = keys[n]["name"]
-                save_yaml(VKEYS_FILE, "virtual_keys", [k for k in keys if k["name"] != name])
-                console.print(f"[green]Deleted '{name}'.[/]"); pause()
+                db.delete_virtual_key(keys[n]["name"])
+                console.print(f"[green]Deleted '{keys[n]['name']}'.[/]"); pause()
 
 
 # --- tokens ----------------------------------------------------------------
@@ -190,7 +171,7 @@ def _health_cell(h: dict | None) -> str:
 def menu_tokens() -> None:
     while True:
         header("Upstream Tokens")
-        tokens = load_yaml(TOKENS_FILE, "tokens")
+        tokens = db.list_tokens()
         state = _get("/state")
         active = state["active"] if state else None
         health = state.get("health") if state else {}
@@ -226,8 +207,8 @@ def menu_tokens() -> None:
                 console.print("[dim]Probing (up to 30s)…[/]")
                 r = _post("/probe", {"name": tokens[n]["name"]}, timeout=35)
                 if r:
-                    console.print(f"[bold]{'green' if r['healthy'] else 'red'}]"
-                                  f"{tokens[n]['name']}: {r.get('status')}[/]")
+                    color = "green" if r["healthy"] else "red"
+                    console.print(f"[bold {color}]{tokens[n]['name']}: {r.get('status')}[/]")
                 pause()
         elif idx == 2:
             name = ask("Name (e.g. personal)")
@@ -236,13 +217,7 @@ def menu_tokens() -> None:
             token = ask("Token (sk-ant-oat-...)")
             if not token:
                 console.print("[red]Token required.[/]"); pause(); continue
-            entry: dict = {"name": name, "token": token}
-            if confirm("Set as default?"):
-                for tk in tokens:
-                    tk.pop("default", None)
-                entry["default"] = True
-            tokens.append(entry)
-            save_yaml(TOKENS_FILE, "tokens", tokens)
+            db.add_token(name, token, is_default=confirm("Set as default?"))
             console.print(f"[green]Added '{name}'. Restart to load it.[/]"); pause()
         elif idx == 3 and tokens:
             n = pick("Reveal which token", [tk["name"] for tk in tokens])
@@ -251,17 +226,13 @@ def menu_tokens() -> None:
         elif idx == 4 and tokens:
             n = pick("Set default (used on next restart)", [tk["name"] for tk in tokens])
             if n is not None:
-                for tk in tokens:
-                    tk.pop("default", None)
-                tokens[n]["default"] = True
-                save_yaml(TOKENS_FILE, "tokens", tokens)
+                db.set_default_token(tokens[n]["name"])
                 console.print(f"[green]'{tokens[n]['name']}' is now default.[/]"); pause()
         elif idx == 5 and tokens:
             n = pick("Delete which token", [tk["name"] for tk in tokens])
             if n is not None and confirm(f"Delete '{tokens[n]['name']}'?"):
-                name = tokens[n]["name"]
-                save_yaml(TOKENS_FILE, "tokens", [tk for tk in tokens if tk["name"] != name])
-                console.print(f"[green]Deleted '{name}'. Restart to apply.[/]"); pause()
+                db.delete_token(tokens[n]["name"])
+                console.print(f"[green]Deleted '{tokens[n]['name']}'. Restart to apply.[/]"); pause()
 
 
 # --- settings --------------------------------------------------------------
@@ -301,8 +272,8 @@ def menu_settings() -> None:
         cfg = _get("/config")
         via_api = cfg is not None
         if cfg is None:
-            cfg = yaml.safe_load(CONFIG_FILE.read_text()) if CONFIG_FILE.exists() else {}
-            console.print("  [dim yellow]Admin API unavailable — editing config.yaml directly[/]\n")
+            cfg = db.get_config_json() or {}
+            console.print("  [dim yellow]Admin API unavailable — editing DB directly[/]\n")
         t = Table(box=None, padding=(0, 2), header_style="bold dim")
         t.add_column("#", style="dim", width=4)
         t.add_column("Setting", style="bold")
@@ -332,17 +303,15 @@ def menu_settings() -> None:
         if via_api and _post("/config", cfg):
             console.print("[green]Saved (live).[/]")
         else:
-            CONFIG_FILE.write_text(yaml.dump(cfg, default_flow_style=False, sort_keys=False))
-            console.print("[yellow]Saved to file (restart to apply).[/]")
+            db.set_config_json(cfg)
+            console.print("[yellow]Saved to DB (restart to apply).[/]")
         pause()
 
 
 # --- restart ---------------------------------------------------------------
 
 def do_restart() -> None:
-    console.print("\n[yellow]Sends SIGTERM to PID 1; Docker restarts the container.[/]")
-    console.print("[dim]This session disconnects — reconnect with:[/]")
-    console.print("[dim]  docker compose exec -it proxy python manage.py[/]\n")
+    console.print("\n[yellow]Sends SIGTERM to PID 1; the orchestrator restarts the pod/container.[/]\n")
     if confirm("Restart the proxy now?"):
         try:
             os.kill(1, signal.SIGTERM)

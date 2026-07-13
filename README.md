@@ -28,54 +28,34 @@ clients (virtual API key)
   `ADMIN_PASSWORD` is set.
 
 The app is a typed Python package under `src/claude_proxy/` (see `CLAUDE.md` for
-the module map). It runs as a **non-root** user in the container.
+the module map). It runs as a **non-root** user (uid 10001).
 
-## Layout
+## Storage
 
-Runtime data lives in a single bind-mounted `data/` directory (so writes are
-atomic — temp file + rename):
+All state — tokens, virtual keys, config, and usage — lives in a single
+**SQLite** database (`data/claude_proxy.db`, WAL mode). The app serves from
+in-memory caches and only touches the DB at startup, on the debounced usage
+flush, and on admin/CRUD calls, so the request hot path never blocks on I/O.
 
-| File | Purpose | Gitignored |
+| Path | Purpose | Gitignored |
 |------|---------|------------|
-| `data/tokens.yaml` | Upstream OAuth tokens | Yes |
-| `data/virtual_keys.yaml` | Client virtual keys | Yes |
-| `data/config.yaml` | Hot-reloadable settings | Yes |
-| `data/usage_stats.json` | Persisted usage counters | Yes |
+| `data/claude_proxy.db` | SQLite: tokens, keys, config, usage | Yes |
 | `.env` | `TAILSCALE_IP`, `ADMIN_USER`, `ADMIN_PASSWORD` | Yes |
 
-> ⚠️ Everything under `data/` and `.env` is secret — all gitignored. Never commit them.
+Manage tokens/keys/settings with the TUI (`manage.py`) or the admin UI. There is
+no YAML to hand-edit. Migrating from the old YAML layout:
+`python -m claude_proxy.migrate` imports `tokens.yaml` / `virtual_keys.yaml` /
+`config.yaml` / `usage_stats.json` from the data dir into the DB.
 
-## Setup
+## Setup (Docker Compose)
 
 ```bash
-cp .env.example .env                       # set TAILSCALE_IP + ADMIN_PASSWORD
-mkdir -p data
-cp tokens.yaml.example        data/tokens.yaml
-cp virtual_keys.yaml.example  data/virtual_keys.yaml
-cp config.yaml.example        data/config.yaml
-echo '{}' > data/usage_stats.json
-sudo chown -R 10001:10001 data             # container runs as uid 10001
-docker compose up -d --build
+cp .env.example .env          # set TAILSCALE_IP + ADMIN_PASSWORD
+./install.sh                  # prompts for a token + key, seeds the DB, starts
 ```
 
-Or run the guided installer: `./install.sh`.
-
-**`data/tokens.yaml`**
-```yaml
-tokens:
-  - name: personal
-    token: "sk-ant-oat-..."
-    default: true
-  - name: work
-    token: "sk-ant-oat-..."
-```
-
-**`data/virtual_keys.yaml`** (hot-reloaded within ~5s — no restart needed)
-```yaml
-virtual_keys:
-  - name: alice
-    key: "vk-alice-secret-key"
-```
+`install.sh` seeds `data/claude_proxy.db`, `chown`s `data/` to uid 10001, and
+runs `docker compose up -d --build`. Add more tokens/keys later via `manage.py`.
 
 ## Usage
 
@@ -104,12 +84,38 @@ At `http://<tailscale-ip>:8182/metrics` (no auth, for scraping):
 docker compose exec -it proxy python manage.py
 ```
 
+## Deploy on k3s
+
+Manifests live in `k8s/claude-proxy.yaml`. The deployment (see `CLAUDE.md`):
+
+- **API → internet** via a Traefik `Ingress` (`claude-proxy.aminsaedi.com`,
+  wildcard TLS from cert-manager) fronted by the in-cluster Cloudflare Tunnel.
+- **Admin → tailnet only** via a `Service type: LoadBalancer` +
+  `loadBalancerClass: tailscale` (L4), reachable at
+  `claude-proxy-admin.<tailnet>.ts.net:8090`.
+- SQLite DB on a `local-path` PVC (pod pinned to the node that owns it); runs
+  non-root (uid 10001, `fsGroup`); image from the in-cluster registry.
+
+```bash
+# build + push
+docker build -t <registry>/claude-proxy:v2 . && docker push <registry>/claude-proxy:v2
+# admin creds + one-time DB seed (kept out of git)
+kubectl -n claude-proxy create secret generic claude-proxy-admin \
+  --from-literal=ADMIN_USER=admin --from-literal=ADMIN_PASSWORD=<pw>
+kubectl -n claude-proxy create secret generic claude-proxy-seed \
+  --from-file=claude_proxy.db=<seeded db>     # delete after first deploy
+kubectl apply -f k8s/claude-proxy.yaml
+```
+
+Add the public host to the Cloudflare Tunnel config
+(`service: https://traefik.kube-system.svc.cluster.local:443`, `noTLSVerify: true`).
+
 ## Development
 
 ```bash
 python -m venv .venv && . .venv/bin/activate
 pip install -e ".[dev]"
-CLAUDE_PROXY_DATA_DIR=./data python -m claude_proxy   # run locally
+CLAUDE_PROXY_DATA_DIR=./data python -m claude_proxy   # DB at ./data/claude_proxy.db
 pytest            # tests
 ruff check .      # lint
 mypy              # type-check

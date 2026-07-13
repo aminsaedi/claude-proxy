@@ -12,6 +12,10 @@ from pathlib import Path
 
 DATA_DIR = Path(os.environ.get("CLAUDE_PROXY_DATA_DIR", ".")).resolve()
 
+# SQLite is the single source of truth for tokens, virtual keys, config, and usage.
+DB_FILE = Path(os.environ.get("CLAUDE_PROXY_DB", str(DATA_DIR / "claude_proxy.db")))
+
+# Legacy YAML/JSON locations — read only by the one-time migration importer.
 CONFIG_FILE = DATA_DIR / "config.yaml"
 TOKENS_FILE = DATA_DIR / "tokens.yaml"
 VKEYS_FILE = DATA_DIR / "virtual_keys.yaml"

@@ -1,6 +1,9 @@
 # Secrets & local state — never commit.
 .env
 data/
+*.db
+*.db-wal
+*.db-shm
 tokens.yaml
 virtual_keys.yaml
 usage_stats.json

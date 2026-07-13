@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 
-from claude_proxy.paths import VKEYS_FILE
+from claude_proxy import db
 from claude_proxy.stores import TokenHealth, TokenStore, VirtualKeyStore
 
 
@@ -17,18 +17,14 @@ def test_virtual_key_resolve():
 def test_virtual_key_hot_reload():
     vk = VirtualKeyStore()
     assert vk.resolve("vk-carol") is None
-    original = VKEYS_FILE.read_text()
+    db.add_virtual_key("carol", "vk-carol")
     try:
-        VKEYS_FILE.write_text(original + "  - name: carol\n    key: vk-carol\n")
-        # bump mtime to guarantee change is detected
-        future = time.time() + 5
-        import os
-        os.utime(VKEYS_FILE, (future, future))
         assert vk.reload_if_changed() is True
         assert vk.resolve("vk-carol") == "carol"
         assert vk.resolve("vk-alice") == "alice"
+        assert vk.reload_if_changed() is False  # no further change
     finally:
-        VKEYS_FILE.write_text(original)
+        db.delete_virtual_key("carol")
 
 
 def test_token_health_usable():
