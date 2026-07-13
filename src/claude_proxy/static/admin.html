@@ -1,384 +1,751 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Claude Proxy — Admin</title>
-<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%237c3aed'/%3E%3Ctext x='16' y='22' font-family='system-ui,sans-serif' font-size='18' font-weight='700' fill='white' text-anchor='middle'%3EC%3C/text%3E%3C/svg%3E">
+<meta name="color-scheme" content="dark light">
+<title>Claude Proxy · Console</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23d97757'/%3E%3Cpath d='M9 22 L16 9 L23 22' stroke='%23140f0c' stroke-width='2.4' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <style>
-* { box-sizing: border-box; margin: 0; padding: 0; }
-body {
-  font-family: system-ui, -apple-system, sans-serif;
-  background: #0d0d0f; color: #d4d4d8; min-height: 100vh;
-  display: flex; align-items: flex-start; justify-content: center; padding: 40px 16px;
+/* ============================ design tokens ============================ */
+:root {
+  --coral:        #d97757;   /* Claude accent — interactive / active */
+  --coral-bright: #e88e6f;
+  --coral-ink:    #1a0f0a;   /* text on coral */
+  --good:         #2fb344;   /* healthy / low utilization */
+  --warn:         #e0a23a;   /* rate-limited / high utilization */
+  --crit:         #e5484d;   /* dead / exhausted */
+  --font-ui: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", "Cascadia Code", Menlo, Consolas, monospace;
+  --r: 12px; --r-sm: 8px;
+  --gap: 18px;
+  --ease: cubic-bezier(.2,.7,.3,1);
 }
-.page { width: 100%; max-width: 680px; display: flex; flex-direction: column; gap: 24px; }
-.card { background: #18181b; border: 1px solid #27272a; border-radius: 14px; padding: 28px 32px; box-shadow: 0 4px 32px rgba(0,0,0,.4); }
-.section-title { font-size: 0.72rem; font-weight: 700; color: #52525b; letter-spacing: .08em; text-transform: uppercase; margin-bottom: 14px; }
-.logo { font-size: 1.2rem; font-weight: 700; color: #fff; margin-bottom: 4px; }
-.sub { font-size: 0.82rem; color: #71717a; }
-.token-card { border: 1.5px solid #27272a; border-radius: 10px; overflow: hidden; margin-bottom: 10px; transition: border-color .15s; }
-.token-card.active { border-color: #7c3aed; }
-.token-header { display: flex; align-items: center; gap: 12px; padding: 13px 16px; background: #09090b; cursor: pointer; width: 100%; text-align: left; border: none; color: #a1a1aa; font-size: 0.9rem; transition: background .15s; }
-.token-header:hover { background: #111113; }
-.token-card.active .token-header { background: #130f1e; color: #e4e4e7; }
-.indicator { width: 9px; height: 9px; border-radius: 50%; background: #3f3f46; flex-shrink: 0; }
-.token-card.active .indicator { background: #7c3aed; }
-.token-name { font-weight: 600; flex: 1; }
-.badge-active { font-size: 0.7rem; padding: 2px 8px; border-radius: 99px; background: #7c3aed22; color: #a78bfa; font-weight: 600; }
-.badge-status { font-size: 0.7rem; padding: 2px 8px; border-radius: 99px; font-weight: 600; }
-.badge-allowed  { background: #14532d33; color: #4ade80; }
-.badge-warning  { background: #78350f33; color: #fbbf24; }
-.badge-rejected { background: #7f1d1d33; color: #f87171; }
-.badge-nodata   { background: #27272a;   color: #52525b; }
-.badge-healthy   { background: #052e1633; color: #4ade80; }
-.badge-ratelimited { background: #78350f33; color: #fbbf24; }
-.badge-unhealthy { background: #450a0a33; color: #f87171; }
-.token-body { padding: 16px 18px 14px; background: #0d0d10; border-top: 1px solid #27272a; display: flex; flex-direction: column; gap: 12px; }
-.usage-row { display: flex; flex-direction: column; gap: 5px; }
-.usage-label-row { display: flex; align-items: center; gap: 8px; font-size: 0.78rem; }
-.period-label { font-weight: 700; color: #71717a; width: 22px; flex-shrink: 0; }
-.pct-label { font-weight: 700; font-size: 0.82rem; min-width: 36px; }
-.reset-label { color: #52525b; font-size: 0.76rem; margin-left: auto; }
-.bar-track { height: 6px; background: #27272a; border-radius: 99px; overflow: hidden; }
-.bar-fill  { height: 100%; border-radius: 99px; transition: width .4s ease; }
-.meta-row  { display: flex; flex-wrap: wrap; gap: 6px 16px; font-size: 0.76rem; color: #71717a; padding-top: 4px; border-top: 1px solid #1f1f23; }
-.meta-item { display: flex; gap: 5px; }
-.meta-key  { color: #52525b; }
-.meta-val.green { color: #4ade80; }
-.meta-val.amber { color: #fbbf24; }
-.meta-val.red   { color: #f87171; }
-details { margin-top: 4px; }
-summary { font-size: 0.76rem; color: #52525b; cursor: pointer; user-select: none; padding: 2px 0; }
-summary:hover { color: #71717a; }
-.raw-table { margin-top: 8px; width: 100%; border-collapse: collapse; font-size: 0.72rem; font-family: monospace; }
-.raw-table td { padding: 3px 6px; vertical-align: top; border-bottom: 1px solid #1f1f23; }
-.raw-table td:first-child { color: #71717a; white-space: nowrap; padding-right: 12px; }
-.raw-table td:last-child  { color: #a1a1aa; word-break: break-all; }
-.vkey-card { border: 1px solid #27272a; border-radius: 10px; overflow: hidden; margin-bottom: 10px; }
-.vkey-header { display: flex; align-items: center; gap: 12px; padding: 12px 16px; background: #09090b; }
-.vkey-name { font-weight: 700; font-size: 0.92rem; color: #e4e4e7; flex: 1; }
-.vkey-totals { display: flex; gap: 14px; font-size: 0.75rem; }
-.vkey-stat { display: flex; flex-direction: column; align-items: flex-end; }
-.vkey-stat-val { font-weight: 700; color: #e4e4e7; }
-.vkey-stat-lbl { font-size: 0.68rem; color: #52525b; }
-.vkey-body { padding: 12px 16px; background: #0d0d10; border-top: 1px solid #27272a; overflow-x: auto; }
-.vkey-nodata { padding: 12px 16px; background: #0d0d10; border-top: 1px solid #27272a; font-size: 0.8rem; color: #52525b; font-style: italic; }
-.usage-table { width: 100%; border-collapse: collapse; font-size: 0.78rem; }
-.usage-table th { text-align: left; padding: 4px 8px 6px; color: #52525b; font-weight: 600; font-size: 0.7rem; text-transform: uppercase; letter-spacing: .05em; border-bottom: 1px solid #1f1f23; }
-.usage-table td { padding: 6px 8px; border-bottom: 1px solid #1a1a1d; color: #a1a1aa; }
-.usage-table tr:last-child td { border-bottom: none; }
-.usage-table td.model-cell { color: #7c3aed; font-family: monospace; font-size: 0.76rem; }
-.usage-table td.num { text-align: right; font-variant-numeric: tabular-nums; color: #d4d4d8; }
-.feedback { margin-top: 14px; padding: 9px 14px; border-radius: 8px; font-size: 0.82rem; display: none; }
-.feedback.ok  { background: #052e16; color: #4ade80; border: 1px solid #14532d; display: block; }
-.feedback.err { background: #450a0a; color: #f87171; border: 1px solid #7f1d1d; display: block; }
-.probe-btn { font-size: 0.7rem; padding: 2px 9px; border-radius: 6px; border: 1px solid #3f3f46; background: #27272a; color: #a1a1aa; cursor: pointer; font-weight: 600; transition: background .15s, color .15s; }
-.probe-btn:hover:not(:disabled) { background: #3f3f46; color: #e4e4e7; }
-.probe-btn:disabled { opacity: 0.5; cursor: default; }
-.metrics-link { font-size: 0.8rem; color: #52525b; text-align: center; }
-.metrics-link a { color: #7c3aed; text-decoration: none; }
-.metrics-link a:hover { text-decoration: underline; }
-.config-group { margin-bottom: 18px; }
-.config-group-title { font-size: 0.78rem; font-weight: 700; color: #71717a; margin-bottom: 10px; text-transform: uppercase; letter-spacing: .05em; }
-.config-row { display: flex; align-items: center; justify-content: space-between; padding: 9px 0; border-bottom: 1px solid #1f1f23; gap: 12px; }
-.config-row:last-child { border-bottom: none; }
-.config-label { font-size: 0.82rem; color: #a1a1aa; }
-.config-hint { font-size: 0.7rem; color: #52525b; margin-top: 2px; }
-.config-input { background: #09090b; border: 1px solid #3f3f46; border-radius: 6px; color: #e4e4e7; font-size: 0.82rem; padding: 5px 10px; width: 80px; text-align: right; font-variant-numeric: tabular-nums; }
-.config-input:focus { border-color: #7c3aed; outline: none; }
-.toggle { position: relative; width: 40px; height: 22px; flex-shrink: 0; }
-.toggle input { opacity: 0; width: 0; height: 0; position: absolute; }
-.toggle-slider { position: absolute; inset: 0; background: #3f3f46; border-radius: 99px; cursor: pointer; transition: background .2s; }
-.toggle-slider::before { content: ""; position: absolute; left: 3px; top: 3px; width: 16px; height: 16px; border-radius: 50%; background: #71717a; transition: transform .2s, background .2s; }
-.toggle input:checked + .toggle-slider { background: #7c3aed; }
-.toggle input:checked + .toggle-slider::before { transform: translateX(18px); background: #fff; }
-.save-btn { background: #7c3aed; color: #fff; border: none; border-radius: 8px; padding: 9px 24px; font-size: 0.85rem; font-weight: 600; cursor: pointer; transition: background .15s; margin-top: 14px; }
-.save-btn:hover { background: #6d28d9; }
-.save-btn:disabled { opacity: 0.5; cursor: default; }
-.rotation-entry { padding: 5px 0; border-bottom: 1px solid #1f1f23; font-size: 0.76rem; color: #a1a1aa; }
-.rotation-entry:last-child { border-bottom: none; }
-.rotation-action { font-weight: 600; }
-.rotation-action.switched { color: #4ade80; }
-.rotation-action.notify { color: #fbbf24; }
+html[data-theme="dark"] {
+  --plane:    #0b0e12;       /* page background */
+  --grid:     #0e1217;
+  --surface:  #141a21;       /* card */
+  --surface-2:#1b232c;       /* inset / track */
+  --line:     rgba(255,255,255,.09);
+  --line-2:   rgba(255,255,255,.05);
+  --ink:      #eef2f5;
+  --ink-2:    #9aa6b2;
+  --muted:    #64707c;
+  --shadow:   0 1px 0 rgba(255,255,255,.03) inset, 0 10px 30px -12px rgba(0,0,0,.7);
+  --glow: 0 0 0 1px rgba(217,119,87,.35), 0 8px 30px -8px rgba(217,119,87,.28);
+}
+html[data-theme="light"] {
+  --plane:    #f4f2ee;
+  --grid:     #eceae4;
+  --surface:  #ffffff;
+  --surface-2:#f1efe9;
+  --line:     rgba(20,20,20,.10);
+  --line-2:   rgba(20,20,20,.055);
+  --ink:      #17191c;
+  --ink-2:    #545a61;
+  --muted:    #8a9098;
+  --good:#0f9a2e; --warn:#b4791a; --crit:#cf3237; --coral:#c15f3f; --coral-bright:#d97757;
+  --shadow:   0 1px 2px rgba(20,20,20,.04), 0 12px 28px -18px rgba(20,20,20,.25);
+  --glow: 0 0 0 1px rgba(193,95,63,.4), 0 8px 26px -10px rgba(193,95,63,.25);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+::selection { background: var(--coral); color: var(--coral-ink); }
+html { -webkit-text-size-adjust: 100%; }
+body {
+  font-family: var(--font-ui);
+  background: var(--plane);
+  color: var(--ink);
+  line-height: 1.45;
+  min-height: 100vh;
+  /* faint instrument grid */
+  background-image:
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 48px 48px;
+  background-position: -1px -1px;
+}
+a { color: var(--coral-bright); text-decoration: none; }
+a:hover { text-decoration: underline; }
+:focus-visible { outline: 2px solid var(--coral-bright); outline-offset: 2px; border-radius: 4px; }
+.mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.eyebrow { font-size: .68rem; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); }
+
+/* ============================ layout ============================ */
+.wrap { max-width: 1120px; margin: 0 auto; padding: 22px 20px 56px; }
+.grid { display: grid; gap: var(--gap); }
+@media (min-width: 760px){ .cols-2 { grid-template-columns: 1fr 1fr; } }
+
+/* ============================ top bar ============================ */
+.topbar {
+  position: sticky; top: 0; z-index: 30;
+  display: flex; align-items: center; gap: 14px;
+  padding: 12px 20px;
+  background: color-mix(in srgb, var(--plane) 82%, transparent);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--line);
+}
+.brand { display: flex; align-items: center; gap: 10px; font-weight: 650; letter-spacing: -.01em; }
+.brand svg { display: block; }
+.brand .sub { color: var(--muted); font-weight: 500; }
+.topbar .spacer { flex: 1; }
+.sysdot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); box-shadow: 0 0 0 4px color-mix(in srgb, var(--muted) 22%, transparent); transition: background .3s; }
+.sysdot.good { background: var(--good); box-shadow: 0 0 0 4px color-mix(in srgb, var(--good) 22%, transparent); }
+.sysdot.warn { background: var(--warn); box-shadow: 0 0 0 4px color-mix(in srgb, var(--warn) 22%, transparent); }
+.sysdot.crit { background: var(--crit); box-shadow: 0 0 0 4px color-mix(in srgb, var(--crit) 22%, transparent); animation: pulse 1.6s infinite; }
+@keyframes pulse { 50% { box-shadow: 0 0 0 8px color-mix(in srgb, var(--crit) 0%, transparent); } }
+.syslabel { font-size: .82rem; font-weight: 600; }
+.iconbtn {
+  display: inline-grid; place-items: center; width: 34px; height: 34px;
+  border: 1px solid var(--line); border-radius: var(--r-sm);
+  background: var(--surface); color: var(--ink-2); cursor: pointer;
+  transition: color .15s, border-color .15s, background .15s;
+}
+.iconbtn:hover { color: var(--ink); border-color: var(--coral); }
+.sync { display: flex; align-items: center; gap: 7px; font-size: .76rem; color: var(--muted); }
+.sync .mono { color: var(--ink-2); }
+
+/* ============================ section head ============================ */
+.sec { margin-top: 30px; }
+.sec-head { display: flex; align-items: baseline; gap: 10px; margin-bottom: 14px; }
+.sec-head h2 { font-size: .82rem; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-2); }
+.sec-head .count { font-size: .72rem; color: var(--muted); font-family: var(--font-mono); }
+.sec-head .rule { flex: 1; height: 1px; background: var(--line); }
+
+/* ============================ hero — active capacity ============================ */
+.hero {
+  display: grid; gap: 22px;
+  grid-template-columns: 1fr;
+  background:
+    radial-gradient(120% 140% at 100% 0%, color-mix(in srgb, var(--coral) 10%, transparent), transparent 55%),
+    var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+  padding: 24px; box-shadow: var(--shadow);
+}
+@media (min-width: 700px){ .hero { grid-template-columns: auto 1fr; align-items: center; } }
+.gauge { position: relative; width: 200px; height: 132px; margin: 0 auto; }
+.gauge svg { width: 100%; height: 100%; overflow: visible; }
+.gauge .track { fill: none; stroke: var(--surface-2); stroke-width: 14; stroke-linecap: round; }
+.gauge .fill  { fill: none; stroke-width: 14; stroke-linecap: round; transition: stroke-dashoffset .6s var(--ease), stroke .3s; }
+.gauge .center { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; padding-bottom: 4px; text-align: center; }
+.gauge .val { font-family: var(--font-mono); font-size: 2.9rem; font-weight: 600; line-height: 1; letter-spacing: -.02em; }
+.gauge .val .pct { font-size: 1.1rem; color: var(--ink-2); margin-left: 1px; }
+.gauge .cap { font-size: .68rem; letter-spacing: .12em; text-transform: uppercase; color: var(--muted); margin-top: 6px; }
+.hero-meta { min-width: 0; }
+.hero-token { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 3px; }
+.hero-token .name { font-size: 1.35rem; font-weight: 650; letter-spacing: -.01em; }
+.hero-sub { color: var(--ink-2); font-size: .85rem; margin-bottom: 16px; }
+.hero-stats { display: flex; gap: 26px; flex-wrap: wrap; }
+.hero-stat .k { font-size: .68rem; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+.hero-stat .v { font-family: var(--font-mono); font-size: 1.05rem; margin-top: 2px; font-variant-numeric: tabular-nums; }
+
+/* ============================ badges ============================ */
+.badge { display: inline-flex; align-items: center; gap: 5px; font-size: .7rem; font-weight: 650; padding: 3px 9px; border-radius: 999px; letter-spacing: .01em; white-space: nowrap; }
+.badge svg { width: 11px; height: 11px; }
+.badge.active { background: color-mix(in srgb, var(--coral) 20%, transparent); color: var(--coral-bright); }
+.badge.good { background: color-mix(in srgb, var(--good) 16%, transparent); color: var(--good); }
+.badge.warn { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+.badge.crit { background: color-mix(in srgb, var(--crit) 18%, transparent); color: var(--crit); }
+.badge.neutral { background: var(--surface-2); color: var(--muted); }
+
+/* ============================ stat tiles ============================ */
+.tiles { display: grid; gap: 12px; grid-template-columns: repeat(2, 1fr); }
+@media (min-width: 640px){ .tiles { grid-template-columns: repeat(5, 1fr); } }
+.tile { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 14px 15px; box-shadow: var(--shadow); }
+.tile .k { font-size: .66rem; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
+.tile .v { font-family: var(--font-mono); font-size: 1.5rem; font-weight: 600; margin-top: 6px; letter-spacing: -.02em; }
+.tile .sub { font-size: .7rem; color: var(--ink-2); margin-top: 2px; }
+
+/* ============================ token cards ============================ */
+.tok { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 16px 18px; box-shadow: var(--shadow); transition: border-color .2s, box-shadow .2s; }
+.tok.is-active { border-color: color-mix(in srgb, var(--coral) 55%, var(--line)); box-shadow: var(--glow); }
+.tok-top { display: flex; align-items: center; gap: 9px; margin-bottom: 14px; }
+.tok-name { font-weight: 650; font-size: 1.02rem; }
+.tok-top .spacer { flex: 1; }
+.meter { margin-bottom: 12px; }
+.meter-row { display: flex; align-items: baseline; gap: 8px; font-size: .74rem; margin-bottom: 5px; }
+.meter-row .period { font-family: var(--font-mono); color: var(--muted); font-weight: 600; }
+.meter-row .pct { font-family: var(--font-mono); font-weight: 650; font-size: .84rem; font-variant-numeric: tabular-nums; }
+.meter-row .reset { margin-left: auto; color: var(--muted); font-size: .72rem; }
+.track { height: 8px; border-radius: 999px; background: var(--surface-2); overflow: hidden; position: relative; }
+.track .bar { height: 100%; border-radius: 999px; transition: width .6s var(--ease), background .3s; min-width: 3px; }
+.track.thin { height: 5px; }
+.tok-actions { display: flex; gap: 8px; margin-top: 14px; }
+.btn { font: inherit; font-size: .78rem; font-weight: 600; padding: 7px 14px; border-radius: var(--r-sm); border: 1px solid var(--line); background: var(--surface-2); color: var(--ink); cursor: pointer; transition: background .15s, border-color .15s, color .15s, transform .05s; }
+.btn:hover { border-color: var(--coral); }
+.btn:active { transform: translateY(1px); }
+.btn[disabled] { opacity: .5; cursor: default; }
+.btn.primary { background: var(--coral); border-color: var(--coral); color: var(--coral-ink); }
+.btn.primary:hover { background: var(--coral-bright); }
+.btn.ghost { background: transparent; }
+details.raw { margin-top: 12px; border-top: 1px solid var(--line-2); padding-top: 10px; }
+details.raw > summary { cursor: pointer; font-size: .72rem; color: var(--muted); list-style: none; }
+details.raw > summary::-webkit-details-marker { display: none; }
+details.raw > summary::before { content: "▸ "; color: var(--coral); }
+details.raw[open] > summary::before { content: "▾ "; }
+.meta-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px 16px; margin-top: 10px; }
+.meta-grid .mk { color: var(--muted); font-size: .68rem; letter-spacing: .04em; text-transform: uppercase; }
+.meta-grid .mv { font-family: var(--font-mono); font-size: .8rem; word-break: break-all; }
+.mv.good { color: var(--good);} .mv.warn { color: var(--warn);} .mv.crit { color: var(--crit);}
+.rawtable { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: .72rem; }
+.rawtable td { padding: 3px 6px; border-bottom: 1px solid var(--line-2); vertical-align: top; }
+.rawtable td:first-child { color: var(--muted); white-space: nowrap; font-family: var(--font-mono); }
+.rawtable td:last-child { color: var(--ink-2); font-family: var(--font-mono); word-break: break-all; }
+
+/* ============================ clients ============================ */
+.client { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-sm); box-shadow: var(--shadow); overflow: hidden; }
+.client + .client { margin-top: 10px; }
+/* magnitude of each client's usage reads as a faint coral fill behind the row */
+.client-head { display: grid; grid-template-columns: 1fr auto; align-items: center; gap: 12px 16px; width: 100%; text-align: left; padding: 14px 16px; border: 0; color: inherit; cursor: pointer; font: inherit; background-color: transparent; background-image: linear-gradient(90deg, color-mix(in srgb, var(--coral) 14%, transparent) var(--sh,0%), transparent 0); transition: background-color .15s; }
+.client-head:hover { background-color: var(--surface-2); }
+.client-id { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.client-id .caret { color: var(--muted); transition: transform .2s; flex: none; }
+.client.open .client-id .caret { transform: rotate(90deg); }
+.client-id .name { font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.client-nums { display: flex; gap: 18px; }
+.cn { text-align: right; }
+.cn .v { font-family: var(--font-mono); font-weight: 600; font-variant-numeric: tabular-nums; }
+.cn .k { font-size: .62rem; letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
+.client-body { display: none; padding: 4px 16px 14px; border-top: 1px solid var(--line-2); }
+.client.open .client-body { display: block; }
+.utable { width: 100%; border-collapse: collapse; font-size: .78rem; }
+.utable th { text-align: right; padding: 8px 8px 6px; color: var(--muted); font-size: .64rem; letter-spacing: .06em; text-transform: uppercase; font-weight: 600; border-bottom: 1px solid var(--line-2); }
+.utable th:first-child { text-align: left; }
+.utable td { padding: 7px 8px; border-bottom: 1px solid var(--line-2); text-align: right; font-family: var(--font-mono); font-variant-numeric: tabular-nums; color: var(--ink-2); }
+.utable td:first-child { text-align: left; color: var(--coral-bright); }
+.utable tr:last-child td { border-bottom: 0; }
+.empty { color: var(--muted); font-size: .82rem; font-style: italic; padding: 16px; text-align: center; }
+
+/* ============================ settings ============================ */
+.panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 20px; box-shadow: var(--shadow); }
+.cfg-group + .cfg-group { margin-top: 20px; padding-top: 4px; }
+.cfg-group > .glabel { font-size: .68rem; letter-spacing: .1em; text-transform: uppercase; color: var(--coral-bright); font-weight: 700; margin-bottom: 8px; }
+.cfg-row { display: flex; align-items: center; gap: 14px; padding: 11px 0; border-bottom: 1px solid var(--line-2); }
+.cfg-row:last-child { border-bottom: 0; }
+.cfg-row .lab { flex: 1; }
+.cfg-row .lab .t { font-size: .86rem; }
+.cfg-row .lab .h { font-size: .72rem; color: var(--muted); margin-top: 1px; }
+.num { font-family: var(--font-mono); font-size: .84rem; width: 84px; text-align: right; padding: 6px 9px; border-radius: var(--r-sm); border: 1px solid var(--line); background: var(--surface-2); color: var(--ink); }
+.num:focus { border-color: var(--coral); outline: none; }
+.switch { position: relative; width: 42px; height: 24px; flex: none; }
+.switch input { position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
+.switch .sl { position: absolute; inset: 0; background: var(--surface-2); border: 1px solid var(--line); border-radius: 999px; transition: background .2s; }
+.switch .sl::before { content: ""; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%; background: var(--muted); transition: transform .2s var(--ease), background .2s; }
+.switch input:checked + .sl { background: color-mix(in srgb, var(--coral) 45%, transparent); border-color: var(--coral); }
+.switch input:checked + .sl::before { transform: translateX(18px); background: var(--coral-bright); }
+.switch input:focus-visible + .sl { outline: 2px solid var(--coral-bright); outline-offset: 2px; }
+.cfg-foot { display: flex; align-items: center; gap: 12px; margin-top: 18px; }
+
+/* ============================ rotation log ============================ */
+.log { position: relative; padding-left: 20px; }
+.log::before { content: ""; position: absolute; left: 5px; top: 4px; bottom: 4px; width: 2px; background: var(--line); }
+.logrow { position: relative; padding: 8px 0; font-size: .8rem; }
+.logrow::before { content: ""; position: absolute; left: -18px; top: 13px; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); box-shadow: 0 0 0 3px var(--surface); }
+.logrow.switched::before { background: var(--good); }
+.logrow.notify::before { background: var(--warn); }
+.logrow .when { color: var(--muted); font-family: var(--font-mono); font-size: .72rem; }
+.logrow b { color: var(--ink); }
+.logrow .arrow { color: var(--coral); }
+
+/* ============================ toasts ============================ */
+.toasts { position: fixed; right: 16px; bottom: 16px; z-index: 60; display: flex; flex-direction: column; gap: 8px; max-width: 340px; }
+.toast { display: flex; align-items: flex-start; gap: 9px; padding: 11px 13px; border-radius: var(--r-sm); background: var(--surface); border: 1px solid var(--line); box-shadow: var(--shadow); font-size: .82rem; animation: rise .25s var(--ease); }
+.toast.ok { border-left: 3px solid var(--good); }
+.toast.err { border-left: 3px solid var(--crit); }
+.toast.info { border-left: 3px solid var(--coral); }
+@keyframes rise { from { opacity: 0; transform: translateY(8px); } }
+
+/* ============================ error banner + skeleton ============================ */
+.banner { display: none; align-items: center; gap: 10px; padding: 11px 16px; border-radius: var(--r-sm); background: color-mix(in srgb, var(--crit) 14%, var(--surface)); border: 1px solid color-mix(in srgb, var(--crit) 40%, transparent); color: var(--ink); font-size: .84rem; margin-bottom: 18px; }
+.banner.show { display: flex; }
+.stale { opacity: .55; transition: opacity .2s; pointer-events: none; }
+.skl { background: linear-gradient(90deg, var(--surface-2) 25%, color-mix(in srgb,var(--surface-2) 60%, var(--ink)) 37%, var(--surface-2) 63%); background-size: 400% 100%; animation: shimmer 1.4s infinite; border-radius: var(--r); }
+@keyframes shimmer { from { background-position: 100% 0; } to { background-position: -100% 0; } }
+.foot { margin-top: 40px; padding-top: 18px; border-top: 1px solid var(--line); display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between; font-size: .76rem; color: var(--muted); }
+
+@media (prefers-reduced-motion: reduce) { * { animation: none !important; transition: none !important; } }
+.vh { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
 </style>
 </head>
 <body>
-<div class="page">
-  <div class="card" style="padding:20px 32px">
-    <div class="logo">Claude Proxy</div>
-    <div class="sub">Admin dashboard · auto-refreshes every 5 s</div>
-  </div>
-  <div class="card">
-    <div class="section-title">Upstream OAuth Tokens</div>
-    <div id="token-list"></div>
-    <div class="feedback" id="fb"></div>
-  </div>
-  <div class="card">
-    <div class="section-title">Virtual API Keys — Token Usage</div>
-    <div id="vkey-list"></div>
-  </div>
-  <div class="card">
-    <div class="section-title">Settings</div>
-    <div id="config-form"></div>
-    <div class="feedback" id="config-fb"></div>
-  </div>
-  <div class="card" id="rotation-log-card" style="display:none">
-    <div class="section-title">Auto-Rotation Log</div>
-    <div id="rotation-log"></div>
-  </div>
-  <div class="metrics-link">Prometheus metrics available at <a href="/metrics" target="_blank">/metrics</a></div>
-</div>
-<script>
-let state = { tokens: [], active: "", headers: {}, health: {}, virtual_keys: [], config: {}, rotation_log: [] };
+<header class="topbar">
+  <span class="brand">
+    <svg width="22" height="22" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="var(--coral)"/><path d="M9 22 L16 9 L23 22" stroke="var(--coral-ink)" stroke-width="2.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    Claude Proxy <span class="sub">· Console</span>
+  </span>
+  <span class="spacer"></span>
+  <span class="sysdot" id="sysdot" title="Overall status"></span>
+  <span class="syslabel" id="syslabel">Connecting…</span>
+  <span class="sync" title="Live data refresh">
+    <span id="synctext" class="mono">—</span>
+    <button class="iconbtn" id="refreshBtn" title="Refresh now" aria-label="Refresh now">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 4v5h-5"/></svg>
+    </button>
+  </span>
+  <button class="iconbtn" id="themeBtn" title="Toggle theme" aria-label="Toggle light/dark theme">
+    <svg id="themeIcon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+  </button>
+</header>
 
-async function init() { await refresh(); setInterval(refresh, 5000); }
-async function refresh() {
-  try { const r = await fetch("/state"); state = await r.json(); render(); }
-  catch (e) { /* ignore transient errors */ }
-}
-function fmtTokens(n) {
+<main class="wrap">
+  <div class="banner" id="banner" role="alert">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>
+    <span id="bannerText">Can't reach the proxy.</span>
+  </div>
+
+  <!-- HERO: active-token capacity -->
+  <section aria-label="Active upstream capacity">
+    <div class="hero" id="hero"><div class="skl" style="height:132px"></div><div class="grid" style="gap:12px"><div class="skl" style="height:20px;width:40%"></div><div class="skl" style="height:14px;width:70%"></div></div></div>
+  </section>
+
+  <!-- KPI tiles -->
+  <section class="sec" aria-label="Fleet totals">
+    <div class="tiles" id="tiles"></div>
+  </section>
+
+  <!-- Upstream tokens -->
+  <section class="sec" aria-label="Upstream tokens">
+    <div class="sec-head"><h2>Upstream tokens</h2><span class="count" id="tokCount"></span><span class="rule"></span></div>
+    <div class="grid cols-2" id="tokens"></div>
+  </section>
+
+  <!-- Clients -->
+  <section class="sec" aria-label="Clients">
+    <div class="sec-head"><h2>Clients</h2><span class="count" id="clientCount"></span><span class="rule"></span></div>
+    <div id="clients"></div>
+  </section>
+
+  <!-- Settings + rotation log -->
+  <section class="sec grid cols-2" aria-label="Settings and rotation log">
+    <div>
+      <div class="sec-head"><h2>Auto-rotation &amp; probes</h2><span class="rule"></span></div>
+      <form class="panel" id="cfgForm"></form>
+    </div>
+    <div>
+      <div class="sec-head"><h2>Rotation log</h2><span class="rule"></span></div>
+      <div class="panel"><div class="log" id="log"><div class="empty">No rotations yet.</div></div></div>
+    </div>
+  </section>
+
+  <div class="foot">
+    <span>Prometheus metrics at <a href="/metrics" target="_blank" rel="noopener">/metrics</a></span>
+    <span id="authnote"></span>
+  </div>
+</main>
+
+<div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
+
+<script>
+"use strict";
+const $ = (s, r=document) => r.querySelector(s);
+const svgNS = "http://www.w3.org/2000/svg";
+
+// ---- formatting ----
+const fmt = (n) => {
   n = n || 0;
-  if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
-  if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
+  if (n >= 1e9) return (n/1e9).toFixed(2)+"B";
+  if (n >= 1e6) return (n/1e6).toFixed(2)+"M";
+  if (n >= 1e3) return (n/1e3).toFixed(1)+"K";
   return String(n);
-}
+};
+const pct = (u) => Math.round((parseFloat(u)||0)*100);
 function fmtReset(ts) {
-  if (!ts) return "";
-  const secs = Math.max(0, parseInt(ts) - Date.now() / 1000);
-  if (secs < 60) return "< 1 min";
-  const h = Math.floor(secs / 3600), m = Math.floor((secs % 3600) / 60);
-  if (h >= 24) { const d = Math.floor(h / 24); return `${d}d ${h % 24}h`; }
+  if (!ts) return "—";
+  const s = Math.max(0, parseInt(ts) - Date.now()/1000);
+  if (s < 60) return "<1m";
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), d = Math.floor(h/24);
+  if (d >= 1) return `${d}d ${h%24}h`;
   return h > 0 ? `${h}h ${m}m` : `${m}m`;
 }
-function barColor(util) {
-  const u = parseFloat(util) || 0;
-  if (u >= 0.9) return "#ef4444";
-  if (u >= 0.7) return "#f59e0b";
-  return "#4ade80";
+// severity by utilization (status, never color-alone — always paired with the % text)
+function sev(u) { u = parseFloat(u)||0; return u >= 0.9 ? "crit" : u >= 0.7 ? "warn" : "good"; }
+function sevColor(s){ return s==="crit"?"var(--crit)":s==="warn"?"var(--warn)":"var(--good)"; }
+function healthSev(st){ return st==="healthy"?"good":st==="rate_limited"?"warn":st==="unhealthy"?"crit":"neutral"; }
+function healthLabel(h){
+  if(!h || h.last_checked===0) return {sev:"neutral", text:"unchecked"};
+  const st = h.status || (h.healthy?"healthy":"unhealthy");
+  if(st==="healthy") return {sev:"good", text:"healthy"};
+  if(st==="rate_limited") return {sev:"warn", text:"rate-limited"};
+  return {sev:"crit", text:`unhealthy · ${h.error_count} err`};
 }
-function statusClass(s) {
-  if (!s) return "badge-nodata";
-  if (s === "allowed") return "badge-allowed";
-  if (s.includes("warning")) return "badge-warning";
-  return "badge-rejected";
-}
-function metaValClass(key, val) {
-  if (key.includes("fallback") && val === "available") return "green";
-  if (key.includes("overage-status") && val === "rejected") return "red";
-  if (key.includes("overage-status") && val === "allowed") return "green";
-  if (val === "allowed") return "green";
-  if (val && val.includes("warning")) return "amber";
-  if (val === "rejected" || val === "blocked") return "red";
-  return "";
-}
-function usageBar(h, period) {
-  const util  = h[`anthropic-ratelimit-unified-${period}-utilization`];
-  const reset = h[`anthropic-ratelimit-unified-${period}-reset`];
-  const status = h[`anthropic-ratelimit-unified-${period}-status`];
-  if (util === undefined) return "";
-  const pct = Math.round(parseFloat(util) * 100);
-  const color = barColor(util);
-  return `
-    <div class="usage-row">
-      <div class="usage-label-row">
-        <span class="period-label">${period}</span>
-        <span class="pct-label" style="color:${color}">${pct}%</span>
-        <span class="badge-status ${statusClass(status)}">${status || ""}</span>
-        <span class="reset-label">resets in ${fmtReset(reset)}</span>
+const ICON = {
+  good:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>',
+  warn:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
+  crit:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>',
+  active:'<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="6"/></svg>',
+  neutral:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><circle cx="12" cy="12" r="9"/></svg>',
+};
+function badge(sev, text){ return `<span class="badge ${sev}">${ICON[sev]||""}${text}</span>`; }
+
+// ---- state ----
+let state = null;
+let cfgDirty = false;       // don't clobber the form while the operator edits
+let lastOk = 0;
+const CIRC = 2 * Math.PI * 62 * 0.5;  // semicircle arc length for r=62
+
+// =====================================================================
+// HERO — active token capacity gauge (the signature instrument)
+// =====================================================================
+function renderHero() {
+  const hero = $("#hero");
+  const active = state.active;
+  const h = (state.headers||{})[active] || {};
+  const hh = (state.health||{})[active];
+  const u5 = h["anthropic-ratelimit-unified-5h-utilization"];
+  const has = u5 !== undefined;
+  const p = pct(u5);
+  const s = has ? sev(u5) : "neutral";
+  const hl = healthLabel(hh);
+  // gauge sweep: clamp to 100% visually; show true % (can exceed 100)
+  const frac = Math.min(1, (parseFloat(u5)||0));
+  const off = CIRC * (1 - frac);
+
+  hero.classList.remove("stale");
+  hero.innerHTML = `
+    <div class="gauge" role="meter" aria-label="Active token 5-hour capacity used"
+         aria-valuenow="${p}" aria-valuemin="0" aria-valuemax="100">
+      <svg viewBox="0 0 140 92" aria-hidden="true">
+        <path class="track" d="M8 84 A62 62 0 0 1 132 84"/>
+        <path class="fill" d="M8 84 A62 62 0 0 1 132 84"
+              stroke="${has?sevColor(s):'var(--surface-2)'}"
+              stroke-dasharray="${CIRC}" stroke-dashoffset="${has?off:CIRC}"/>
+      </svg>
+      <div class="center">
+        <div class="val">${has?p:"—"}<span class="pct">${has?"%":""}</span></div>
+        <div class="cap">5h capacity used</div>
       </div>
-      <div class="bar-track"><div class="bar-fill" style="width:${Math.min(pct,100)}%;background:${color}"></div></div>
+    </div>
+    <div class="hero-meta">
+      <div class="eyebrow">Active upstream</div>
+      <div class="hero-token">
+        <span class="name">${esc(active||"—")}</span>
+        ${badge("active","live")}
+        ${badge(hl.sev, hl.text)}
+      </div>
+      <div class="hero-sub" id="heroSub">${heroSub(has,p,s,h)}</div>
+      <div class="hero-stats">
+        <div class="hero-stat"><div class="k">7-day used</div><div class="v" style="color:${h['anthropic-ratelimit-unified-7d-utilization']!==undefined?sevColor(sev(h['anthropic-ratelimit-unified-7d-utilization'])):'var(--ink)'}">${h['anthropic-ratelimit-unified-7d-utilization']!==undefined?pct(h['anthropic-ratelimit-unified-7d-utilization'])+'%':'—'}</div></div>
+        <div class="hero-stat"><div class="k">5h resets in</div><div class="v reset5">${fmtReset(h['anthropic-ratelimit-unified-5h-reset'])}</div></div>
+        <div class="hero-stat"><div class="k">Tokens</div><div class="v">${state.tokens.length}</div></div>
+      </div>
     </div>`;
 }
-function renderRawHeaders(h) {
-  if (!h || Object.keys(h).length === 0) return "";
-  const metaKeys = [
-    "anthropic-ratelimit-unified-status","anthropic-ratelimit-unified-representative-claim",
-    "anthropic-ratelimit-unified-fallback","anthropic-ratelimit-unified-fallback-percentage",
-    "anthropic-ratelimit-unified-overage-status","anthropic-ratelimit-unified-overage-disabled-reason",
+function heroSub(has,p,s,h){
+  if(!has) return "No rate-limit data yet — send a request or run a probe.";
+  const rem = Math.max(0, 100 - p);
+  if(s==="crit") return `Only <b style="color:var(--crit)">${rem}%</b> of the 5-hour window left — near or over the limit.`;
+  if(s==="warn") return `<b style="color:var(--warn)">${rem}%</b> of the 5-hour window remaining.`;
+  return `<b style="color:var(--good)">${rem}%</b> of the 5-hour window remaining — healthy headroom.`;
+}
+
+// =====================================================================
+// KPI tiles
+// =====================================================================
+function sumUsage() {
+  let req=0, inp=0, out=0, cr=0, cw=0, activeClients=0;
+  for (const vk of state.virtual_keys) {
+    let kr=0;
+    for (const m of Object.values(vk.usage||{})) {
+      req+=m.requests||0; inp+=m.input_tokens||0; out+=m.output_tokens||0;
+      cr+=m.cache_read_input_tokens||0; cw+=m.cache_creation_input_tokens||0; kr+=m.requests||0;
+    }
+    if (kr>0) activeClients++;
+  }
+  return {req,inp,out,cr,cw,activeClients};
+}
+function renderTiles() {
+  const t = sumUsage();
+  const tiles = [
+    {k:"Requests", v:fmt(t.req), sub:"all-time"},
+    {k:"Input tokens", v:fmt(t.inp), sub:"all-time"},
+    {k:"Output tokens", v:fmt(t.out), sub:"all-time"},
+    {k:"Cache read", v:fmt(t.cr), sub:"served from cache"},
+    {k:"Active clients", v:`${t.activeClients}`, sub:`of ${state.virtual_keys.length} keys`},
   ];
-  const metaItems = metaKeys.filter(k => h[k] !== undefined).map(k => {
-    const shortKey = k.replace("anthropic-ratelimit-unified-", "");
-    const cls = metaValClass(k, h[k]);
-    return `<span class="meta-item"><span class="meta-key">${shortKey}:</span> <span class="meta-val ${cls}">${h[k]}</span></span>`;
+  $("#tiles").innerHTML = tiles.map(x=>`<div class="tile"><div class="k">${x.k}</div><div class="v">${x.v}</div><div class="sub">${x.sub}</div></div>`).join("");
+}
+
+// =====================================================================
+// Token cards  (keyed patch — no flicker, preserves <details> + focus)
+// =====================================================================
+const tokRefs = new Map();
+function meterHTML(h, period, big){
+  const u = h[`anthropic-ratelimit-unified-${period}-utilization`];
+  if (u === undefined) return "";
+  const p = pct(u), s = sev(u);
+  return `<div class="meter">
+    <div class="meter-row">
+      <span class="period">${period}</span>
+      <span class="pct" style="color:${sevColor(s)}">${p}%</span>
+      <span class="reset" data-reset="${h[`anthropic-ratelimit-unified-${period}-reset`]||''}">resets ${fmtReset(h[`anthropic-ratelimit-unified-${period}-reset`])}</span>
+    </div>
+    <div class="track ${big?'':'thin'}"><div class="bar" style="width:${Math.min(100,p)}%;background:${sevColor(s)}"></div></div>
+  </div>`;
+}
+const META_KEYS = ["anthropic-ratelimit-unified-status","anthropic-ratelimit-unified-overage-status","anthropic-ratelimit-unified-fallback"];
+function metaClass(k,v){ if(v==="allowed"||v==="available") return "good"; if(v==="rejected"||v==="blocked") return "crit"; if((v||"").includes("warning")) return "warn"; return ""; }
+function tokenCardHTML(name){
+  const h = (state.headers||{})[name] || {};
+  const hl = healthLabel((state.health||{})[name]);
+  const isActive = name === state.active;
+  const hasData = Object.keys(h).length>0;
+  const meta = META_KEYS.filter(k=>h[k]!==undefined).map(k=>{
+    const short = k.replace("anthropic-ratelimit-unified-","");
+    return `<div><div class="mk">${short}</div><div class="mv ${metaClass(k,h[k])}">${esc(h[k])}</div></div>`;
   }).join("");
-  const rows = Object.entries(h).sort(([a],[b]) => a.localeCompare(b))
-    .map(([k,v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
+  const rawRows = Object.entries(h).sort((a,b)=>a[0].localeCompare(b[0])).map(([k,v])=>`<tr><td>${esc(k)}</td><td>${esc(v)}</td></tr>`).join("");
   return `
-    ${metaItems ? `<div class="meta-row">${metaItems}</div>` : ""}
-    <details><summary>Raw headers (${Object.keys(h).length})</summary><table class="raw-table">${rows}</table></details>`;
-}
-function healthBadge(n) {
-  const h = (state.health || {})[n];
-  if (!h) return "";
-  const s = h.status || (h.healthy ? "healthy" : "unhealthy");
-  if (s === "unchecked" || h.last_checked === 0) return `<span class="badge-status badge-nodata">unchecked</span>`;
-  if (s === "healthy") return `<span class="badge-status badge-healthy">healthy</span>`;
-  if (s === "rate_limited") return `<span class="badge-status badge-ratelimited">rate-limited</span>`;
-  return `<span class="badge-status badge-unhealthy">unhealthy (${h.error_count} err)</span>`;
-}
-function renderOAuthTokens() {
-  document.getElementById("token-list").innerHTML = state.tokens.map(n => {
-    const isActive = n === state.active;
-    const h = state.headers[n] || {};
-    const overallStatus = h["anthropic-ratelimit-unified-status"];
-    const hasData = Object.keys(h).length > 0;
-    const statusBadge = hasData
-      ? `<span class="badge-status ${statusClass(overallStatus)}">${overallStatus || "?"}</span>`
-      : `<span class="badge-status badge-nodata">no data</span>`;
-    const body = hasData ? `<div class="token-body">${usageBar(h,"5h")}${usageBar(h,"7d")}${renderRawHeaders(h)}</div>` : "";
-    return `
-      <div class="token-card ${isActive ? "active" : ""}">
-        <button class="token-header" onclick="pick('${n}')">
-          <span class="indicator"></span>
-          <span class="token-name">${n}</span>
-          ${isActive ? '<span class="badge-active">active</span>' : ""}
-          ${healthBadge(n)}
-          ${statusBadge}
-          <button class="probe-btn" id="probe-btn-${n}" onclick="event.stopPropagation();probe('${n}')" title="Run health probe now">Test</button>
-        </button>
-        ${body}
-      </div>`;
-  }).join("");
-}
-function renderVirtualKeys() {
-  const vkeys = state.virtual_keys || [];
-  document.getElementById("vkey-list").innerHTML = vkeys.map(vk => {
-    const usage = vk.usage || {};
-    const models = Object.keys(usage).sort();
-    const sum = (f) => models.reduce((s, m) => s + (usage[m][f] || 0), 0);
-    const totalReq = sum("requests"), totalIn = sum("input_tokens"), totalOut = sum("output_tokens");
-    const totalCacheR = sum("cache_read_input_tokens"), totalCacheW = sum("cache_creation_input_tokens");
-    const modelRows = models.map(m => `
-      <tr>
-        <td class="model-cell">${m}</td>
-        <td class="num">${usage[m].requests || 0}</td>
-        <td class="num">${fmtTokens(usage[m].input_tokens)}</td>
-        <td class="num">${fmtTokens(usage[m].output_tokens)}</td>
-        <td class="num">${fmtTokens(usage[m].cache_read_input_tokens)}</td>
-        <td class="num">${fmtTokens(usage[m].cache_creation_input_tokens)}</td>
-      </tr>`).join("");
-    return `
-      <div class="vkey-card">
-        <div class="vkey-header">
-          <span class="vkey-name">${vk.name}</span>
-          <div class="vkey-totals">
-            <div class="vkey-stat"><span class="vkey-stat-val">${totalReq}</span><span class="vkey-stat-lbl">requests</span></div>
-            <div class="vkey-stat"><span class="vkey-stat-val">${fmtTokens(totalIn)}</span><span class="vkey-stat-lbl">input</span></div>
-            <div class="vkey-stat"><span class="vkey-stat-val">${fmtTokens(totalOut)}</span><span class="vkey-stat-lbl">output</span></div>
-            <div class="vkey-stat"><span class="vkey-stat-val">${fmtTokens(totalCacheR)}</span><span class="vkey-stat-lbl">cache rd</span></div>
-            <div class="vkey-stat"><span class="vkey-stat-val">${fmtTokens(totalCacheW)}</span><span class="vkey-stat-lbl">cache wr</span></div>
-          </div>
-        </div>
-        ${models.length > 0 ? `
-        <div class="vkey-body">
-          <table class="usage-table">
-            <thead><tr><th>Model</th><th>Req</th><th>Input</th><th>Output</th><th>Cache rd</th><th>Cache wr</th></tr></thead>
-            <tbody>${modelRows}</tbody>
-          </table>
-        </div>` : `<div class="vkey-nodata">No usage recorded yet</div>`}
-      </div>`;
-  }).join("");
-}
-function render() { renderOAuthTokens(); renderVirtualKeys(); renderConfig(); renderRotationLog(); }
-function cfgToggle(id, label, val, hint) {
-  return `<div class="config-row"><div><div class="config-label">${label}</div>${hint ? `<div class="config-hint">${hint}</div>` : ""}</div>
-    <label class="toggle"><input type="checkbox" id="${id}" ${val ? "checked" : ""}><span class="toggle-slider"></span></label></div>`;
-}
-function cfgNum(id, label, val, hint, unit) {
-  return `<div class="config-row"><div><div class="config-label">${label}</div>${hint ? `<div class="config-hint">${hint}</div>` : ""}</div>
-    <div style="display:flex;align-items:center;gap:6px"><input type="number" class="config-input" id="${id}" value="${val}" step="any" min="0">
-    ${unit ? `<span style="font-size:0.75rem;color:#52525b">${unit}</span>` : ""}</div></div>`;
-}
-function renderConfig() {
-  const cfg = state.config || {}; const ar = cfg.auto_rotation || {};
-  document.getElementById("config-form").innerHTML = `
-    <div class="config-group">
-      <div class="config-group-title">Auto-Rotation</div>
-      ${cfgToggle("ar-enabled", "Enabled", ar.enabled, "Switch tokens on high 5h utilization or when the active token is dead/rate-limited")}
-      ${cfgNum("ar-threshold", "Threshold (5h)", ar.threshold_5h, "Trigger when active token 5h util &ge; this (0.0&ndash;1.0)", "")}
-      ${cfgNum("ar-target-max", "Target max util (5h)", ar.target_max_util_5h, "On high-util rotation, only switch to tokens below this", "")}
-      ${cfgNum("ar-interval", "Check interval", ar.check_interval_seconds, "How often to evaluate", "sec")}
-      ${cfgToggle("ar-probe", "Probe before switch", ar.probe_before_switch, "Health-check candidate before switching")}
-      ${cfgNum("ar-cooldown", "Cooldown", ar.cooldown_seconds, "Min time between util-based rotations", "sec")}
-      ${cfgToggle("ar-notify", "Notify only", ar.notify_only, "Log events without actually switching")}
+    <div class="tok-top">
+      <span class="tok-name">${esc(name)}</span>
+      ${isActive?badge("active","active"):""}
+      ${badge(hl.sev, hl.text)}
+      <span class="spacer"></span>
     </div>
-    <div class="config-group">
-      <div class="config-group-title">General</div>
-      ${cfgNum("cfg-health-int", "Health probe interval", cfg.health_probe_interval_seconds, "Re-probe unhealthy tokens", "sec")}
-      ${cfgNum("cfg-active-int", "Active probe interval", cfg.active_probe_interval_seconds, "Validate active token periodically", "sec")}
-      ${cfgNum("cfg-timeout", "Upstream timeout", cfg.upstream_timeout_seconds, "HTTP timeout for API calls (restart required)", "sec")}
+    ${hasData ? meterHTML(h,"5h",true)+meterHTML(h,"7d",false) : `<div class="empty" style="text-align:left;padding:6px 0">No rate-limit data yet.</div>`}
+    <div class="tok-actions">
+      <button class="btn primary act-select" ${isActive?"disabled":""}>${isActive?"Serving traffic":"Set active"}</button>
+      <button class="btn ghost act-probe">Test</button>
     </div>
-    <button class="save-btn" id="save-cfg-btn" onclick="saveConfig()">Save Settings</button>`;
+    ${hasData?`<details class="raw"><summary>Diagnostics</summary>
+      ${meta?`<div class="meta-grid">${meta}</div>`:""}
+      <table class="rawtable">${rawRows}</table></details>`:""}`;
 }
-function renderRotationLog() {
-  const logs = state.rotation_log || [];
-  const card = document.getElementById("rotation-log-card");
-  if (logs.length === 0) { card.style.display = "none"; return; }
-  card.style.display = "";
-  document.getElementById("rotation-log").innerHTML = logs.slice().reverse().map(e => {
-    const ts = new Date(e.time * 1000).toLocaleString();
-    const isSwitched = e.action === "switched";
-    const cls = isSwitched ? "switched" : "notify";
-    const label = isSwitched ? "Switched" : "Would switch";
-    const reason = e.reason === "active_unusable" ? "active dead/rate-limited" : `5h ${(e.trigger_util_5h*100).toFixed(0)}%`;
-    return `<div class="rotation-entry">${ts} &mdash; <span class="rotation-action ${cls}">${label}</span> <b>${e.from}</b> &rarr; <b>${e.to}</b> (${reason})</div>`;
+function renderTokens(){
+  const box = $("#tokens");
+  $("#tokCount").textContent = `${state.tokens.length}`;
+  const seen = new Set();
+  state.tokens.forEach(name=>{
+    seen.add(name);
+    let card = tokRefs.get(name);
+    if(!card){
+      card = document.createElement("div");
+      card.className = "tok";
+      tokRefs.set(name, card);
+      box.appendChild(card);
+    }
+    // preserve <details open> across re-render
+    const wasOpen = card.querySelector("details.raw")?.open;
+    card.classList.toggle("is-active", name===state.active);
+    card.innerHTML = tokenCardHTML(name);
+    if(wasOpen){ const d=card.querySelector("details.raw"); if(d) d.open=true; }
+    card.querySelector(".act-select").onclick = ()=>selectToken(name);
+    card.querySelector(".act-probe").onclick = (e)=>probeToken(name, e.currentTarget);
+  });
+  for(const [name,card] of tokRefs){ if(!seen.has(name)){ card.remove(); tokRefs.delete(name); } }
+}
+
+// =====================================================================
+// Clients  (usage per virtual key, magnitude share bar + expandable)
+// =====================================================================
+const clientOpen = new Set();
+function renderClients(){
+  const box = $("#clients");
+  const vks = state.virtual_keys || [];
+  $("#clientCount").textContent = `${vks.length}`;
+  const totals = vks.map(vk=>{
+    let req=0,inp=0,out=0,cr=0,cw=0,tot=0;
+    const models = Object.entries(vk.usage||{}).sort((a,b)=>((b[1].input_tokens+b[1].output_tokens)-(a[1].input_tokens+a[1].output_tokens)));
+    for(const [,m] of models){ req+=m.requests||0; inp+=m.input_tokens||0; out+=m.output_tokens||0; cr+=m.cache_read_input_tokens||0; cw+=m.cache_creation_input_tokens||0; }
+    tot = inp+out+cr+cw;
+    return {name:vk.name, req,inp,out,cr,cw,tot,models};
+  }).sort((a,b)=>b.tot-a.tot);
+  const max = Math.max(1, ...totals.map(t=>t.tot));
+  box.innerHTML = totals.map(t=>{
+    const rows = t.models.map(([mn,m])=>`<tr><td>${esc(mn)}</td><td>${m.requests||0}</td><td>${fmt(m.input_tokens)}</td><td>${fmt(m.output_tokens)}</td><td>${fmt(m.cache_read_input_tokens)}</td><td>${fmt(m.cache_creation_input_tokens)}</td></tr>`).join("");
+    const open = clientOpen.has(t.name);
+    const share = Math.round(t.tot/max*100);
+    return `<div class="client ${open?'open':''}" data-name="${esc(t.name)}">
+      <button class="client-head" aria-expanded="${open}" style="--sh:${share}%" title="${share}% of the busiest client's tokens">
+        <span class="client-id">
+          <svg class="caret" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
+          <span class="name">${esc(t.name)}</span>
+        </span>
+        <span class="client-nums">
+          <span class="cn"><div class="v">${t.req}</div><div class="k">req</div></span>
+          <span class="cn"><div class="v">${fmt(t.inp)}</div><div class="k">in</div></span>
+          <span class="cn"><div class="v">${fmt(t.out)}</div><div class="k">out</div></span>
+          <span class="cn"><div class="v">${fmt(t.cr)}</div><div class="k">cache</div></span>
+        </span>
+      </button>
+      <div class="client-body">${t.models.length?`<table class="utable"><thead><tr><th>Model</th><th>Req</th><th>Input</th><th>Output</th><th>Cache rd</th><th>Cache wr</th></tr></thead><tbody>${rows}</tbody></table>`:`<div class="empty">No usage recorded yet.</div>`}</div>
+    </div>`;
+  }).join("") || `<div class="client"><div class="empty">No clients configured.</div></div>`;
+  box.querySelectorAll(".client-head").forEach(btn=>{
+    btn.onclick = ()=>{
+      const el = btn.closest(".client"); const nm = el.dataset.name;
+      if(clientOpen.has(nm)) clientOpen.delete(nm); else clientOpen.add(nm);
+      el.classList.toggle("open"); btn.setAttribute("aria-expanded", clientOpen.has(nm));
+    };
+  });
+}
+
+// =====================================================================
+// Settings form (built once; not clobbered while editing)
+// =====================================================================
+const CFG = [
+  {g:"Auto-rotation", rows:[
+    ["auto_rotation.enabled","bool","Enabled","Switch tokens on high 5h utilization or when the active token is dead/rate-limited"],
+    ["auto_rotation.threshold_5h","num","5h threshold","Rotate when the active token's 5h use ≥ this (0–1)"],
+    ["auto_rotation.target_max_util_5h","num","Target max util","On high-util rotation, only switch to tokens below this"],
+    ["auto_rotation.check_interval_seconds","num","Check interval","Seconds between evaluations"],
+    ["auto_rotation.probe_before_switch","bool","Probe before switch","Health-check a candidate before switching to it"],
+    ["auto_rotation.cooldown_seconds","num","Cooldown","Min seconds between util-based rotations"],
+    ["auto_rotation.notify_only","bool","Notify only","Log rotations without actually switching"],
+  ]},
+  {g:"Probes & timeouts", rows:[
+    ["health_probe_interval_seconds","num","Health probe interval","Re-probe unhealthy tokens (seconds)"],
+    ["active_probe_interval_seconds","num","Active probe interval","Validate the active token (seconds)"],
+    ["upstream_timeout_seconds","num","Upstream timeout","HTTP timeout for API calls (restart to apply)"],
+  ]},
+];
+const cget = (o,p)=>p.split(".").reduce((a,k)=>a&&a[k]!==undefined?a[k]:undefined,o);
+function buildForm(){
+  const cfg = state.config||{};
+  const f = $("#cfgForm");
+  f.innerHTML = CFG.map(grp=>`<div class="cfg-group"><div class="glabel">${grp.g}</div>${grp.rows.map(([path,type,label,hint])=>{
+    const v = cget(cfg,path);
+    const ctl = type==="bool"
+      ? `<label class="switch"><input type="checkbox" data-path="${path}" ${v?"checked":""} aria-label="${label}"><span class="sl"></span></label>`
+      : `<input class="num" type="number" step="any" min="0" data-path="${path}" value="${v}" aria-label="${label}">`;
+    return `<div class="cfg-row"><span class="lab"><div class="t">${label}</div><div class="h">${hint}</div></span>${ctl}</div>`;
+  }).join("")}</div>`).join("") +
+    `<div class="cfg-foot"><button type="submit" class="btn primary" id="saveCfg">Save settings</button><button type="button" class="btn ghost" id="revertCfg">Revert</button></div>`;
+  f.querySelectorAll("[data-path]").forEach(el=>el.addEventListener("input", ()=>{cfgDirty=true;}));
+  f.onsubmit = saveConfig;
+  $("#revertCfg").onclick = ()=>{ cfgDirty=false; buildForm(); toast("info","Reverted to saved settings"); };
+}
+async function saveConfig(e){
+  e.preventDefault();
+  const f = $("#cfgForm"), btn = $("#saveCfg");
+  const payload = {auto_rotation:{}};
+  f.querySelectorAll("[data-path]").forEach(el=>{
+    const path = el.dataset.path;
+    const val = el.type==="checkbox" ? el.checked : parseFloat(el.value);
+    const [a,b] = path.split(".");
+    if(b){ payload.auto_rotation[b]=val; } else { payload[a]=val; }
+  });
+  btn.disabled=true; btn.textContent="Saving…";
+  try{
+    const r = await fetch("/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.error||r.statusText);
+    cfgDirty=false; state.config=d.config; buildForm();
+    toast("ok","Settings saved");
+  }catch(err){ toast("err","Couldn't save: "+err.message); }
+  finally{ btn.disabled=false; btn.textContent="Save settings"; }
+}
+
+// =====================================================================
+// Rotation log
+// =====================================================================
+function renderLog(){
+  const logs = state.rotation_log||[];
+  const box = $("#log");
+  if(!logs.length){ box.innerHTML = `<div class="empty">No rotations yet.</div>`; return; }
+  box.innerHTML = logs.slice().reverse().map(e=>{
+    const when = new Date(e.time*1000).toLocaleString();
+    const sw = e.action==="switched";
+    const why = e.reason==="active_unusable" ? "active dead/rate-limited" : `5h at ${Math.round((e.trigger_util_5h||0)*100)}%`;
+    return `<div class="logrow ${sw?'switched':'notify'}"><div class="when">${when}</div>${sw?'Switched':'Would switch'} <b>${esc(e.from)}</b> <span class="arrow">→</span> <b>${esc(e.to)}</b> · ${why}</div>`;
   }).join("");
 }
-async function saveConfig() {
-  const btn = document.getElementById("save-cfg-btn");
-  btn.disabled = true; btn.textContent = "Saving…";
-  const cfg = {
-    auto_rotation: {
-      enabled: document.getElementById("ar-enabled").checked,
-      threshold_5h: parseFloat(document.getElementById("ar-threshold").value),
-      target_max_util_5h: parseFloat(document.getElementById("ar-target-max").value),
-      check_interval_seconds: parseInt(document.getElementById("ar-interval").value),
-      probe_before_switch: document.getElementById("ar-probe").checked,
-      cooldown_seconds: parseInt(document.getElementById("ar-cooldown").value),
-      notify_only: document.getElementById("ar-notify").checked,
-    },
-    health_probe_interval_seconds: parseInt(document.getElementById("cfg-health-int").value),
-    active_probe_interval_seconds: parseInt(document.getElementById("cfg-active-int").value),
-    upstream_timeout_seconds: parseInt(document.getElementById("cfg-timeout").value),
-  };
-  const fb = document.getElementById("config-fb");
-  try {
-    const r = await fetch("/config", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(cfg) });
-    const data = await r.json();
-    if (!r.ok) throw new Error(data.error || r.statusText);
-    state.config = data.config || cfg;
-    fb.textContent = "Settings saved"; fb.className = "feedback ok";
-  } catch (e) { fb.textContent = `Error: ${e.message}`; fb.className = "feedback err"; }
-  finally { btn.disabled = false; btn.textContent = "Save Settings"; }
-  setTimeout(() => { fb.className = "feedback"; }, 3000);
+
+// =====================================================================
+// Actions
+// =====================================================================
+async function selectToken(name){
+  try{
+    const r = await fetch("/select",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name})});
+    if(!r.ok) throw new Error(await r.text());
+    state.active = name; renderHero(); renderTokens();
+    toast("ok",`Now serving via “${name}”`);
+    refresh();
+  }catch(err){ toast("err","Switch failed: "+err.message); }
 }
-async function probe(name) {
-  const btn = document.getElementById(`probe-btn-${name}`);
-  if (btn) { btn.disabled = true; btn.textContent = "…"; }
-  const fb = document.getElementById("fb");
-  try {
-    const r = await fetch("/probe", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
-    const data = await r.json();
-    if (!r.ok) throw new Error(data.error || r.statusText);
+async function probeToken(name, btn){
+  const old = btn.textContent; btn.disabled=true; btn.textContent="Testing…";
+  try{
+    const r = await fetch("/probe",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name})});
+    const d = await r.json();
+    if(!r.ok) throw new Error(d.error||r.statusText);
+    toast(d.healthy?"ok":"err", d.healthy?`“${name}” is healthy`:`“${name}” — ${d.status}`);
     await refresh();
-    fb.textContent = data.healthy ? `"${name}" is healthy` : `"${name}" probe: ${data.status} (errors: ${data.error_count})`;
-    fb.className = data.healthy ? "feedback ok" : "feedback err";
-  } catch (e) { fb.textContent = `Probe error: ${e.message}`; fb.className = "feedback err"; }
-  finally { if (btn) { btn.disabled = false; btn.textContent = "Test"; } }
-  setTimeout(() => { fb.className = "feedback"; }, 4000);
+  }catch(err){ toast("err","Probe failed: "+err.message); }
+  finally{ btn.disabled=false; btn.textContent=old; }
 }
-async function pick(name) {
-  const fb = document.getElementById("fb");
-  try {
-    const r = await fetch("/select", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name }) });
-    if (!r.ok) throw new Error(await r.text());
-    state.active = name; render();
-    fb.textContent = `Switched to "${name}"`; fb.className = "feedback ok";
-  } catch (e) { fb.textContent = `Error: ${e.message}`; fb.className = "feedback err"; }
-  setTimeout(() => { fb.className = "feedback"; }, 3000);
+
+// =====================================================================
+// System status (top bar)
+// =====================================================================
+function renderSystem(){
+  // overall: crit if active unusable; warn if any token warn/rate-limited; else good
+  const hh = (state.health||{})[state.active];
+  const activeSev = healthLabel(hh).sev;
+  const h = (state.headers||{})[state.active]||{};
+  const u5 = h["anthropic-ratelimit-unified-5h-utilization"];
+  let overall = "good", label = "All systems nominal";
+  if(activeSev==="crit"){ overall="crit"; label="Active token unavailable"; }
+  else if(activeSev==="warn" || (u5!==undefined && sev(u5)==="warn")){ overall="warn"; label="Degraded — high utilization"; }
+  else if(u5!==undefined && sev(u5)==="crit"){ overall="crit"; label="Capacity exhausted"; }
+  const dot=$("#sysdot"); dot.className="sysdot "+overall; $("#syslabel").textContent=label;
 }
-init();
+
+// =====================================================================
+// fetch + render loop
+// =====================================================================
+async function refresh(){
+  try{
+    const r = await fetch("/state",{cache:"no-store"});
+    if(!r.ok) throw new Error("HTTP "+r.status);
+    state = await r.json();
+    lastOk = Date.now();
+    $("#banner").classList.remove("show");
+    document.querySelectorAll(".stale").forEach(e=>e.classList.remove("stale"));
+    renderSystem(); renderHero(); renderTiles(); renderTokens(); renderClients(); renderLog();
+    if(!cfgDirty) buildForm();
+    $("#authnote").textContent = state.auth_enabled ? "Admin auth: on" : "Admin auth: OFF — set ADMIN_PASSWORD";
+  }catch(err){
+    $("#bannerText").textContent = "Can't reach the proxy — retrying. ("+err.message+")";
+    $("#banner").classList.add("show");
+    // keep the last good frame, dim it (interaction.md: refetch keeps the frame)
+    ["hero","tokens","clients","tiles"].forEach(id=>{ if(state) $("#"+id).classList.add("stale"); });
+  }
+}
+
+// live countdowns + "synced Ns ago" between fetches
+function tick(){
+  if(lastOk){ const s=Math.round((Date.now()-lastOk)/1000); $("#synctext").textContent = s<2?"live":`${s}s ago`; }
+  document.querySelectorAll("[data-reset]").forEach(el=>{ const ts=el.getAttribute("data-reset"); if(ts) el.textContent="resets "+fmtReset(ts); });
+  const rs=$("#hero")?.querySelector(".reset5"); // hero 5h countdown handled on full render; cheap enough
+}
+
+// ---- toasts ----
+function toast(kind, msg){
+  const t=document.createElement("div"); t.className="toast "+kind; t.setAttribute("role","status");
+  t.innerHTML = `<span style="color:${kind==='ok'?'var(--good)':kind==='err'?'var(--crit)':'var(--coral-bright)'}">${ICON[kind==='ok'?'good':kind==='err'?'crit':'active']}</span><span></span>`;
+  t.querySelector("span:last-child").textContent = msg;
+  $("#toasts").appendChild(t);
+  setTimeout(()=>{ t.style.transition="opacity .3s"; t.style.opacity="0"; setTimeout(()=>t.remove(),300); }, 3600);
+}
+// icons in toasts want fixed size
+const style=document.createElement("style"); style.textContent=".toast svg{width:15px;height:15px;flex:none}"; document.head.appendChild(style);
+
+function esc(s){ return String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+// ---- theme ----
+function applyTheme(t){ document.documentElement.dataset.theme=t; localStorage.setItem("cp-theme",t);
+  $("#themeIcon").innerHTML = t==="dark"
+    ? '<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>'
+    : '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>';
+}
+applyTheme(localStorage.getItem("cp-theme") || (matchMedia("(prefers-color-scheme: light)").matches?"light":"dark"));
+$("#themeBtn").onclick = ()=>applyTheme(document.documentElement.dataset.theme==="dark"?"light":"dark");
+$("#refreshBtn").onclick = ()=>{ $("#refreshBtn").style.transform="rotate(360deg)"; setTimeout(()=>$("#refreshBtn").style.transform="",400); refresh(); };
+
+// ---- boot ----
+refresh();
+setInterval(refresh, 5000);
+setInterval(tick, 1000);
 </script>
 </body>
 </html>
