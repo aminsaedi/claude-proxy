@@ -4,9 +4,10 @@
 
 `claude-proxy` is a self-hosted Anthropic API proxy: clients authenticate with
 **virtual keys**, the proxy forwards to `api.anthropic.com` using subscription
-**OAuth tokens**, with per-request failover, usage tracking, health probing, and
-auto-rotation. It runs two FastAPI apps concurrently — a proxy on port 8080 and
-an admin UI on port 8090 — plus background tasks, all under one asyncio loop.
+**OAuth tokens**, with per-request failover, usage + cost tracking, per-key spend
+limits, health probing, and auto-rotation. It runs two FastAPI apps concurrently
+— a proxy on port 8080 and an admin UI on port 8090 — plus background tasks, all
+under one asyncio loop.
 
 ## Module map (`src/claude_proxy/`)
 
@@ -16,7 +17,11 @@ an admin UI on port 8090 — plus background tasks, all under one asyncio loop.
 - `admin_app.py` — dashboard + `/state` `/select` `/probe` `/config` `/metrics`; HTTP Basic auth.
 - `stores.py` — `TokenStore` (health incl. rate-limited vs unhealthy, failover order) and
   `VirtualKeyStore` (mtime hot-reload, `resolve()`).
-- `usage.py` — `UsageTracker`: async-locked, debounced, atomic; tracks cache tokens.
+- `usage.py` — `UsageTracker`: async-locked, debounced, atomic; lifetime totals **and**
+  an hourly time series; tracks cache tokens and per-request cost.
+- `pricing.py` — `PricingTable`: per-token USD rates from LiteLLM's open price list,
+  disk-cached with a bundled fallback; model-name resolution + `refresh_loop`.
+- `budgets.py` — tz-aware calendar `window_bounds`, `LimitStatus`/`evaluate`, `LimitStore`.
 - `health.py` — token probing (429 → rate_limited, 401/403 → unhealthy) + `health_loop`.
 - `rotation.py` — health-aware auto-rotation (`rotation_loop`).
 - `db.py` — SQLite layer (schema + CRUD); the single source of truth.
@@ -30,10 +35,13 @@ an admin UI on port 8090 — plus background tasks, all under one asyncio loop.
 
 Everything lives in one SQLite DB, `CLAUDE_PROXY_DB` (default
 `$CLAUDE_PROXY_DATA_DIR/claude_proxy.db`; `/data/claude_proxy.db` in k8s). Tables:
-`tokens`, `virtual_keys`, `config` (single JSON row), `usage`. WAL mode lets the
-app and a `manage.py` process share the file. The request path never hits the DB
-— tokens/keys/config are cached in memory (vkeys refreshed from the DB every ~5s),
-usage is flushed on a debounced background task via `asyncio.to_thread`.
+`tokens`, `virtual_keys`, `config` (single JSON row), `usage` (lifetime totals),
+`usage_hourly` (time series, one row per UTC hour × key × model), `key_limits`.
+Schema changes are additive — `db._ADDED_COLUMNS` is applied on startup. WAL mode
+lets the app and a `manage.py` process share the file. The request path never hits
+the DB — tokens/keys/config/limits are cached in memory (vkeys and limits refreshed
+from the DB every ~5s), usage is flushed on a debounced background task via
+`asyncio.to_thread`.
 
 ## Deployment (k3s)
 
@@ -62,6 +70,14 @@ initContainer, non-root uid 10001. Also runnable via `docker compose` (see READM
   unusable; an unusable active token fails over regardless of `target_max_util_5h`.
 - **Usage**: parsed from SSE (`message_start` for input+cache, `message_delta` for
   output) or the JSON `usage` block; flushed to disk on a debounced background task.
+- **Cost**: priced at ingest from `PricingTable` and stored with the tokens, so a
+  price change never rewrites history. Unknown models cost $0 and are surfaced in
+  the console rather than guessed at.
+- **Spend limits**: several periods per key at once (`hour`/`day`/`week`/`month`),
+  all enforced. Windows are calendar-aligned in `config.timezone` (default
+  `America/Toronto`); hourly buckets line up with those edges for whole-hour zones.
+  `AppState.limit_breach()` is checked *before* forwarding and reads only memory.
+  Spend is booked after a response completes, so in-flight requests can overshoot.
 
 ## What NOT to do
 

@@ -14,3 +14,14 @@ auto_rotation:
 health_probe_interval_seconds: 60    # re-probe unhealthy tokens (>= 10)
 active_probe_interval_seconds: 300   # validate the active token periodically (>= 30)
 upstream_timeout_seconds: 600        # HTTP timeout for upstream calls (restart to apply)
+
+# IANA timezone that defines the day/week/month edges for the spend views and
+# for every spend limit (per-key caps live in the DB, not here).
+timezone: America/Toronto
+
+pricing:
+  online: true                 # fetch per-token rates from source_url; off = use the cached copy
+  refresh_hours: 12            # hours between fetches (1–720)
+  source_url: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
+
+usage_retention_days: 400      # days of hourly usage kept on disk (>= 40)

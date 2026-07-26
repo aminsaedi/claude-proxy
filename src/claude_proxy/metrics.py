@@ -29,6 +29,26 @@ CACHE_CREATION_TOKENS = Counter(
     "Cache-creation input tokens per virtual key and model",
     ["key_name", "model"],
 )
+COST_USD = Counter(
+    "proxy_cost_usd_total",
+    "Estimated spend in USD per virtual key and model, priced at request time",
+    ["key_name", "model"],
+)
+LIMIT_BLOCKS = Counter(
+    "proxy_limit_blocks_total",
+    "Requests rejected because a virtual key was over one of its spend limits",
+    ["key_name", "period"],
+)
+KEY_SPEND_USD = Gauge(
+    "proxy_key_window_spend_usd",
+    "Spend in the current limit window, per virtual key and period",
+    ["key_name", "period"],
+)
+KEY_LIMIT_USD = Gauge(
+    "proxy_key_window_limit_usd",
+    "Configured spend cap for the current window, per virtual key and period",
+    ["key_name", "period"],
+)
 UPSTREAM_UTIL_5H = Gauge(
     "proxy_upstream_utilization_5h_ratio",
     "Upstream OAuth token 5-hour utilization ratio",

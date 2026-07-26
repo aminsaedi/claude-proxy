@@ -152,7 +152,9 @@ a:hover { text-decoration: underline; }
 
 /* ============================ stat tiles ============================ */
 .tiles { display: grid; gap: 12px; grid-template-columns: repeat(2, 1fr); }
-@media (min-width: 640px){ .tiles { grid-template-columns: repeat(5, 1fr); } }
+@media (min-width: 640px){ .tiles { grid-template-columns: repeat(3, 1fr); } }
+@media (min-width: 1000px){ .tiles { grid-template-columns: repeat(6, 1fr); } }
+.tile.spend .v { color: var(--coral-bright); }
 .tile { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-sm); padding: 14px 15px; box-shadow: var(--shadow); }
 .tile .k { font-size: .66rem; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); }
 .tile .v { font-family: var(--font-mono); font-size: 1.5rem; font-weight: 600; margin-top: 6px; letter-spacing: -.02em; }
@@ -230,6 +232,51 @@ details.raw[open] > summary::before { content: "▾ "; }
 .client-actions .btn { font-size: .74rem; padding: 6px 11px; display: inline-flex; align-items: center; gap: 6px; }
 .client-actions .btn svg { width: 14px; height: 14px; }
 .client-actions .ckey { flex: 1; min-width: 120px; font-family: var(--font-mono); font-size: .72rem; color: var(--muted); text-align: right; word-break: break-all; }
+
+/* ============================ spend: windows, bars, caps ============================ */
+.money { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.wins { display: grid; gap: 10px; grid-template-columns: repeat(2, 1fr); margin: 12px 0 4px; }
+@media (min-width: 620px){ .wins { grid-template-columns: repeat(4, 1fr); } }
+.win { background: var(--surface-2); border: 1px solid var(--line-2); border-radius: var(--r-sm); padding: 10px 12px; }
+.win .k { font-size: .62rem; letter-spacing: .09em; text-transform: uppercase; color: var(--muted); }
+.win .v { font-family: var(--font-mono); font-size: 1.15rem; font-weight: 650; margin-top: 4px; letter-spacing: -.02em; }
+.win .sub { font-size: .68rem; color: var(--ink-2); margin-top: 2px; font-family: var(--font-mono); }
+.win.lead { background: color-mix(in srgb, var(--coral) 10%, var(--surface-2)); border-color: color-mix(in srgb, var(--coral) 30%, transparent); }
+
+.spark { margin: 14px 0 6px; }
+.spark-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 7px; }
+.spark-head .t { font-size: .68rem; letter-spacing: .09em; text-transform: uppercase; color: var(--muted); }
+.spark-head .z { margin-left: auto; font-size: .68rem; color: var(--muted); font-family: var(--font-mono); }
+.bars { display: flex; align-items: flex-end; gap: 3px; height: 54px; }
+.bars .b { flex: 1; min-width: 0; display: flex; flex-direction: column; justify-content: flex-end; height: 100%; border-radius: 3px 3px 0 0; cursor: default; }
+.bars .b i { display: block; background: color-mix(in srgb, var(--coral) 62%, transparent); border-radius: 3px 3px 0 0; transition: height .4s var(--ease); min-height: 2px; }
+.bars .b:hover i { background: var(--coral-bright); }
+.bars .b.zero i { background: var(--surface-2); }
+.bars .b.today i { background: var(--coral); }
+.spark-axis { display: flex; justify-content: space-between; margin-top: 5px; font-size: .62rem; color: var(--muted); font-family: var(--font-mono); }
+
+.caps { margin: 14px 0 2px; }
+.caps-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+.caps-head .t { font-size: .68rem; letter-spacing: .09em; text-transform: uppercase; color: var(--muted); }
+.caps-head .rule { flex: 1; height: 1px; background: var(--line-2); }
+.cap { padding: 7px 0; }
+.cap + .cap { border-top: 1px solid var(--line-2); }
+.cap-row { display: flex; align-items: baseline; gap: 8px; font-size: .74rem; margin-bottom: 5px; }
+.cap-row .period { font-family: var(--font-mono); color: var(--muted); font-weight: 600; min-width: 74px; }
+.cap-row .amt { font-family: var(--font-mono); font-weight: 650; font-variant-numeric: tabular-nums; }
+.cap-row .reset { margin-left: auto; color: var(--muted); font-size: .72rem; }
+.caps .none { font-size: .78rem; color: var(--muted); font-style: italic; }
+.limit-chip { display: inline-flex; align-items: center; gap: 6px; font-size: .66rem; font-weight: 650; padding: 2px 8px; border-radius: 999px; font-family: var(--font-mono); white-space: nowrap; }
+.limit-chip.good { background: color-mix(in srgb, var(--good) 14%, transparent); color: var(--good); }
+.limit-chip.warn { background: color-mix(in srgb, var(--warn) 16%, transparent); color: var(--warn); }
+.limit-chip.crit { background: color-mix(in srgb, var(--crit) 18%, transparent); color: var(--crit); }
+
+.scope { display: inline-flex; border: 1px solid var(--line); border-radius: var(--r-sm); overflow: hidden; margin: 14px 0 8px; }
+.scope button { font: inherit; font-size: .7rem; font-weight: 600; padding: 4px 11px; border: 0; background: transparent; color: var(--ink-2); cursor: pointer; transition: background .15s, color .15s; }
+.scope button + button { border-left: 1px solid var(--line); }
+.scope button:hover { color: var(--ink); }
+.scope button[aria-pressed="true"] { background: var(--coral); color: var(--coral-ink); }
+.utable td.cost { color: var(--ink); font-weight: 600; }
 
 /* ============================ settings ============================ */
 .panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 20px; box-shadow: var(--shadow); }
@@ -358,8 +405,9 @@ dialog.dlg[open] { animation: dlgin .18s var(--ease); }
   <!-- Settings + rotation log -->
   <section class="sec grid cols-2" aria-label="Settings and rotation log">
     <div>
-      <div class="sec-head"><h2>Auto-rotation &amp; probes</h2><span class="rule"></span></div>
+      <div class="sec-head"><h2>Settings</h2><span class="rule"></span></div>
       <form class="panel" id="cfgForm"></form>
+      <div class="panel" id="pricingPanel" style="margin-top:14px"></div>
     </div>
     <div>
       <div class="sec-head"><h2>Rotation log</h2><span class="rule"></span></div>
@@ -389,6 +437,17 @@ const fmt = (n) => {
   return String(n);
 };
 const pct = (u) => Math.round((parseFloat(u)||0)*100);
+// Money. Cents everywhere so columns line up, but real-but-tiny spend reads as
+// "<$0.01" rather than a $0.00 that looks like nothing happened.
+function usd(n){
+  n = Number(n)||0;
+  if (n === 0) return "$0";
+  const a = Math.abs(n);
+  if (a >= 1000) return "$"+n.toLocaleString(undefined,{maximumFractionDigits:0});
+  if (a >= 0.01) return "$"+n.toFixed(2);
+  return "<$0.01";
+}
+const tokTotal = (m) => (m.input_tokens||0)+(m.output_tokens||0)+(m.cache_read_input_tokens||0)+(m.cache_creation_input_tokens||0);
 function fmtReset(ts) {
   if (!ts) return "—";
   const s = Math.max(0, parseInt(ts) - Date.now()/1000);
@@ -424,6 +483,7 @@ const SVG = {
   trash:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2m1 0-1 14H7L6 6"/></svg>',
   rotate:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 3v6h-6"/></svg>',
   rename:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.6 13.4 12 22l-9-9V4h9z"/><circle cx="7.5" cy="7.5" r="1.6"/></svg>',
+  gauge:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17a9 9 0 1 1 18 0"/><path d="m12 17 4.5-5"/></svg>',
 };
 
 // ---- clipboard (works on plain-http tailnet, where navigator.clipboard is absent) ----
@@ -584,27 +644,32 @@ function heroSub(has,p,s,h){
 // KPI tiles
 // =====================================================================
 function sumUsage() {
-  let req=0, inp=0, out=0, cr=0, cw=0, activeClients=0;
+  let req=0, inp=0, out=0, cr=0, cw=0, cost=0, activeClients=0;
+  const win = {"1d":0, "3d":0, "7d":0, "30d":0};
   for (const vk of state.virtual_keys) {
     let kr=0;
     for (const m of Object.values(vk.usage||{})) {
       req+=m.requests||0; inp+=m.input_tokens||0; out+=m.output_tokens||0;
-      cr+=m.cache_read_input_tokens||0; cw+=m.cache_creation_input_tokens||0; kr+=m.requests||0;
+      cr+=m.cache_read_input_tokens||0; cw+=m.cache_creation_input_tokens||0;
+      cost+=m.cost_usd||0; kr+=m.requests||0;
     }
+    for (const k in win) win[k] += (vk.windows||{})[k]?.cost_usd || 0;
     if (kr>0) activeClients++;
   }
-  return {req,inp,out,cr,cw,activeClients};
+  return {req,inp,out,cr,cw,cost,win,activeClients};
 }
 function renderTiles() {
   const t = sumUsage();
+  const tz = state.timezone || "local";
   const tiles = [
-    {k:"Requests", v:fmt(t.req), sub:"all-time"},
-    {k:"Input tokens", v:fmt(t.inp), sub:"all-time"},
-    {k:"Output tokens", v:fmt(t.out), sub:"all-time"},
-    {k:"Cache read", v:fmt(t.cr), sub:"served from cache"},
+    {k:"Spend today", v:usd(t.win["1d"]), sub:tz, cls:"spend"},
+    {k:"Spend 3d", v:usd(t.win["3d"]), sub:"3 calendar days", cls:"spend"},
+    {k:"Spend 7d", v:usd(t.win["7d"]), sub:"7 calendar days", cls:"spend"},
+    {k:"Spend all-time", v:usd(t.cost), sub:`${fmt(t.req)} requests`},
+    {k:"Cache read", v:fmt(t.cr), sub:"tokens served from cache"},
     {k:"Active clients", v:`${t.activeClients}`, sub:`of ${state.virtual_keys.length} keys`},
   ];
-  $("#tiles").innerHTML = tiles.map(x=>`<div class="tile"><div class="k">${x.k}</div><div class="v">${x.v}</div><div class="sub">${x.sub}</div></div>`).join("");
+  $("#tiles").innerHTML = tiles.map(x=>`<div class="tile ${x.cls||""}"><div class="k">${x.k}</div><div class="v">${x.v}</div><div class="sub">${esc(x.sub)}</div></div>`).join("");
 }
 
 // =====================================================================
@@ -694,30 +759,94 @@ function renderTokens(){
 // =====================================================================
 const clientOpen = new Set();
 const clientRefs = new Map();   // name -> wrapper element (with ._html cache)
+const clientScope = new Map();  // name -> which window the model table shows
+const SCOPES = [["1d","Today"],["7d","7 days"],["30d","30 days"],["all","All-time"]];
+const PERIOD_LABEL = {hour:"per hour", day:"per day", week:"per week", month:"per month"};
+
+// The worst cap on a key, as a compact pill for the collapsed row.
+function limitChip(limits){
+  if(!limits || !limits.length) return "";
+  const w = limits[0];   // server sorts tightest-first
+  const s = w.over ? "crit" : w.ratio >= 0.8 ? "warn" : "good";
+  const text = w.over ? `over ${usd(w.limit_usd)} ${PERIOD_LABEL[w.period]}`
+                      : `${usd(w.spent_usd)} / ${usd(w.limit_usd)} ${PERIOD_LABEL[w.period]}`;
+  return `<span class="limit-chip ${s}" title="Resets ${fmtReset(w.resets_at)}">${w.over?"⛔ ":""}${esc(text)}</span>`;
+}
+function winsHTML(w){
+  return `<div class="wins">` + [["1d","Today"],["3d","3 days"],["7d","7 days"],["30d","30 days"]].map(([k,label],i)=>{
+    const d = w[k]||{};
+    return `<div class="win ${i===0?"lead":""}">
+      <div class="k">${label}</div>
+      <div class="v">${usd(d.cost_usd)}</div>
+      <div class="sub">${fmt(d.requests)} req · ${fmt(tokTotal(d))} tok</div>
+    </div>`;
+  }).join("") + `</div>`;
+}
+function sparkHTML(daily, tz){
+  if(!daily || !daily.length) return "";
+  const max = Math.max(...daily.map(d=>d.cost_usd||0), 0);
+  const bars = daily.map((d,i)=>{
+    const c = d.cost_usd||0;
+    const h = max > 0 ? Math.max(2, Math.round(c/max*100)) : 0;
+    const last = i===daily.length-1;
+    return `<span class="b ${c?"":"zero"} ${last?"today":""}" title="${esc(d.date)} — ${usd(c)} · ${fmt(d.requests)} req"><i style="height:${h}%"></i></span>`;
+  }).join("");
+  return `<div class="spark">
+    <div class="spark-head"><span class="t">Daily spend</span><span class="z">${esc(tz||"")}</span></div>
+    <div class="bars">${bars}</div>
+    <div class="spark-axis"><span>${esc(daily[0].date)}</span><span>today</span></div>
+  </div>`;
+}
+function capsHTML(limits){
+  const body = (limits && limits.length) ? limits.map(l=>{
+    const s = l.over ? "crit" : l.ratio >= 0.8 ? "warn" : "good";
+    return `<div class="cap">
+      <div class="cap-row">
+        <span class="period">${esc(PERIOD_LABEL[l.period]||l.period)}</span>
+        <span class="amt" style="color:${sevColor(s)}">${usd(l.spent_usd)}</span>
+        <span style="color:var(--muted)">of ${usd(l.limit_usd)}</span>
+        <span class="reset" data-reset="${l.resets_at||''}">resets ${fmtReset(l.resets_at)}</span>
+      </div>
+      <div class="track thin"><div class="bar" style="width:${Math.min(100,Math.round(l.ratio*100))}%;background:${sevColor(s)}"></div></div>
+    </div>`;
+  }).join("") : `<div class="none">No spend limits — this client can spend without a cap.</div>`;
+  return `<div class="caps"><div class="caps-head"><span class="t">Spend limits</span><span class="rule"></span></div>${body}</div>`;
+}
 function clientInnerHTML(t, max){
-  const rows = t.models.map(([mn,m])=>`<tr><td>${esc(mn)}</td><td>${m.requests||0}</td><td>${fmt(m.input_tokens)}</td><td>${fmt(m.output_tokens)}</td><td>${fmt(m.cache_read_input_tokens)}</td><td>${fmt(m.cache_creation_input_tokens)}</td></tr>`).join("");
-  const share = Math.round(t.tot/max*100);
-  return `<button class="client-head" aria-expanded="${clientOpen.has(t.name)}" style="--sh:${share}%" title="${share}% of the busiest client's tokens">
+  const scope = clientScope.get(t.name) || "1d";
+  const models = Object.entries(scope==="all" ? t.lifetime : ((t.windows[scope]||{}).models || {}))
+    .sort((a,b)=>(b[1].cost_usd||0)-(a[1].cost_usd||0) || tokTotal(b[1])-tokTotal(a[1]));
+  const rows = models.map(([mn,m])=>`<tr><td>${esc(mn)}</td><td class="cost">${usd(m.cost_usd)}</td><td>${fmt(m.requests)}</td><td>${fmt(m.input_tokens)}</td><td>${fmt(m.output_tokens)}</td><td>${fmt(m.cache_read_input_tokens)}</td><td>${fmt(m.cache_creation_input_tokens)}</td></tr>`).join("");
+  const share = Math.round(t.rank/max*100);
+  return `<button class="client-head" aria-expanded="${clientOpen.has(t.name)}" style="--sh:${share}%" title="${share}% of the busiest client's 7-day spend">
       <span class="client-id">
         <svg class="caret" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
         <span class="name">${esc(t.name)}</span>
+        ${limitChip(t.limits)}
       </span>
       <span class="client-nums">
-        <span class="cn"><div class="v">${t.req}</div><div class="k">req</div></span>
-        <span class="cn"><div class="v">${fmt(t.inp)}</div><div class="k">in</div></span>
-        <span class="cn"><div class="v">${fmt(t.out)}</div><div class="k">out</div></span>
+        <span class="cn"><div class="v money">${usd(t.today)}</div><div class="k">today</div></span>
+        <span class="cn"><div class="v money">${usd(t.week)}</div><div class="k">7d</div></span>
+        <span class="cn"><div class="v">${fmt(t.req)}</div><div class="k">req</div></span>
         <span class="cn"><div class="v">${fmt(t.cr)}</div><div class="k">cache</div></span>
       </span>
     </button>
     <div class="client-body">
+      ${winsHTML(t.windows)}
+      ${sparkHTML(t.daily, state.timezone)}
+      ${capsHTML(t.limits)}
       <div class="client-actions">
+        <button class="btn ck-limits" type="button">${SVG.gauge} Set limits</button>
         <button class="btn ck-reveal" type="button">${SVG.eye} Reveal key</button>
         <button class="btn ck-rotate" type="button">${SVG.rotate} Rotate</button>
         <button class="btn ck-rename" type="button">${SVG.rename} Rename</button>
         <button class="btn danger ck-delete" type="button">${SVG.trash} Delete</button>
         <span class="ckey" title="Masked — use Reveal for the full key">${esc(t.preview||"vk-…")}</span>
       </div>
-      ${t.models.length?`<table class="utable"><thead><tr><th>Model</th><th>Req</th><th>Input</th><th>Output</th><th>Cache rd</th><th>Cache wr</th></tr></thead><tbody>${rows}</tbody></table>`:`<div class="empty">No usage recorded yet.</div>`}
+      <div class="scope" role="group" aria-label="Model breakdown period">
+        ${SCOPES.map(([k,label])=>`<button type="button" data-scope="${k}" aria-pressed="${scope===k}">${label}</button>`).join("")}
+      </div>
+      ${models.length?`<table class="utable"><thead><tr><th>Model</th><th>Cost</th><th>Req</th><th>Input</th><th>Output</th><th>Cache rd</th><th>Cache wr</th></tr></thead><tbody>${rows}</tbody></table>`:`<div class="empty">No usage in this period.</div>`}
     </div>`;
 }
 function bindClient(el, nm){
@@ -726,6 +855,10 @@ function bindClient(el, nm){
     el.classList.toggle("open");
     el.querySelector(".client-head").setAttribute("aria-expanded", clientOpen.has(nm));
   };
+  el.querySelectorAll("[data-scope]").forEach(b=>b.addEventListener("click", ()=>{
+    clientScope.set(nm, b.dataset.scope); renderClients();
+  }));
+  el.querySelector(".ck-limits")?.addEventListener("click", ()=>editLimits(nm));
   el.querySelector(".ck-reveal")?.addEventListener("click", ()=>revealKey(nm));
   el.querySelector(".ck-rotate")?.addEventListener("click", ()=>rotateKey(nm));
   el.querySelector(".ck-rename")?.addEventListener("click", ()=>renameKey(nm));
@@ -736,18 +869,23 @@ function renderClients(){
   const vks = state.virtual_keys || [];
   $("#clientCount").textContent = `${vks.length}`;
   const totals = vks.map(vk=>{
-    let req=0,inp=0,out=0,cr=0,cw=0,tot=0;
-    const models = Object.entries(vk.usage||{}).sort((a,b)=>((b[1].input_tokens+b[1].output_tokens)-(a[1].input_tokens+a[1].output_tokens)));
-    for(const [,m] of models){ req+=m.requests||0; inp+=m.input_tokens||0; out+=m.output_tokens||0; cr+=m.cache_read_input_tokens||0; cw+=m.cache_creation_input_tokens||0; }
-    tot = inp+out+cr+cw;
-    return {name:vk.name, preview:vk.preview||"", req,inp,out,cr,cw,tot,models};
-  }).sort((a,b)=>b.tot-a.tot);
+    const windows = vk.windows || {};
+    const lifetime = vk.usage || {};
+    let req=0, cr=0, cost=0;
+    for(const m of Object.values(lifetime)){ req+=m.requests||0; cr+=m.cache_read_input_tokens||0; cost+=m.cost_usd||0; }
+    const today = windows["1d"]?.cost_usd || 0;
+    const week  = windows["7d"]?.cost_usd || 0;
+    return {name:vk.name, preview:vk.preview||"", limits:vk.limits||[], daily:vk.daily||[],
+            windows, lifetime, req, cr, cost, today, week,
+            // Rank by recent spend — that's the number an operator acts on.
+            rank: week || cost};
+  }).sort((a,b)=>b.rank-a.rank || b.cost-a.cost);
   if(!totals.length){
     box.innerHTML = `<div class="client"><div class="empty">No clients configured.</div></div>`;
     clientRefs.clear();
     return;
   }
-  const max = Math.max(1, ...totals.map(t=>t.tot));
+  const max = Math.max(1e-9, ...totals.map(t=>t.rank));
   const seen = new Set();
   // keyed patch: reuse each client's wrapper node, only rewrite its innards when
   // the content actually changed — an unchanged row keeps its focus & selection.
@@ -787,6 +925,12 @@ const CFG = [
     ["active_probe_interval_seconds","num","Active probe interval","Validate the active token (seconds)"],
     ["upstream_timeout_seconds","num","Upstream timeout","HTTP timeout for API calls (restart to apply)"],
   ]},
+  {g:"Cost & limits", rows:[
+    ["timezone","text","Timezone","IANA name. Sets the day/week/month boundaries for spend windows and limits"],
+    ["pricing.online","bool","Fetch prices online","Pull per-token rates from the public price list; off = use the cached copy"],
+    ["pricing.refresh_hours","num","Price refresh","Hours between price-list fetches"],
+    ["usage_retention_days","num","Usage history","Days of hourly usage kept on disk (min 40)"],
+  ]},
 ];
 const cget = (o,p)=>p.split(".").reduce((a,k)=>a&&a[k]!==undefined?a[k]:undefined,o);
 function buildForm(){
@@ -796,8 +940,10 @@ function buildForm(){
   f.innerHTML = CFG.map(grp=>`<div class="cfg-group"><div class="glabel">${grp.g}</div>${grp.rows.map(([path,type,label,hint])=>{
     const v = cget(cfg,path);
     const ctl = type==="bool"
-      ? `<label class="switch"><input type="checkbox" data-path="${path}" ${v?"checked":""} aria-label="${label}"><span class="sl"></span></label>`
-      : `<input class="num" type="number" step="any" min="0" data-path="${path}" value="${v}" aria-label="${label}">`;
+      ? `<label class="switch"><input type="checkbox" data-path="${path}" data-type="bool" ${v?"checked":""} aria-label="${label}"><span class="sl"></span></label>`
+      : type==="text"
+      ? `<input class="num" style="width:170px;text-align:left" type="text" spellcheck="false" data-path="${path}" data-type="text" value="${esc(v)}" aria-label="${label}">`
+      : `<input class="num" type="number" step="any" min="0" data-path="${path}" data-type="num" value="${esc(v)}" aria-label="${label}">`;
     return `<div class="cfg-row"><span class="lab"><div class="t">${label}</div><div class="h">${hint}</div></span>${ctl}</div>`;
   }).join("")}</div>`).join("") +
     `<div class="cfg-foot"><button type="submit" class="btn primary" id="saveCfg">Save settings</button><button type="button" class="btn ghost" id="revertCfg">Revert</button></div>`;
@@ -808,12 +954,12 @@ function buildForm(){
 async function saveConfig(e){
   e.preventDefault();
   const f = $("#cfgForm"), btn = $("#saveCfg");
-  const payload = {auto_rotation:{}};
+  const payload = {};
   f.querySelectorAll("[data-path]").forEach(el=>{
-    const path = el.dataset.path;
-    const val = el.type==="checkbox" ? el.checked : parseFloat(el.value);
-    const [a,b] = path.split(".");
-    if(b){ payload.auto_rotation[b]=val; } else { payload[a]=val; }
+    const t = el.dataset.type;
+    const val = t==="bool" ? el.checked : t==="text" ? el.value.trim() : parseFloat(el.value);
+    const [a,b] = el.dataset.path.split(".");
+    if(b){ (payload[a] = payload[a]||{})[b] = val; } else { payload[a]=val; }
   });
   btn.disabled=true; btn.textContent="Saving…";
   try{
@@ -824,6 +970,39 @@ async function saveConfig(e){
     toast("ok","Settings saved");
   }catch(err){ toast("err","Couldn't save: "+err.message); }
   finally{ btn.disabled=false; btn.textContent="Save settings"; }
+}
+
+// =====================================================================
+// Pricing source
+// =====================================================================
+const PRICE_SRC = {
+  online:   {sev:"good",    text:"live price list"},
+  cache:    {sev:"warn",    text:"cached price list"},
+  fallback: {sev:"crit",    text:"built-in fallback rates"},
+};
+function renderPricing(){
+  const p = state.pricing || {};
+  const s = PRICE_SRC[p.source] || {sev:"neutral", text:p.source||"unknown"};
+  const when = p.fetched_at ? new Date(p.fetched_at*1000).toLocaleString() : "never";
+  const unpriced = (p.unpriced_models||[]);
+  $("#pricingPanel").innerHTML = `
+    <div class="cfg-group"><div class="glabel">Model pricing</div>
+      <div class="cfg-row"><span class="lab">
+        <div class="t">${badge(s.sev, s.text)} <span class="mono" style="font-size:.78rem;color:var(--ink-2)">${p.models||0} models</span></div>
+        <div class="h">Fetched ${esc(when)}${p.last_error?` · last attempt failed: ${esc(p.last_error)}`:""}</div>
+      </span><button type="button" class="btn" id="refreshPrices">Refresh now</button></div>
+      ${unpriced.length?`<div class="cfg-row"><span class="lab">
+        <div class="t" style="color:var(--warn)">${unpriced.length} model${unpriced.length>1?"s":""} with no published price</div>
+        <div class="h mono">${esc(unpriced.join(", "))} — counted as $0.00</div></span></div>`:""}
+      <div class="cfg-row"><span class="lab"><div class="h">Rates come from the LiteLLM community price list and are applied when a
+        request is recorded, so past spend never changes when prices do.</div></span></div>
+    </div>`;
+  $("#refreshPrices").onclick = async (ev)=>{
+    const b = ev.currentTarget; b.disabled=true; b.textContent="Fetching…";
+    try{ const d=await api("POST","/pricing/refresh"); toast("ok",`Loaded ${d.models} model prices`); await refresh(); }
+    catch(err){ toast("err","Price refresh failed: "+err.message); }
+    finally{ b.disabled=false; b.textContent="Refresh now"; }
+  };
 }
 
 // =====================================================================
@@ -967,6 +1146,48 @@ async function revealKey(name){
   }catch(err){ toast("err","Couldn't reveal: "+err.message); }
 }
 
+// ---- spend limits ----
+// All four periods are edited together and sent as one replace-all payload, so
+// clearing a box is how you remove a cap. Several can be active at once — an
+// hourly cap catches a runaway loop, a monthly one bounds the bill.
+const LIMIT_PERIODS = [
+  ["hour",  "$ per hour",  "resets on the hour"],
+  ["day",   "$ per day",   "resets at local midnight"],
+  ["week",  "$ per week",  "resets Monday at local midnight"],
+  ["month", "$ per month", "resets on the 1st"],
+];
+async function editLimits(name){
+  const vk = (state.virtual_keys||[]).find(v=>v.name===name) || {};
+  const cur = {};
+  for(const l of (vk.limits||[])) cur[l.period] = l.limit_usd;
+  const tz = state.timezone || "local time";
+  const data = await formDialog({
+    title:`Spend limits · ${name}`,
+    desc:`Requests are rejected with HTTP 429 while any cap is exceeded. Windows are calendar-aligned in ${tz}. Leave a box blank for no cap.`,
+    submitLabel:"Save limits",
+    fields: LIMIT_PERIODS.map(([p,label,hint])=>({
+      name:p, label, hint,
+      value: cur[p]!==undefined ? String(cur[p]) : "",
+      placeholder:"no cap",
+    })),
+  });
+  if(!data) return;
+  const limits = {};
+  for(const [p] of LIMIT_PERIODS){
+    const raw = (data[p]||"").replace(/^\$/,"").trim();
+    if(!raw) continue;
+    const v = Number(raw);
+    if(!isFinite(v) || v < 0){ toast("err",`“${raw}” isn't a valid amount for ${p}`); return; }
+    if(v > 0) limits[p] = v;
+  }
+  try{
+    await api("PUT","/virtual-keys/"+enc(name)+"/limits",{limits});
+    const n = Object.keys(limits).length;
+    toast("ok", n ? `Saved ${n} limit${n>1?"s":""} for “${name}”` : `Removed all limits for “${name}”`);
+    await refresh();
+  }catch(err){ toast("err","Couldn't save limits: "+err.message); }
+}
+
 // =====================================================================
 // System status (top bar)
 // =====================================================================
@@ -976,10 +1197,12 @@ function renderSystem(){
   const activeSev = healthLabel(hh).sev;
   const h = (state.headers||{})[state.active]||{};
   const u5 = h["anthropic-ratelimit-unified-5h-utilization"];
+  const blocked = (state.virtual_keys||[]).filter(vk=>(vk.limits||[]).some(l=>l.over)).length;
   let overall = "good", label = "All systems nominal";
   if(activeSev==="crit"){ overall="crit"; label="Active token unavailable"; }
   else if(activeSev==="warn" || (u5!==undefined && sev(u5)==="warn")){ overall="warn"; label="Degraded — high utilization"; }
   else if(u5!==undefined && sev(u5)==="crit"){ overall="crit"; label="Capacity exhausted"; }
+  else if(blocked){ overall="warn"; label=`${blocked} client${blocked>1?"s":""} over budget`; }
   const dot=$("#sysdot"); dot.className="sysdot "+overall; $("#syslabel").textContent=label;
 }
 
@@ -987,7 +1210,8 @@ function renderSystem(){
 // live feed (SSE) + render
 // =====================================================================
 function renderAll(){
-  renderSystem(); renderHero(); renderTiles(); renderTokens(); renderClients(); renderLog();
+  renderSystem(); renderHero(); renderTiles(); renderTokens(); renderClients();
+  renderPricing(); renderLog();
   const cfgJSON = JSON.stringify(state.config||{});
   if(!cfgDirty && cfgJSON!==lastCfgJSON) buildForm();   // never clobber a form being edited
   $("#authnote").textContent = state.auth_enabled ? "Admin auth: on" : "Tailnet-only · no admin auth";

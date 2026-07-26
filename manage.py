@@ -171,6 +171,77 @@ def menu_virtual_keys() -> None:
                 console.print(f"[green]Deleted '{keys[n]['name']}'.[/]"); pause()
 
 
+# --- spend limits ----------------------------------------------------------
+
+_PERIODS = [("hour", "per hour"), ("day", "per day"), ("week", "per week"), ("month", "per month")]
+
+
+def _spend_by_key() -> dict:
+    """Live per-key limit status from the admin API, keyed by name (may be empty)."""
+    state = _get("/state") or {}
+    return {vk["name"]: vk for vk in state.get("virtual_keys", [])}
+
+
+def menu_limits() -> None:
+    """Spend caps. Written straight to the DB — the proxy re-reads them in ~5s."""
+    while True:
+        header("Spend Limits")
+        keys = db.list_virtual_keys()
+        limits = db.list_key_limits()
+        live = _spend_by_key()
+        cfg = _get("/config") or db.get_config_json() or {}
+        tz = cfg.get("timezone", "America/Toronto")
+        console.print(f"  [dim]Windows are calendar-aligned in [bold]{tz}[/].[/]\n")
+
+        t = Table(box=None, padding=(0, 2), header_style="bold dim")
+        t.add_column("#", style="dim", width=4)
+        t.add_column("Name", style="bold")
+        t.add_column("Caps", style="green")
+        t.add_column("Today", justify="right")
+        t.add_column("7 days", justify="right")
+        for i, vk in enumerate(keys, 1):
+            caps = limits.get(vk["name"], {})
+            cap_txt = " + ".join(f"${v:g}/{p[0]}" for p, v in sorted(caps.items())) or "[dim]none[/]"
+            over = [c for c in (live.get(vk["name"], {}).get("limits") or []) if c.get("over")]
+            if over:
+                cap_txt += f" [bold red]⛔ over {over[0]['period']}[/]"
+            w = (live.get(vk["name"], {}).get("windows") or {})
+            t.add_row(str(i), vk["name"], cap_txt,
+                      f"${w.get('1d', {}).get('cost_usd', 0):.2f}" if w else "[dim]—[/]",
+                      f"${w.get('7d', {}).get('cost_usd', 0):.2f}" if w else "[dim]—[/]")
+        console.print(t if keys else "  [dim](no virtual keys)[/]")
+        if not live:
+            console.print("\n  [dim yellow]Admin API unreachable — spend figures unavailable[/]")
+        console.print()
+
+        if not keys:
+            pause(); return
+        n = pick("Edit caps for which key", [k["name"] for k in keys])
+        if n is None:
+            return
+        name = keys[n]["name"]
+        current = limits.get(name, {})
+        console.print("\n[dim]Blank keeps the current value; 0 removes the cap.[/]")
+        new: dict[str, float] = {}
+        for period, label in _PERIODS:
+            cur = current.get(period)
+            raw = ask(f"  ${label}", "" if cur is None else f"{cur:g}")
+            if raw == "":
+                continue
+            try:
+                amount = float(raw.lstrip("$"))
+            except ValueError:
+                console.print(f"[red]'{raw}' is not a number — skipping {period}.[/]")
+                continue
+            if amount > 0:
+                new[period] = amount
+        db.set_key_limits(name, new)
+        summary = " + ".join(f"${v:g} {label}" for p, label in _PERIODS
+                             if (v := new.get(p)) is not None)
+        console.print(f"\n[green]Saved:[/] {summary or 'no caps (unlimited)'}")
+        console.print("[dim](picked up by the proxy within ~5s)[/]"); pause()
+
+
 # --- tokens ----------------------------------------------------------------
 
 def _health_cell(h: dict | None) -> str:
@@ -263,6 +334,10 @@ _SCHEMA = [
     ("health_probe_interval_seconds", "Health probe interval (s)", "int"),
     ("active_probe_interval_seconds", "Active probe interval (s)", "int"),
     ("upstream_timeout_seconds", "Upstream timeout (s, restart)", "int"),
+    ("timezone", "Timezone (spend windows)", "str"),
+    ("pricing.online", "Fetch prices online", "bool"),
+    ("pricing.refresh_hours", "Price refresh (h)", "int"),
+    ("usage_retention_days", "Usage history (days)", "int"),
 ]
 
 
@@ -310,10 +385,13 @@ def menu_settings() -> None:
             raw = ask(f"New value for {label} (current: {cur})")
             if not raw:
                 continue
-            try:
-                new = float(raw) if typ == "float" else int(raw)
-            except ValueError:
-                console.print("[red]Invalid number.[/]"); pause(); continue
+            if typ == "str":
+                new = raw
+            else:
+                try:
+                    new = float(raw) if typ == "float" else int(raw)
+                except ValueError:
+                    console.print("[red]Invalid number.[/]"); pause(); continue
         _cfg_set(cfg, path, new)
         if via_api and _post("/config", cfg):
             console.print("[green]Saved (live).[/]")
@@ -340,11 +418,11 @@ def main() -> None:
         console.print(Panel("[bold white]Claude Proxy Manager[/]",
                             border_style="magenta", padding=(1, 4)))
         console.print()
-        idx = pick("Choose", ["Virtual Keys", "Upstream Tokens", "Settings",
+        idx = pick("Choose", ["Virtual Keys", "Spend Limits", "Upstream Tokens", "Settings",
                               "Restart Proxy", "Quit"])
-        if idx is None or idx == 4:
+        if idx is None or idx == 5:
             console.clear(); console.print("[dim]Bye.[/]"); sys.exit(0)
-        (menu_virtual_keys, menu_tokens, menu_settings, do_restart)[idx]()
+        (menu_virtual_keys, menu_limits, menu_tokens, menu_settings, do_restart)[idx]()
 
 
 if __name__ == "__main__":

@@ -39,6 +39,39 @@ def _upstream_error(message: str) -> JSONResponse:
     )
 
 
+def _budget_error(status, now: float) -> JSONResponse:  # noqa: ANN001 - budgets.LimitStatus
+    """429 in Anthropic's envelope, with Retry-After set to the window rollover.
+
+    Clients already back off on 429 + Retry-After, so an over-budget key behaves
+    like a rate-limited one rather than failing in some bespoke way.
+    """
+    retry_after = max(1, int(status.resets_at - now))
+    return JSONResponse(
+        status_code=429,
+        content={"type": "error", "error": {
+            "type": "rate_limit_error",
+            "message": f"{status.message()} Resets in {_human(retry_after)}.",
+        }},
+        headers={
+            "retry-after": str(retry_after),
+            "x-proxy-limit-period": status.period,
+            "x-proxy-limit-usd": f"{status.limit_usd:.2f}",
+            "x-proxy-limit-spent-usd": f"{status.spent_usd:.2f}",
+        },
+    )
+
+
+def _human(seconds: float) -> str:
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m"
+    if s < 86400:
+        return f"{s // 3600}h {s % 3600 // 60}m"
+    return f"{s // 86400}d {s % 86400 // 3600}h"
+
+
 def _mask(key: str) -> str:
     return key[:6] + "…" if len(key) > 7 else "…"
 
@@ -90,6 +123,15 @@ def build_proxy_app(state) -> FastAPI:  # noqa: ANN001
                         _client_host(request), request.method, path,
                         _mask(key) if key else "<none>")
             return _auth_error("invalid x-api-key")
+
+        now = time.time()
+        breach = state.limit_breach(key_name, now)
+        if breach is not None:
+            metrics.LIMIT_BLOCKS.labels(key_name=key_name, period=breach.period).inc()
+            log.warning("BLOCKED %s(%s) /v1/%s — $%.2f of $%.2f %s",
+                        _client_host(request), key_name, path,
+                        breach.spent_usd, breach.limit_usd, breach.period)
+            return _budget_error(breach, now)
 
         body = await request.body()
         model = _extract_model(body) if request.method == "POST" else "-"

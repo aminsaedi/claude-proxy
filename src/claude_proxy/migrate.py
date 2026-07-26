@@ -4,6 +4,10 @@ Reads tokens.yaml / virtual_keys.yaml / config.yaml / usage_stats.json from the
 data dir (``CLAUDE_PROXY_DATA_DIR``) and populates the SQLite DB
 (``CLAUDE_PROXY_DB``). Idempotent for tokens/keys (skips names already present).
 
+Imported usage lands as lifetime totals with ``cost_usd = 0``: the legacy files
+recorded neither cost nor a timestamp, so there is nothing to price or to place
+on the hourly series. Cost accrues from the first request after the migration.
+
     python -m claude_proxy.migrate
 """
 

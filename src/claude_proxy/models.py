@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
 from pydantic import BaseModel, Field, field_validator
+
+from .budgets import DEFAULT_TIMEZONE
+from .pricing import LITELLM_URL
 
 
 class AutoRotation(BaseModel):
@@ -38,6 +43,21 @@ class AutoRotation(BaseModel):
         return v
 
 
+class Pricing(BaseModel):
+    """Where per-token USD rates come from, and how often to re-fetch them."""
+
+    online: bool = True
+    source_url: str = LITELLM_URL
+    refresh_hours: int = 12
+
+    @field_validator("refresh_hours")
+    @classmethod
+    def _hours(cls, v: int) -> int:
+        if not 1 <= v <= 24 * 30:
+            raise ValueError("refresh_hours must be between 1 and 720")
+        return v
+
+
 class AppConfig(BaseModel):
     """Top-level, hot-reloadable proxy configuration (mirrors config.yaml)."""
 
@@ -45,6 +65,27 @@ class AppConfig(BaseModel):
     health_probe_interval_seconds: int = 60
     active_probe_interval_seconds: int = 300
     upstream_timeout_seconds: int = 600
+    # Calendar boundaries for the daily views and for every spend limit.
+    timezone: str = DEFAULT_TIMEZONE
+    pricing: Pricing = Field(default_factory=Pricing)
+    # How long the hourly usage series is kept on disk (memory keeps ~40 days).
+    usage_retention_days: int = 400
+
+    @field_validator("timezone")
+    @classmethod
+    def _tz(cls, v: str) -> str:
+        try:
+            ZoneInfo(v)
+        except (ZoneInfoNotFoundError, ValueError, KeyError) as e:
+            raise ValueError(f"unknown timezone {v!r} (use an IANA name, e.g. America/Toronto)") from e
+        return v
+
+    @field_validator("usage_retention_days")
+    @classmethod
+    def _retention(cls, v: int) -> int:
+        if v < 40:
+            raise ValueError("usage_retention_days must be >= 40 (the in-memory window)")
+        return v
 
     @field_validator("health_probe_interval_seconds")
     @classmethod

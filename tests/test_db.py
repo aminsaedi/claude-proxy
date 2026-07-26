@@ -89,6 +89,7 @@ def test_usage_replace_and_load(dbpath):
     stats = {"alice": {"claude-opus-4-8": {
         "input_tokens": 10, "output_tokens": 20,
         "cache_read_input_tokens": 5, "cache_creation_input_tokens": 1, "requests": 2,
+        "cost_usd": 0.125,
     }}}
     db.replace_usage(stats, path=dbpath)
     assert db.load_usage(path=dbpath) == stats

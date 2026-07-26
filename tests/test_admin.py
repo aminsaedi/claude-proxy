@@ -133,6 +133,83 @@ async def test_vkey_delete_last_is_blocked():
                 db.add_virtual_key("bob", "vk-bob")
 
 
+async def test_limits_crud_and_state_payload():
+    state = AppState()
+    app = build_admin_app(state)
+    async with _asgi(app) as ac:
+        try:
+            # replace-all: two caps enforced at once
+            r = await ac.put("/virtual-keys/alice/limits", json={"limits": {"hour": 3, "day": 10}})
+            assert r.status_code == 200
+            assert state.limits.for_key("alice") == {"hour": 3.0, "day": 10.0}
+            assert {s["period"] for s in r.json()["status"]} == {"hour", "day"}
+
+            # the same payload shape without the wrapper key also works
+            assert (await ac.put("/virtual-keys/alice/limits", json={"day": 5})).status_code == 200
+            assert state.limits.for_key("alice") == {"day": 5.0}   # hour cap dropped
+
+            # bad input is refused with a readable message
+            bad = await ac.put("/virtual-keys/alice/limits", json={"limits": {"day": "lots"}})
+            assert bad.status_code == 400 and "not a number" in bad.json()["error"]
+            assert (await ac.put("/virtual-keys/alice/limits",
+                                 json={"limits": {"decade": 5}})).status_code == 400
+            assert (await ac.put("/virtual-keys/ghost/limits", json={"limits": {}})).status_code == 404
+
+            # GET mirrors it, and /state carries the evaluated caps + windows
+            got = (await ac.get("/virtual-keys/alice/limits")).json()
+            assert got["limits"] == {"day": 5.0}
+            alice = next(v for v in (await ac.get("/state")).json()["virtual_keys"]
+                         if v["name"] == "alice")
+            assert [c["period"] for c in alice["limits"]] == ["day"]
+            assert set(alice["windows"]) == {"1d", "3d", "7d", "30d"}
+            assert len(alice["daily"]) == 14
+            assert alice["daily"][-1]["date"] >= alice["daily"][0]["date"]
+
+            # clearing works
+            assert (await ac.put("/virtual-keys/alice/limits", json={"limits": {}})).status_code == 200
+            assert state.limits.for_key("alice") == {}
+        finally:
+            db.set_key_limits("alice", {})
+
+
+async def test_state_exposes_pricing_and_timezone():
+    state = AppState()
+    app = build_admin_app(state)
+    async with _asgi(app) as ac:
+        body = (await ac.get("/state")).json()
+        assert body["timezone"] == "America/Toronto"
+        assert body["pricing"]["source"] in ("online", "cache", "fallback")
+        assert (await ac.get("/pricing")).json()["url"].startswith("https://")
+
+
+async def test_config_accepts_timezone_and_pricing_and_rejects_junk():
+    state = AppState()
+    app = build_admin_app(state)
+    original = state.config.model_dump()
+    async with _asgi(app) as ac:
+        try:
+            r = await ac.post("/config", json={
+                "timezone": "Europe/Berlin",
+                "pricing": {"refresh_hours": 6, "online": False},
+                "usage_retention_days": 90,
+            })
+            assert r.status_code == 200
+            assert state.config.timezone == "Europe/Berlin"
+            assert state.tz.key == "Europe/Berlin"
+            assert state.config.pricing.refresh_hours == 6
+            # auto_rotation is untouched by a partial update
+            assert state.config.auto_rotation.check_interval_seconds == \
+                original["auto_rotation"]["check_interval_seconds"]
+
+            bad = await ac.post("/config", json={"timezone": "Mars/Olympus"})
+            assert bad.status_code == 400 and "timezone" in bad.json()["error"]
+            assert state.config.timezone == "Europe/Berlin"   # unchanged
+            # retention below the in-memory window is refused
+            assert (await ac.post("/config", json={"usage_retention_days": 3})).status_code == 400
+        finally:
+            await ac.post("/config", json=original)
+
+
 def test_appstate_pubsub_notify():
     """subscribe/notify/unsubscribe: notify() sets every live subscriber."""
     state = AppState()

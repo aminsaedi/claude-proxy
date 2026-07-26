@@ -19,3 +19,4 @@ venv/
 .ruff_cache/
 *.egg-info/
 .coverage
+model_prices.json

@@ -23,3 +23,4 @@ config.yaml
 docker-compose.yml.bak.*
 README.md
 CLAUDE.md
+model_prices.json

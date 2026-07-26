@@ -40,13 +40,45 @@ CREATE TABLE IF NOT EXISTS usage (
     cache_read_input_tokens     INTEGER NOT NULL DEFAULT 0,
     cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
     requests       INTEGER NOT NULL DEFAULT 0,
+    cost_usd       REAL NOT NULL DEFAULT 0,
     PRIMARY KEY (key_name, model)
+);
+-- Time series behind the 1d/3d/7d views and the spend limits. One row per
+-- (UTC hour, key, model); hourly granularity is fine because every limit
+-- window we support starts on an hour boundary in the configured timezone.
+CREATE TABLE IF NOT EXISTS usage_hourly (
+    hour_start     INTEGER NOT NULL,   -- UTC epoch seconds, floored to the hour
+    key_name       TEXT NOT NULL,
+    model          TEXT NOT NULL,
+    input_tokens   INTEGER NOT NULL DEFAULT 0,
+    output_tokens  INTEGER NOT NULL DEFAULT 0,
+    cache_read_input_tokens     INTEGER NOT NULL DEFAULT 0,
+    cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0,
+    requests       INTEGER NOT NULL DEFAULT 0,
+    cost_usd       REAL NOT NULL DEFAULT 0,
+    PRIMARY KEY (hour_start, key_name, model)
+);
+CREATE INDEX IF NOT EXISTS usage_hourly_key_idx ON usage_hourly (key_name, hour_start);
+-- Spend caps. A key may have several rows (e.g. $3/hour *and* $10/day); every
+-- one of them is enforced, and the tightest breach is the one that blocks.
+CREATE TABLE IF NOT EXISTS key_limits (
+    key_name  TEXT NOT NULL,
+    period    TEXT NOT NULL,          -- hour | day | week | month
+    limit_usd REAL NOT NULL,
+    PRIMARY KEY (key_name, period)
 );
 """
 
 _USAGE_FIELDS = (
     "input_tokens", "output_tokens",
     "cache_read_input_tokens", "cache_creation_input_tokens", "requests",
+)
+# Same set plus the money column; cost is a float, the rest are counters.
+_USAGE_COLUMNS = (*_USAGE_FIELDS, "cost_usd")
+
+# Columns added after v2.0 shipped — applied to existing DBs on startup.
+_ADDED_COLUMNS = (
+    ("usage", "cost_usd", "REAL NOT NULL DEFAULT 0"),
 )
 
 
@@ -74,6 +106,15 @@ def cursor(path: Path | None = None):
 def init_schema(path: Path | None = None) -> None:
     with cursor(path) as conn:
         conn.executescript(_SCHEMA)
+        _add_missing_columns(conn)
+
+
+def _add_missing_columns(conn: sqlite3.Connection) -> None:
+    """Bring a pre-existing DB up to the current schema (additive only)."""
+    for table, column, decl in _ADDED_COLUMNS:
+        cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        if cols and column not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 
 # --- tokens ---------------------------------------------------------------
@@ -144,8 +185,10 @@ def add_virtual_key(name: str, key: str, path: Path | None = None) -> None:
 
 
 def delete_virtual_key(name: str, path: Path | None = None) -> None:
+    """Remove a key and its spend limits. Usage history is deliberately kept."""
     with cursor(path) as conn:
         conn.execute("DELETE FROM virtual_keys WHERE name = ?", (name,))
+        conn.execute("DELETE FROM key_limits WHERE key_name = ?", (name,))
 
 
 def set_virtual_key(name: str, key: str, path: Path | None = None) -> bool:
@@ -166,6 +209,8 @@ def rename_virtual_key(old: str, new: str, path: Path | None = None) -> bool:
             return False
         conn.execute("UPDATE virtual_keys SET name = ? WHERE name = ?", (new, old))
         conn.execute("UPDATE usage SET key_name = ? WHERE key_name = ?", (new, old))
+        conn.execute("UPDATE usage_hourly SET key_name = ? WHERE key_name = ?", (new, old))
+        conn.execute("UPDATE key_limits SET key_name = ? WHERE key_name = ?", (new, old))
         return True
 
 
@@ -189,19 +234,19 @@ def set_config_json(data: dict, path: Path | None = None) -> None:
 # --- usage ----------------------------------------------------------------
 
 def load_usage(path: Path | None = None) -> dict:
-    """Return the nested {key_name: {model: {field: int}}} shape the app uses."""
+    """Return the nested {key_name: {model: {field: number}}} shape the app uses."""
     with cursor(path) as conn:
         rows = conn.execute("SELECT * FROM usage").fetchall()
-    out: dict[str, dict[str, dict[str, int]]] = {}
+    out: dict[str, dict[str, dict[str, float]]] = {}
     for r in rows:
-        out.setdefault(r["key_name"], {})[r["model"]] = {f: r[f] for f in _USAGE_FIELDS}
+        out.setdefault(r["key_name"], {})[r["model"]] = {f: r[f] for f in _USAGE_COLUMNS}
     return out
 
 
 def replace_usage(stats: dict, path: Path | None = None) -> None:
     """Overwrite the usage table from the in-memory snapshot (called by the flusher)."""
     rows = [
-        (key_name, model, *(m.get(f, 0) for f in _USAGE_FIELDS))
+        (key_name, model, *(m.get(f, 0) for f in _USAGE_COLUMNS))
         for key_name, models in stats.items()
         for model, m in models.items()
     ]
@@ -209,7 +254,76 @@ def replace_usage(stats: dict, path: Path | None = None) -> None:
         conn.execute("DELETE FROM usage")
         conn.executemany(
             "INSERT INTO usage (key_name, model, input_tokens, output_tokens, "
-            "cache_read_input_tokens, cache_creation_input_tokens, requests) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "cache_read_input_tokens, cache_creation_input_tokens, requests, cost_usd) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             rows,
+        )
+
+
+# --- hourly usage (time series) -------------------------------------------
+
+def load_usage_hourly(since: int = 0, path: Path | None = None) -> list[dict]:
+    """Rows at or after ``since`` (UTC epoch seconds), oldest first."""
+    with cursor(path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM usage_hourly WHERE hour_start >= ? ORDER BY hour_start",
+            (int(since),),
+        ).fetchall()
+    return [
+        {"hour_start": r["hour_start"], "key_name": r["key_name"], "model": r["model"],
+         **{f: r[f] for f in _USAGE_COLUMNS}}
+        for r in rows
+    ]
+
+
+def upsert_usage_hourly(rows: list[tuple], path: Path | None = None) -> None:
+    """Write whole buckets: (hour_start, key_name, model, *_USAGE_COLUMNS).
+
+    The in-memory tracker holds the authoritative total for every bucket it has
+    loaded, so this replaces values rather than incrementing them — which makes
+    a re-flush after a failed one idempotent.
+    """
+    if not rows:
+        return
+    with cursor(path) as conn:
+        conn.executemany(
+            "INSERT INTO usage_hourly (hour_start, key_name, model, input_tokens, "
+            "output_tokens, cache_read_input_tokens, cache_creation_input_tokens, "
+            "requests, cost_usd) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(hour_start, key_name, model) DO UPDATE SET "
+            "input_tokens = excluded.input_tokens, "
+            "output_tokens = excluded.output_tokens, "
+            "cache_read_input_tokens = excluded.cache_read_input_tokens, "
+            "cache_creation_input_tokens = excluded.cache_creation_input_tokens, "
+            "requests = excluded.requests, cost_usd = excluded.cost_usd",
+            rows,
+        )
+
+
+def prune_usage_hourly(before: int, path: Path | None = None) -> int:
+    """Drop buckets older than ``before``; returns the number of rows removed."""
+    with cursor(path) as conn:
+        cur = conn.execute("DELETE FROM usage_hourly WHERE hour_start < ?", (int(before),))
+        return cur.rowcount
+
+
+# --- spend limits ---------------------------------------------------------
+
+def list_key_limits(path: Path | None = None) -> dict[str, dict[str, float]]:
+    """All limits as {key_name: {period: limit_usd}}."""
+    with cursor(path) as conn:
+        rows = conn.execute("SELECT key_name, period, limit_usd FROM key_limits").fetchall()
+    out: dict[str, dict[str, float]] = {}
+    for r in rows:
+        out.setdefault(r["key_name"], {})[r["period"]] = float(r["limit_usd"])
+    return out
+
+
+def set_key_limits(key_name: str, limits: dict[str, float], path: Path | None = None) -> None:
+    """Replace *all* limits for one key. An empty dict clears them."""
+    with cursor(path) as conn:
+        conn.execute("DELETE FROM key_limits WHERE key_name = ?", (key_name,))
+        conn.executemany(
+            "INSERT INTO key_limits (key_name, period, limit_usd) VALUES (?, ?, ?)",
+            [(key_name, period, float(v)) for period, v in sorted(limits.items())],
         )
