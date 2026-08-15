@@ -4,9 +4,11 @@ token on a retryable upstream error (429/5xx)."""
 
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 import time
+import zlib
 
 import httpx
 from fastapi import FastAPI, Request
@@ -20,9 +22,38 @@ RETRYABLE = {429, 500, 502, 503, 529}
 MAX_ATTEMPTS = 3
 _EXCLUDED_REQ_HEADERS = {
     "host", "x-api-key", "authorization", "content-length", "transfer-encoding",
+    "accept-encoding",
 }
 _EXCLUDED_RESP_HEADERS = {"transfer-encoding", "content-encoding", "content-length"}
 OAUTH_BETA = "oauth-2025-04-20"
+
+
+def _decode_body(body: bytes, encoding: str) -> bytes:
+    """Best-effort decompression for upstreams that ignore accept-encoding.
+
+    httpx only decodes gzip/deflate (and brotli when the optional module is
+    installed); we relay bodies as-is while stripping the content-encoding
+    header, so anything still compressed would corrupt the client's response.
+    """
+    try:
+        if encoding == "gzip":
+            return gzip.decompress(body)
+        if encoding == "deflate":
+            try:
+                return zlib.decompress(body)
+            except zlib.error:
+                return zlib.decompress(body, -zlib.MAX_WBITS)
+        if encoding == "br":
+            import brotli  # noqa: PLC0415
+
+            return brotli.decompress(body)
+        if encoding == "zstd":
+            import zstandard  # noqa: PLC0415
+
+            return zstandard.ZstdDecompressor().decompress(body)
+    except Exception:  # noqa: BLE001
+        pass
+    return body
 
 
 def _auth_error(message: str) -> JSONResponse:
@@ -92,6 +123,13 @@ def _base_upstream_headers(request: Request) -> dict[str, str]:
     beta = headers.get("anthropic-beta", "")
     if OAUTH_BETA not in beta:
         headers["anthropic-beta"] = f"{beta},{OAUTH_BETA}".strip(",")
+    # Never accept compressed bodies from upstream. api.anthropic.com (behind
+    # Cloudflare) brotli-compresses non-SSE JSON responses (stream:false
+    # /v1/messages, /v1/models, error envelopes) when the client advertises
+    # accept-encoding; this proxy relays bodies as-is but strips
+    # content-encoding, which would hand the client raw brotli bytes. Request
+    # identity explicitly so neither Cloudflare nor httpx negotiates one.
+    headers["accept-encoding"] = "identity"
     return headers
 
 
@@ -197,6 +235,9 @@ def build_proxy_app(state) -> FastAPI:  # noqa: ANN001
 
         out = await upstream.aread()
         await upstream.aclose()
+        encoding = upstream.headers.get("content-encoding", "")
+        if encoding and encoding.lower() != "identity":
+            out = _decode_body(out, encoding.lower())
         if 200 <= status < 300:
             _usage = _extract_usage(out)
             if _usage:
