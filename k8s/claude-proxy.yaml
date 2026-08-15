@@ -70,7 +70,7 @@ spec:
       initContainers:
         # Seed the SQLite DB into the PVC on first run only (idempotent).
         - name: seed-db
-          image: 100.69.180.101:31500/claude-proxy:v7
+          image: 100.69.180.101:31500/claude-proxy:v8
           command: ["sh", "-c", "test -f /data/claude_proxy.db || cp /seed/claude_proxy.db /data/claude_proxy.db"]
           volumeMounts:
             - name: data
@@ -80,7 +80,7 @@ spec:
               readOnly: true
       containers:
         - name: proxy
-          image: 100.69.180.101:31500/claude-proxy:v7
+          image: 100.69.180.101:31500/claude-proxy:v8
           imagePullPolicy: Always
           env:
             - name: CLAUDE_PROXY_DATA_DIR
