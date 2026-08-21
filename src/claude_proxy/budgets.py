@@ -17,6 +17,7 @@ since sub-hour buckets would cost far more than that precision is worth.
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -144,6 +145,11 @@ class LimitStore:
     def __init__(self) -> None:
         self._by_key: dict[str, dict[str, float]] = {}
         self._sig: frozenset = frozenset()
+        # Guards the cache against the one interleaving that can lose a write:
+        # ``set`` runs in a worker thread (asyncio.to_thread) while
+        # ``reload_if_changed`` runs on the event loop. See the note there.
+        self._lock = threading.Lock()
+        self._generation = 0
         self.load()
 
     def load(self) -> None:
@@ -159,15 +165,34 @@ class LimitStore:
         )
 
     def reload_if_changed(self) -> bool:
+        """Adopt another process's edits — without undoing this one's.
+
+        The subtle part is the generation check. This reads the database and
+        then replaces the whole cache with what it read, but the read is not
+        instantaneous: sqlite releases the GIL during file I/O, so a local
+        :meth:`set` running on a worker thread can commit *in that window*.
+        Adopting the earlier read would then quietly put the pre-save values
+        back — the operator's new cap would vanish from the console and, worse,
+        stop being enforced until some later tick happened to notice.
+
+        So a local write bumps the generation, and a reload that finds the
+        generation moved under it discards its now-stale read and tries again
+        on the next tick.
+        """
+        with self._lock:
+            generation = self._generation
         try:
             by_key = db.list_key_limits()
         except Exception as e:  # noqa: BLE001 - keep enforcing the cached caps
             log.warning("Failed to reload spend limits: %s", e)
             return False
         sig = self._signature(by_key)
-        if sig == self._sig:
-            return False
-        self._by_key, self._sig = by_key, sig
+        with self._lock:
+            if generation != self._generation:
+                return False  # a local save landed mid-read; its value wins
+            if sig == self._sig:
+                return False
+            self._by_key, self._sig = by_key, sig
         log.info("Reloaded spend limits from DB (%d keys capped)", len(by_key))
         return True
 
@@ -178,14 +203,20 @@ class LimitStore:
         return {k: dict(v) for k, v in self._by_key.items()}
 
     def set(self, name: str, limits: dict[str, float]) -> None:
-        """Persist and cache a key's full set of caps (empty dict = uncapped)."""
+        """Persist and cache a key's full set of caps (empty dict = uncapped).
+
+        Bumping the generation under the lock is what tells a concurrent
+        :meth:`reload_if_changed` that its in-flight read is stale.
+        """
         clean = {p: float(v) for p, v in limits.items() if p in PERIODS and float(v) > 0}
         db.set_key_limits(name, clean)
-        if clean:
-            self._by_key[name] = clean
-        else:
-            self._by_key.pop(name, None)
-        self._sig = self._signature(self._by_key)
+        with self._lock:
+            if clean:
+                self._by_key[name] = clean
+            else:
+                self._by_key.pop(name, None)
+            self._sig = self._signature(self._by_key)
+            self._generation += 1
 
 
 def parse_limits(raw: dict) -> dict[str, float]:

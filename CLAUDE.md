@@ -32,6 +32,10 @@ port 8090 — plus background tasks, all under one asyncio loop.
 - `config.py` / `models.py` — pydantic `AppConfig`, persisted as a JSON row in the DB.
 - `migrate.py` — one-time YAML/JSON → SQLite importer (`python -m claude_proxy.migrate`).
 - `metrics.py` — Prometheus. `paths.py` — data-dir / DB-path resolution.
+- `static/console-dom.js` — the console's rendering primitives: `el` builds DOM,
+  `txt`/`cls`/`sty`/`att`/`val` write a single value **only when it changed**,
+  `list` reconciles a keyed collection by reusing nodes. Views build their DOM
+  once and patch it; nothing re-renders markup on a live update.
 - `static/console.{html,css,js}` — the admin console, served from `/` and
   `/assets/{name}` (an explicit allow-map, not a directory listing). The shell is
   `no-store` and stamps `__BUILD__` with the version into the asset URLs, so the
@@ -122,6 +126,14 @@ counterpart in the code — change one and re-read the other:
   probe at `/healthz` — both quietly break zero-downtime rollouts.
 - Do not do audit work on the event loop (no compression, no JSON encoding, no
   DB access in the handler); the whole design is that the writer thread owns it.
+- Do not reintroduce innerHTML-per-frame rendering in the console. It destroys
+  focus and selection mid-edit, restarts transitions, and — because rendered
+  strings contain countdowns — rebuilds cards every minute for no reason.
+- Do not have a store's `reload_if_changed` blindly adopt what it read: a local
+  write can commit inside that read window. `LimitStore` guards with a
+  generation counter, `VirtualKeyStore` by holding read-and-adopt under one
+  lock. Without it a save is silently rolled back — in the UI *and* in
+  enforcement — until some later tick notices.
 - Do not run a second proxy process against the same data dir except during a
   deliberate rollout overlap — it is safe now, but it doubles health probes,
   which cost real subscription quota.

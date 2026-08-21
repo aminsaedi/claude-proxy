@@ -345,43 +345,91 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .turn.tools .turn-head { color: var(--s4); }
 .subtle { color: var(--muted); font-size: var(--t-sm); }
 
-/* ============================ clients ============================ */
-.client { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-sm); box-shadow: var(--shadow); overflow: hidden; }
-.client + .client { margin-top: var(--sp-2); }
-.client-head {
-  display: grid; grid-template-columns: 1fr auto; align-items: center; gap: var(--sp-3) var(--sp-4);
-  width: 100%; text-align: left; padding: 13px var(--sp-4); border: 0; color: inherit; cursor: pointer;
-  background-color: transparent;
-  background-image: linear-gradient(90deg, color-mix(in srgb, var(--brand) 12%, transparent) var(--sh,0%), transparent 0);
-  transition: background-color .15s;
+/* ============================ clients: split view ============================
+   A persistent list beside a detail pane, rather than rows that expand. Rows
+   that grow push everything below them around, make two clients impossible to
+   compare, and stop scaling somewhere around ten of them. Here nothing moves:
+   selecting a client only repaints the right-hand pane. */
+.cl-split { display: grid; grid-template-columns: minmax(230px, 290px) 1fr; gap: var(--sp-4); align-items: start; }
+@media (max-width: 900px) { .cl-split { grid-template-columns: 1fr; } }
+
+.cl-list {
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--r);
+  box-shadow: var(--shadow); overflow: hidden;
+  position: sticky; top: 68px;                 /* stays put while the detail scrolls */
+  max-height: calc(100vh - 96px); display: flex; flex-direction: column;
 }
-.client-head:hover { background-color: var(--surface-2); }
-.client-id { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; }
-.client-id .caret { color: var(--muted); transition: transform .2s; flex: none; }
-.client.open .client-id .caret { transform: rotate(90deg); }
-.client-id .name { font-weight: 650; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.client-nums { display: flex; gap: var(--sp-5); }
-.cn { text-align: right; }
-.cn .v { font-weight: 600; font-variant-numeric: tabular-nums; }
-.cn .k { font-size: var(--t-xs); letter-spacing: .07em; text-transform: uppercase; color: var(--muted); }
-.client-body { display: none; padding: var(--sp-1) var(--sp-4) var(--sp-4); border-top: 1px solid var(--line-2); }
-.client.open .client-body { display: block; }
-.client-actions { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); padding: var(--sp-3) 0 var(--sp-2); }
-.client-actions .ckey { flex: 1; min-width: 110px; font-family: var(--font-mono); font-size: var(--t-xs); color: var(--muted); text-align: right; word-break: break-all; }
-.wins { display: grid; gap: var(--sp-2); grid-template-columns: repeat(2, 1fr); margin: var(--sp-3) 0 var(--sp-1); }
+@media (max-width: 900px) { .cl-list { position: static; max-height: 42vh; } }
+.cl-toolbar { display: flex; gap: 6px; padding: 10px; border-bottom: 1px solid var(--line); }
+.cl-search { flex: 1; min-width: 0; width: auto; text-align: left; }
+.cl-sort { width: 126px; flex: none; font-size: var(--t-xs); padding-left: 7px; }
+.cl-rows { overflow-y: auto; flex: 1; padding: 4px; }
+.cl-foot { padding: 9px 10px; border-top: 1px solid var(--line); }
+.cl-foot .btn { width: 100%; justify-content: center; }
+
+.cl-row {
+  display: flex; align-items: center; gap: var(--sp-2); width: 100%;
+  padding: 8px 9px; border: 0; border-radius: var(--r-sm); background: transparent;
+  color: inherit; cursor: pointer; text-align: left; transition: background .12s;
+}
+.cl-row:hover { background: var(--surface-2); }
+.cl-row.sel { background: color-mix(in srgb, var(--brand) 14%, transparent); }
+.cl-row.sel .cl-name { color: var(--brand-ink); }
+.cl-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.cl-main { min-width: 0; flex: 1; display: flex; flex-direction: column; }
+.cl-name { font-weight: 600; font-size: var(--t-md); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cl-meta { font-size: var(--t-xs); color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cl-spend { font-family: var(--font-mono); font-size: var(--t-sm); font-variant-numeric: tabular-nums; color: var(--ink-2); flex: none; }
+.cl-none { padding: var(--sp-4); }
+
+.cl-detail {
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--r);
+  box-shadow: var(--shadow); padding: var(--sp-5); min-width: 0;
+}
+.cl-empty { padding: var(--sp-6) 0; }
+.hide { display: none !important; }
+
+.cl-head { border-bottom: 1px solid var(--line); padding-bottom: var(--sp-4); margin-bottom: var(--sp-4); }
+.cl-title { display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap; }
+.cl-title h3 { font-size: var(--t-xl); font-weight: 650; letter-spacing: -.015em; }
+.cl-sub { display: flex; gap: 7px; flex-wrap: wrap; font-size: var(--t-xs); color: var(--muted); margin-top: 3px; }
+.cl-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: var(--sp-3); }
+.btn-ico { display: inline-flex; width: 14px; height: 14px; }
+.btn-ico svg { width: 100%; height: 100%; }
+
+.cl-section { margin-top: var(--sp-5); }
+.cl-section-head { display: flex; align-items: center; gap: var(--sp-3); margin-bottom: var(--sp-3); }
+.cl-section-head .rule { flex: 1; height: 1px; background: var(--line-2); }
+.cl-section-foot { display: flex; align-items: center; gap: var(--sp-2); margin-top: var(--sp-3); }
+.cl-savestate { font-size: var(--t-xs); color: var(--muted); white-space: nowrap; }
+.cl-savestate.dirty { color: var(--warn-ink); font-weight: 600; }
+.cl-savestate.ok { color: var(--good-ink); font-weight: 600; }
+
+/* --- the limits editor: a real form, not a modal that replaces everything --- */
+.lim-rows { display: flex; flex-direction: column; }
+/* The usage track is capped rather than fluid: stretched across a wide pane an
+   empty one reads as a horizontal rule rather than as a meter at zero. */
+.lim-row {
+  display: grid; grid-template-columns: 168px 112px minmax(0, 340px); gap: var(--sp-4);
+  align-items: center; padding: 10px 0; border-bottom: 1px solid var(--line-2);
+}
+.lim-row:last-child { border-bottom: 0; }
+@media (max-width: 620px) { .lim-row { grid-template-columns: 1fr 118px; } .lim-usage { grid-column: 1 / -1; } }
+.lim-period { font-size: var(--t-md); font-weight: 550; }
+.lim-hint { font-size: var(--t-xs); color: var(--muted); white-space: nowrap; }
+.lim-field { display: flex; align-items: center; gap: 5px; }
+.lim-currency { color: var(--muted); font-family: var(--font-mono); font-size: var(--t-sm); }
+.lim-input { width: 92px; }
+.lim-usage { min-width: 0; }
+.lim-text { font-size: var(--t-xs); font-family: var(--font-mono); color: var(--muted); margin-top: 5px; }
+
+.wins { display: grid; gap: var(--sp-2); grid-template-columns: repeat(2, 1fr); }
 @media (min-width: 640px) { .wins { grid-template-columns: repeat(4, 1fr); } }
 .win { background: var(--surface-2); border: 1px solid var(--line-2); border-radius: var(--r-sm); padding: 9px 11px; }
 .win .k { font-size: var(--t-xs); letter-spacing: .08em; text-transform: uppercase; color: var(--muted); }
 .win .v { font-size: var(--t-lg); font-weight: 650; margin-top: 3px; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
 .win .sub { font-size: var(--t-xs); color: var(--ink-2); margin-top: 1px; font-family: var(--font-mono); }
 .win.lead { background: color-mix(in srgb, var(--brand) 9%, var(--surface-2)); border-color: color-mix(in srgb, var(--brand) 26%, transparent); }
-.caps { margin: var(--sp-4) 0 var(--sp-1); }
-.cap { padding: 7px 0; }
-.cap + .cap { border-top: 1px solid var(--line-2); }
-.cap-row { display: flex; align-items: baseline; gap: var(--sp-2); font-size: var(--t-sm); margin-bottom: 5px; }
-.cap-row .period { font-family: var(--font-mono); color: var(--muted); font-weight: 600; min-width: 72px; }
-.cap-row .amt { font-weight: 650; font-variant-numeric: tabular-nums; }
-.cap-row .reset { margin-left: auto; color: var(--muted); font-size: var(--t-xs); }
 
 /* ============================ upstream token cards ============================ */
 .tok { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: var(--sp-4); box-shadow: var(--shadow); transition: border-color .2s, box-shadow .2s; }

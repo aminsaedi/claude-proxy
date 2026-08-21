@@ -161,3 +161,63 @@ def test_renaming_a_key_carries_its_limits():
     finally:
         db.delete_virtual_key("znew")
         db.delete_virtual_key("zold")
+
+
+def test_a_save_is_not_undone_by_a_concurrent_reload(monkeypatch):
+    """The lost-update race behind 'I set a limit and it didn't stick'.
+
+    ``LimitStore.set`` runs in a worker thread (asyncio.to_thread) while
+    ``reload_if_changed`` runs on the event loop. The reload reads the DB and
+    then replaces the whole cache with what it read — so a save committing
+    inside that read window used to be silently rolled back, in the console
+    *and* in enforcement, until some later tick happened to notice.
+    """
+    import threading
+
+    from claude_proxy import budgets as budgets_mod
+
+    store = budgets.LimitStore()
+    store.set("alice", {"day": 10.0})
+
+    real_list = budgets_mod.db.list_key_limits
+    gate = threading.Event()
+    started = threading.Event()
+
+    def slow_list(*a, **kw):
+        out = real_list(*a, **kw)
+        started.set()
+        gate.wait(3.0)      # stand in for the I/O window sqlite really has
+        return out
+
+    def save():
+        started.wait(3.0)
+        store.set("alice", {"day": 10.0, "hour": 5.0})
+        gate.set()
+
+    monkeypatch.setattr(budgets_mod.db, "list_key_limits", slow_list)
+    saver = threading.Thread(target=save)
+    saver.start()
+    store.reload_if_changed()
+    saver.join(5.0)
+    monkeypatch.setattr(budgets_mod.db, "list_key_limits", real_list)
+
+    try:
+        assert store.for_key("alice") == {"day": 10.0, "hour": 5.0}, \
+            "the reload rolled the save back"
+        # And a later reload still converges on the persisted truth.
+        store.reload_if_changed()
+        assert store.for_key("alice") == {"day": 10.0, "hour": 5.0}
+    finally:
+        store.set("alice", {})
+
+
+def test_reload_still_picks_up_another_process_edit():
+    """The generation guard must not block genuine external changes."""
+    store = budgets.LimitStore()
+    try:
+        store.set("alice", {"day": 10.0})
+        db.set_key_limits("alice", {"day": 99.0})     # as if manage.py did it
+        assert store.reload_if_changed() is True
+        assert store.for_key("alice") == {"day": 99.0}
+    finally:
+        store.set("alice", {})

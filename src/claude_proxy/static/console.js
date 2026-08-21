@@ -1,332 +1,257 @@
 /* =====================================================================
-   claude-proxy console
+   console.js — views, state, and actions
    =====================================================================
+   Every view follows the same shape: `mount()` builds its DOM once and keeps
+   handles on the parts that change, `update()` writes current values into
+   those handles. Nothing rebuilds markup on a live update, which is what keeps
+   focus, selection, scroll position and in-flight transitions intact while
+   data streams in. The primitives are in console-dom.js.
+
    Two data channels, deliberately different:
-
-   * /events (SSE) carries the dashboard state and only pushes when something
-     actually changed, so an idle console never re-renders and never loses your
-     scroll position, an open panel, or a half-typed form.
-   * /requests is polled, but only while the Requests tab is on screen and Live
-     is armed. The audit log is far too chatty to belong in the state snapshot,
-     and paying for it when nobody is looking would be silly.
-
-   Rendering is keyed-patch throughout: nodes are reused and only rewritten when
-   their content changed, which is what keeps focus and selection intact under a
-   live feed.
+     * /events (SSE) pushes dashboard state, and only when something changed.
+     * /requests is polled, but only while the Requests tab is on screen.
    ===================================================================== */
 "use strict";
 
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
-const enc = encodeURIComponent;
-
-// ============================ formatting ============================
-function esc(s) {
-  return String(s == null ? "" : s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-}
-function fmt(n) {
-  n = n || 0;
-  if (n >= 1e9) return (n / 1e9).toFixed(2) + "B";
-  if (n >= 1e6) return (n / 1e6).toFixed(2) + "M";
-  if (n >= 1e3) return (n / 1e3).toFixed(1) + "K";
-  return String(Math.round(n));
-}
-// Money in cents so columns line up, but real-but-tiny spend reads as "<$0.01"
-// rather than a $0.00 that looks like nothing happened.
-function usd(n) {
-  n = Number(n) || 0;
-  if (n === 0) return "$0";
-  const a = Math.abs(n);
-  if (a >= 1000) return "$" + n.toLocaleString(undefined, { maximumFractionDigits: 0 });
-  if (a >= 0.01) return "$" + n.toFixed(2);
-  return "<$0.01";
-}
-function bytes(n) {
-  n = Number(n) || 0;
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let i = 0;
-  while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
-  return (i === 0 ? Math.round(n) : n.toFixed(1)) + units[i];
-}
-function ms(v) {
-  if (v == null) return "—";
-  return v < 1000 ? Math.round(v) + "ms" : (v / 1000).toFixed(v < 10000 ? 2 : 1) + "s";
-}
-const pct = u => Math.round((parseFloat(u) || 0) * 100);
-const tokTotal = m => (m.input_tokens || 0) + (m.output_tokens || 0) + (m.cache_read_input_tokens || 0) + (m.cache_creation_input_tokens || 0);
-
-function fmtReset(ts) {
-  if (!ts) return "—";
-  const s = Math.max(0, parseInt(ts) - Date.now() / 1000);
-  if (s < 60) return "<1m";
-  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), d = Math.floor(h / 24);
-  if (d >= 1) return `${d}d ${h % 24}h`;
-  return h > 0 ? `${h}h ${m}m` : `${m}m`;
-}
-function ago(ts) {
-  const s = Math.max(0, Date.now() / 1000 - ts);
-  if (s < 60) return Math.round(s) + "s";
-  if (s < 3600) return Math.round(s / 60) + "m";
-  if (s < 86400) return Math.round(s / 3600) + "h";
-  return Math.round(s / 86400) + "d";
-}
-const clock = ts => new Date(ts * 1000).toLocaleTimeString(undefined, { hour12: false });
-
-// ============================ status vocabulary ============================
-// Severity is never carried by colour alone: every call site pairs it with an
-// icon and a word. Two of the four status steps sit below 3:1 on a light
-// surface by design, and this pairing is the mitigation.
-function sev(u) { u = parseFloat(u) || 0; return u >= 0.9 ? "crit" : u >= 0.7 ? "warn" : "good"; }
-function sevMark(s) { return `var(--${s === "crit" ? "crit" : s === "warn" ? "warn" : s === "serious" ? "serious" : "good"})`; }
-function sevInk(s) { return `var(--${s === "crit" ? "crit-ink" : s === "warn" ? "warn-ink" : s === "serious" ? "serious-ink" : "good-ink"})`; }
-function healthLabel(h) {
-  if (!h || h.last_checked === 0) return { sev: "neutral", text: "unchecked" };
-  const st = h.status || (h.healthy ? "healthy" : "unhealthy");
-  if (st === "healthy") return { sev: "good", text: "healthy" };
-  if (st === "rate_limited") return { sev: "warn", text: "rate-limited" };
-  return { sev: "crit", text: `unhealthy · ${h.error_count} err` };
-}
-const ICON = {
-  good: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>',
-  warn: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>',
-  serious: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>',
-  crit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>',
-  brand: '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="12" r="6"/></svg>',
-  neutral: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"><circle cx="12" cy="12" r="9"/></svg>',
-};
-const badge = (s, text) => `<span class="badge ${s}">${ICON[s] || ""}${esc(text)}</span>`;
-
-const SVG = {
-  eye: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>',
-  edit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>',
-  trash: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M8 6V4h8v2m1 0-1 14H7L6 6"/></svg>',
-  rotate: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.6-6.4"/><path d="M21 3v6h-6"/></svg>',
-  rename: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.6 13.4 12 22l-9-9V4h9z"/><circle cx="7.5" cy="7.5" r="1.6"/></svg>',
-  gauge: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 17a9 9 0 1 1 18 0"/><path d="m12 17 4.5-5"/></svg>',
-};
-
-// Fixed categorical slots for the per-model breakdown — assigned in order and
-// never cycled, so a model keeps its colour when the list is filtered.
-const SERIES = ["var(--s1)", "var(--s2)", "var(--s3)", "var(--s4)", "var(--s5)", "var(--s6)"];
-
-// ============================ clipboard ============================
-// navigator.clipboard only exists in a secure context, which a plain-http
-// tailnet URL is not; and the execCommand fallback needs its temp field inside
-// the open <dialog>, since showModal() makes the rest of the document inert.
-async function copyText(text, host) {
-  try { if (window.isSecureContext && navigator.clipboard) { await navigator.clipboard.writeText(text); return true; } } catch (e) { /* fall through */ }
-  const root = host || document.querySelector("dialog[open]") || document.body;
-  try {
-    const ta = document.createElement("textarea");
-    ta.value = text; ta.setAttribute("readonly", "");
-    ta.style.cssText = "position:fixed;top:0;left:0;width:1px;height:1px;padding:0;border:0;opacity:0";
-    root.appendChild(ta);
-    ta.focus(); ta.select();
-    try { ta.setSelectionRange(0, text.length); } catch (e) { /* older browsers */ }
-    const ok = document.execCommand("copy");
-    ta.remove();
-    return ok;
-  } catch (e) { return false; }
-}
-
-// ============================ dialogs ============================
-function makeDialog(inner) {
-  const d = document.createElement("dialog");
-  d.className = "dlg"; d.innerHTML = inner;
-  document.body.appendChild(d);
-  d.addEventListener("click", e => { if (e.target === d) d.close(); });
-  d.addEventListener("close", () => d.remove(), { once: true });
-  return d;
-}
-function confirmDialog({ title, message = "", confirmLabel = "Confirm", danger = false }) {
-  return new Promise(resolve => {
-    const d = makeDialog(`<div class="dlg-head"><h3>${esc(title)}</h3>${message ? `<p>${message}</p>` : ""}</div>
-      <div class="dlg-foot"><button class="btn ghost" data-x type="button">Cancel</button>
-      <button class="btn ${danger ? "danger" : "primary"}" data-ok type="button">${esc(confirmLabel)}</button></div>`);
-    let ok = false;
-    d.querySelector("[data-ok]").onclick = () => { ok = true; d.close(); resolve(true); };
-    d.querySelector("[data-x]").onclick = () => d.close();
-    d.addEventListener("close", () => { if (!ok) resolve(false); }, { once: true });
-    d.showModal(); d.querySelector("[data-ok]").focus();
-  });
-}
-function formDialog({ title, desc = "", fields, submitLabel = "Save" }) {
-  return new Promise(resolve => {
-    const body = fields.map(f => {
-      if (f.type === "checkbox")
-        return `<label class="chk"><input type="checkbox" name="${f.name}" ${f.value ? "checked" : ""}> ${esc(f.label)}</label>`;
-      const ctl = f.type === "textarea"
-        ? `<textarea name="${f.name}" placeholder="${esc(f.placeholder || "")}" spellcheck="false">${esc(f.value || "")}</textarea>`
-        : `<input type="text" name="${f.name}" value="${esc(f.value || "")}" placeholder="${esc(f.placeholder || "")}" autocomplete="off" spellcheck="false">`;
-      return `<div class="field"><label>${esc(f.label)}</label>${ctl}${f.hint ? `<div class="fh">${esc(f.hint)}</div>` : ""}</div>`;
-    }).join("");
-    const d = makeDialog(`<form><div class="dlg-head"><h3>${esc(title)}</h3>${desc ? `<p>${esc(desc)}</p>` : ""}</div>
-      <div class="dlg-body">${body}</div>
-      <div class="dlg-foot"><button type="button" class="btn ghost" data-x>Cancel</button>
-      <button type="submit" class="btn primary">${esc(submitLabel)}</button></div></form>`);
-    const form = d.querySelector("form");
-    let done = false;
-    form.addEventListener("submit", e => {
-      e.preventDefault();
-      const data = {};
-      fields.forEach(f => {
-        const el = form.elements[f.name];
-        data[f.name] = f.type === "checkbox" ? el.checked : el.value.trim();
-      });
-      done = true; d.close(); resolve(data);
-    });
-    d.querySelector("[data-x]").onclick = () => d.close();
-    d.addEventListener("close", () => { if (!done) resolve(null); }, { once: true });
-    d.showModal();
-    const first = form.querySelector("input,textarea");
-    if (first) first.focus();
-  });
-}
-function revealDialog({ title, label, value, note = "" }) {
-  const d = makeDialog(`<div class="dlg-head"><h3>${esc(title)}</h3>${note ? `<p>${esc(note)}</p>` : ""}</div>
-    <div class="dlg-body"><div class="field"><label>${esc(label)}</label>
-      <div class="reveal-box"><input type="text" readonly value="${esc(value)}"><button type="button" class="btn" data-copy>Copy</button></div>
-    </div></div>
-    <div class="dlg-foot"><button type="button" class="btn primary" data-x>Done</button></div>`);
-  const input = d.querySelector("input");
-  d.querySelector("[data-copy]").onclick = async () => {
-    const ok = await copyText(value, d);   // from inside this dialog: top layer, not inert
-    if (!ok) { input.focus(); input.select(); try { input.setSelectionRange(0, value.length); } catch (e) { /* ignore */ } }
-    toast(ok ? "ok" : "err", ok ? "Copied to clipboard" : "Couldn't copy — text is selected, press ⌘/Ctrl-C");
-  };
-  d.querySelector("[data-x]").onclick = () => d.close();
-  d.showModal(); input.focus(); input.select();
-}
-
-// ============================ toasts ============================
-function toast(kind, msg) {
-  const t = document.createElement("div");
-  t.className = "toast " + kind;
-  t.setAttribute("role", "status");
-  const colour = kind === "ok" ? "var(--good-ink)" : kind === "err" ? "var(--crit-ink)" : "var(--brand-ink)";
-  t.innerHTML = `<span style="color:${colour}">${ICON[kind === "ok" ? "good" : kind === "err" ? "crit" : "brand"]}</span><span></span>`;
-  t.querySelector("span:last-child").textContent = msg;
-  $("#toasts").appendChild(t);
-  setTimeout(() => { t.style.transition = "opacity .3s"; t.style.opacity = "0"; setTimeout(() => t.remove(), 300); }, 3600);
-}
-
-// ============================ api ============================
-async function api(method, path, body) {
-  const opt = { method, headers: {}, cache: "no-store" };
-  if (body !== undefined) { opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
-  const r = await fetch(path, opt);
-  let d = {};
-  try { d = await r.json(); } catch (e) { /* empty body */ }
-  if (!r.ok) throw new Error(d.error || ("HTTP " + r.status));
-  return d;
-}
 
 // ============================ shared state ============================
 let state = null;
-let cfgDirty = false;      // never clobber a form the operator is editing
-let lastCfgJSON = null;
-let lastBeat = 0;
 let es = null;
+let lastBeat = 0;
 let currentView = "overview";
-const CIRC = 2 * Math.PI * 62 * 0.5;   // semicircle arc length, r=62
+let auditOverview = null;
+let auditModels = null;
 
-// ============================ chart tooltip ============================
-// An HTML chart is interactive by default (interaction.md): every bar gets a
-// hover readout, with a hit target the full column height rather than the mark.
-const tip = () => $("#tip");
-function showTip(ev, title, rows) {
-  const el = tip();
-  el.innerHTML = `<div class="tt">${esc(title)}</div>` +
-    rows.map(([k, v]) => `<div class="tr"><span>${esc(k)}</span><span>${esc(v)}</span></div>`).join("");
-  el.classList.add("show");
-  el.setAttribute("aria-hidden", "false");
-  const r = el.getBoundingClientRect();
-  const x = Math.min(window.innerWidth - r.width - 10, Math.max(8, ev.clientX + 12));
-  const y = Math.max(8, ev.clientY - r.height - 12);
-  el.style.left = x + "px";
-  el.style.top = y + "px";
-}
-function hideTip() { tip().classList.remove("show"); tip().setAttribute("aria-hidden", "true"); }
+const VIEWS = ["overview", "requests", "clients", "upstreams", "settings"];
 
-/* Bar chart of one measure over time. One series, so no legend — the section
-   title names the measure. 4px rounded tops on the baseline, 2px gaps. */
-function barChart(points, { valueKey = "value", labelKey = "label", format = usd, sub = () => "" }) {
-  if (!points.length) return `<div class="empty">No data yet.</div>`;
-  const max = Math.max(...points.map(p => p[valueKey] || 0), 0);
-  const bars = points.map((p, i) => {
-    const v = p[valueKey] || 0;
-    const h = max > 0 ? Math.max(2, Math.round(v / max * 100)) : 0;
-    const last = i === points.length - 1;
-    return `<span class="b ${v ? "" : "zero"} ${last ? "today" : ""}" data-i="${i}"><i style="height:${h}%"></i></span>`;
-  }).join("");
-  return `<div class="chart">
-    <div class="chart-head"><span class="t">peak ${esc(format(max))}</span><span class="z">${esc(sub())}</span></div>
-    <div class="bars" data-chart>${bars}</div>
-    <div class="chart-axis"><span>${esc(points[0][labelKey])}</span><span>${esc(points[points.length - 1][labelKey])}</span></div>
-  </div>`;
-}
-function bindChart(root, points, render) {
-  const bars = root.querySelector("[data-chart]");
-  if (!bars) return;
-  bars.addEventListener("mousemove", e => {
-    const b = e.target.closest("[data-i]");
-    if (!b) return hideTip();
-    const p = points[+b.dataset.i];
-    if (p) showTip(e, ...render(p));
-  });
-  bars.addEventListener("mouseleave", hideTip);
+// Nodes whose text is a live countdown. Registered rather than re-rendered, so
+// a ticking clock never counts as "the data changed" — which is what used to
+// rebuild whole cards once a minute for no reason.
+const countdowns = new Map();
+function countdown(node, ts, prefix = "") {
+  if (!ts) { countdowns.delete(node); txt(node, "—"); return; }
+  countdowns.set(node, { ts, prefix });
+  txt(node, prefix + fmtReset(ts));
 }
 
 // =====================================================================
-// OVERVIEW — hero gauge
+// OVERVIEW
 // =====================================================================
-function renderHero() {
-  const hero = $("#hero");
-  const active = state.active;
-  const h = (state.headers || {})[active] || {};
-  const hh = (state.health || {})[active];
-  const u5 = h["anthropic-ratelimit-unified-5h-utilization"];
-  const has = u5 !== undefined;
-  const p = pct(u5);
-  const s = has ? sev(u5) : "neutral";
-  const hl = healthLabel(hh);
-  const frac = Math.min(1, parseFloat(u5) || 0);   // clamp the sweep, show the true %
-  const off = CIRC * (1 - frac);
-  const u7 = h["anthropic-ratelimit-unified-7d-utilization"];
+const Overview = {
+  mounted: false,
 
-  hero.classList.remove("stale");
-  hero.innerHTML = `
-    <div class="gauge" role="meter" aria-label="Active token 5-hour capacity used"
-         aria-valuenow="${p}" aria-valuemin="0" aria-valuemax="100">
-      <svg viewBox="0 0 140 92" aria-hidden="true">
-        <path class="track" d="M8 84 A62 62 0 0 1 132 84"/>
-        <path class="fill" d="M8 84 A62 62 0 0 1 132 84"
-              stroke="${has ? sevMark(s) : "var(--surface-3)"}"
-              stroke-dasharray="${CIRC}" stroke-dashoffset="${has ? off : CIRC}"/>
-      </svg>
-      <div class="center">
-        <div class="val">${has ? p : "—"}<span class="pct">${has ? "%" : ""}</span></div>
-        <div class="cap">5h capacity used</div>
-      </div>
-    </div>
-    <div class="hero-meta">
-      <div class="eyebrow">Active upstream</div>
-      <div class="hero-token">
-        <span class="name">${esc(active || "—")}</span>
-        ${badge("brand", "live")}
-        ${badge(hl.sev, hl.text)}
-      </div>
-      <div class="hero-sub">${heroSub(has, p, s)}</div>
-      <div class="hero-stats">
-        <div class="hero-stat"><div class="k">7-day used</div>
-          <div class="v" style="color:${u7 !== undefined ? sevInk(sev(u7)) : "var(--ink)"}">${u7 !== undefined ? pct(u7) + "%" : "—"}</div></div>
-        <div class="hero-stat"><div class="k">5h resets in</div>
-          <div class="v" data-reset="${h["anthropic-ratelimit-unified-5h-reset"] || ""}">${fmtReset(h["anthropic-ratelimit-unified-5h-reset"])}</div></div>
-        <div class="hero-stat"><div class="k">Upstreams</div><div class="v">${state.tokens.length}</div></div>
-        <div class="hero-stat"><div class="k">Uptime</div><div class="v">${state.started_at ? ago(state.started_at) : "—"}</div></div>
-      </div>
-    </div>`;
+  mount() {
+    if (this.mounted) return;
+    this.mounted = true;
+
+    const hero = clear($("#hero"));
+    hero.appendChild(el("div.gauge", {
+      role: "meter", "aria-label": "Active token 5-hour capacity used",
+      "aria-valuemin": "0", "aria-valuemax": "100",
+    },
+      el("svg", { viewBox: "0 0 140 92", "aria-hidden": "true" },
+        el("path.track", { d: "M8 84 A62 62 0 0 1 132 84" }),
+        el("path.fill", { "data-ref": "arc", d: "M8 84 A62 62 0 0 1 132 84" })),
+      el("div.center",
+        el("div.val", el("span", { "data-ref": "pct" }), el("span.pct", { "data-ref": "pctSign" })),
+        el("div.cap", { text: "5h capacity used" }))));
+    hero.appendChild(el("div.hero-meta",
+      el("div.eyebrow", { text: "Active upstream" }),
+      el("div.hero-token",
+        el("span.name", { "data-ref": "name" }),
+        el("span", { "data-ref": "badges" })),
+      el("div.hero-sub", { "data-ref": "sub" }),
+      el("div.hero-stats",
+        stat("7-day used", "u7"), stat("5h resets in", "reset"),
+        stat("Upstreams", "count"), stat("Uptime", "uptime"))));
+    this.hero = refs(hero);
+    this.gauge = hero.querySelector(".gauge");
+
+    this.tiles = clear($("#tiles"));
+    this.spend = clear($("#spendChart"));
+    this.latency = clear($("#latencyPanel"));
+    this.models = clear($("#modelPanel"));
+  },
+
+  update() {
+    this.mount();
+    const h = (state.headers || {})[state.active] || {};
+    const hl = healthLabel((state.health || {})[state.active]);
+    const u5 = h["anthropic-ratelimit-unified-5h-utilization"];
+    const has = u5 !== undefined;
+    const p = pct(u5);
+    const s = has ? sev(u5) : "neutral";
+    const CIRC = 2 * Math.PI * 62 * 0.5;   // semicircle arc length, r=62
+
+    att(this.hero.arc, "stroke", has ? sevMark(s) : "var(--surface-3)");
+    att(this.hero.arc, "stroke-dasharray", CIRC);
+    att(this.hero.arc, "stroke-dashoffset", has ? CIRC * (1 - Math.min(1, parseFloat(u5) || 0)) : CIRC);
+    txt(this.hero.pct, has ? p : "—");
+    txt(this.hero.pctSign, has ? "%" : "");
+    att(this.gauge, "aria-valuenow", p);
+    txt(this.hero.name, state.active || "—");
+    html(this.hero.badges, badgeHTML("brand", "live") + badgeHTML(hl.sev, hl.text));
+    html(this.hero.sub, heroSub(has, p, s));
+
+    const u7 = h["anthropic-ratelimit-unified-7d-utilization"];
+    txt(this.hero.u7, u7 !== undefined ? pct(u7) + "%" : "—");
+    sty(this.hero.u7, "color", u7 !== undefined ? sevInk(sev(u7)) : "var(--ink)");
+    countdown(this.hero.reset, h["anthropic-ratelimit-unified-5h-reset"]);
+    txt(this.hero.count, state.tokens.length);
+    txt(this.hero.uptime, state.started_at ? ago(state.started_at).replace(" ago", "") : "—");
+
+    this.renderTiles();
+    this.renderSpend();
+    this.renderLatency();
+    this.renderModels();
+  },
+
+  renderTiles() {
+    const t = fleetTotals();
+    const o = auditOverview || {};
+    // Rate over *forwarded* requests: a rejected key never reached upstream, so
+    // counting it would both inflate the rate and let a flood of bad-key
+    // retries drown out a real upstream problem.
+    const errRate = o.forwarded ? (o.errors || 0) / o.forwarded : 0;
+    const errSev = errRate >= 0.1 ? "crit" : errRate >= 0.02 ? "warn" : "good";
+    const bits = [o.errors && `${fmt(o.errors)} failed`, o.blocked && `${fmt(o.blocked)} blocked`,
+      o.rejected && `${fmt(o.rejected)} rejected`].filter(Boolean);
+    const tiles = [
+      { k: "Spend today", v: usd(t.win["1d"]), sub: state.timezone || "local", accent: true },
+      { k: "Spend 7d", v: usd(t.win["7d"]), sub: "7 calendar days", accent: true },
+      { k: "Spend all-time", v: usd(t.cost), sub: `${fmt(t.req)} requests` },
+      { k: "Requests 24h", v: fmt(o.forwarded || 0), sub: `${fmt(o.tokens || 0)} tokens` },
+      {
+        k: "Error rate 24h", v: o.forwarded ? (errRate * 100).toFixed(1) + "%" : "—",
+        sub: bits.length ? bits.join(" · ") : "no failures",
+        ink: o.forwarded ? sevInk(errSev) : null,
+      },
+      { k: "Active clients", v: String(t.activeClients), sub: `of ${(state.virtual_keys || []).length} keys` },
+    ];
+    list(this.tiles, tiles, {
+      key: x => x.k,
+      create: () => el("div.tile", el("div.k"), el("div.v"), el("div.sub")),
+      update: (node, x) => {
+        cls(node, "accent", !!x.accent);
+        txt(node.children[0], x.k);
+        txt(node.children[1], x.v);
+        sty(node.children[1], "color", x.ink || "");
+        txt(node.children[2], x.sub);
+      },
+    });
+  },
+
+  renderSpend() {
+    // One series across all clients: the fleet's daily spend.
+    const byDate = new Map();
+    for (const vk of state.virtual_keys || []) {
+      for (const d of vk.daily || []) {
+        const cur = byDate.get(d.date) || { date: d.date, cost_usd: 0, requests: 0, tokens: 0 };
+        cur.cost_usd += d.cost_usd || 0;
+        cur.requests += d.requests || 0;
+        cur.tokens += tokTotal(d);
+        byDate.set(d.date, cur);
+      }
+    }
+    const points = Array.from(byDate.values()).sort((a, b) => a.date.localeCompare(b.date));
+    txt($("#spendRange"), points.length ? `${points.length} days` : "");
+    barChart(this.spend, points, {
+      value: p => p.cost_usd, label: p => p.date, format: usd,
+      note: state.timezone || "",
+      tip: p => [p.date, [["Spend", usd(p.cost_usd)], ["Requests", fmt(p.requests)], ["Tokens", fmt(p.tokens)]]],
+    });
+  },
+
+  renderLatency() {
+    const o = auditOverview;
+    const box = this.latency;
+    if (!o || !o.forwarded) {
+      if (box.__mode !== "empty") {
+        clear(box).appendChild(el("div.empty", { text: "No requests forwarded upstream in the last 24h." }));
+        box.__mode = "empty";
+      }
+      return;
+    }
+    if (box.__mode !== "table") {
+      clear(box);
+      box.__mode = "table";
+      // Percentiles, not averages: latency is long-tailed and the mean
+      // describes nobody's experience of it.
+      box.appendChild(el("table.tbl",
+        el("thead", el("tr", el("th", { text: "Last 24h" }),
+          el("th.r", { text: "p50" }), el("th.r", { text: "p95" }))),
+        el("tbody",
+          el("tr", el("td.name", { text: "Time to first byte" }),
+            el("td.r.strong.mono", { "data-ref": "t50" }), el("td.r.strong.mono", { "data-ref": "t95" })),
+          el("tr", el("td.name", { text: "Full response" }),
+            el("td.r.strong.mono", { "data-ref": "l50" }), el("td.r.strong.mono", { "data-ref": "l95" })))));
+      box.appendChild(el("div.subtle", { "data-ref": "note", style: "margin-top:12px" }));
+      box.appendChild(el("div.subtle", { "data-ref": "rej", style: "margin-top:8px" }));
+      box.__refs = refs(box);
+    }
+    const r = box.__refs;
+    txt(r.t50, ms(o.ttfb_p50));
+    txt(r.t95, ms(o.ttfb_p95));
+    txt(r.l50, ms(o.latency_p50));
+    txt(r.l95, ms(o.latency_p95));
+    txt(r.note, `Over the ${fmt(o.forwarded)} request${o.forwarded === 1 ? "" : "s"} actually ` +
+      "forwarded upstream. Time to first byte is the part the proxy and upstream control; " +
+      "the full response also covers however long the completion took to generate.");
+    txt(r.rej, o.rejected
+      ? `${fmt(o.rejected)} request${o.rejected > 1 ? "s were" : " was"} rejected on an unknown key ` +
+        "and never forwarded — excluded from these figures."
+      : "");
+  },
+
+  renderModels() {
+    const rows = auditModels || [];
+    const box = this.models;
+    if (!rows.length) {
+      if (box.__mode !== "empty") {
+        clear(box).appendChild(el("div.empty", { text: "No requests recorded in the last 24h." }));
+        box.__mode = "empty";
+      }
+      return;
+    }
+    if (box.__mode !== "table") {
+      clear(box);
+      box.__mode = "table";
+      box.appendChild(el("table.tbl",
+        el("thead", el("tr", el("th", { text: "Model" }), el("th.r", { text: "Share" }),
+          el("th.r", { text: "Requests" }), el("th.r", { text: "Cost" }),
+          el("th.r", { text: "Avg TTFB" }), el("th.r", { text: "Avg total" }))),
+        el("tbody", { "data-ref": "body" })));
+      box.__refs = refs(box);
+    }
+    const max = Math.max(...rows.map(r => r.cost_usd || 0), 1e-9);
+    list(box.__refs.body, rows.map((r, i) => ({ ...r, i })), {
+      key: r => r.model || "—",
+      create: () => el("tr",
+        el("td.name", el("span.swatch", { style: "display:inline-block" }), el("span")),
+        el("td.r", { style: "width:120px" }, el("span.track.thin", { style: "display:block" }, el("span.bar"))),
+        el("td.r.mono"), el("td.r.strong.mono"), el("td.r.mono"), el("td.r.mono")),
+      update: (node, r) => {
+        const colour = SERIES[r.i % SERIES.length];
+        sty(node.children[0].children[0], "background", colour);
+        txt(node.children[0].children[1], " " + (r.model || "—"));
+        const bar = node.children[1].firstChild.firstChild;
+        sty(bar, "width", Math.round((r.cost_usd || 0) / max * 100) + "%");
+        sty(bar, "background", colour);
+        txt(node.children[2], fmt(r.requests));
+        txt(node.children[3], usd(r.cost_usd));
+        txt(node.children[4], ms(r.avg_ttfb_ms));
+        txt(node.children[5], ms(r.avg_latency_ms));
+      },
+    });
+  },
+};
+
+function stat(label, ref) {
+  return el("div.hero-stat", el("div.k", { text: label }), el("div.v", { "data-ref": ref }));
 }
+
 function heroSub(has, p, s) {
   if (!has) return "No rate-limit data yet — send a request or run a probe.";
   const rem = Math.max(0, 100 - p);
@@ -335,497 +260,782 @@ function heroSub(has, p, s) {
   return `<b style="color:var(--good-ink)">${rem}%</b> of the 5-hour window remaining — healthy headroom.`;
 }
 
-// =====================================================================
-// OVERVIEW — KPI tiles
-// =====================================================================
-function sumUsage() {
-  let req = 0, cr = 0, cost = 0, activeClients = 0;
+function fleetTotals() {
+  let req = 0, cost = 0, activeClients = 0;
   const win = { "1d": 0, "3d": 0, "7d": 0, "30d": 0 };
   for (const vk of state.virtual_keys || []) {
     let kr = 0;
     for (const m of Object.values(vk.usage || {})) {
       req += m.requests || 0;
-      cr += m.cache_read_input_tokens || 0;
       cost += m.cost_usd || 0;
       kr += m.requests || 0;
     }
     for (const k in win) win[k] += (vk.windows || {})[k]?.cost_usd || 0;
     if (kr > 0) activeClients++;
   }
-  return { req, cr, cost, win, activeClients };
+  return { req, cost, win, activeClients };
 }
-function renderTiles() {
-  const t = sumUsage();
-  const tz = state.timezone || "local";
-  const o = auditOverview || {};
-  // Rate over *forwarded* requests: a rejected key never reached upstream, so
-  // counting it as a failure of the upstream would be misleading in both
-  // directions — it inflates the rate, and a flood of them would drown out a
-  // real upstream problem.
-  const bad = (o.errors || 0) + (o.blocked || 0);
-  const errRate = o.forwarded ? (o.errors || 0) / o.forwarded : 0;
-  const errSev = errRate >= 0.1 ? "crit" : errRate >= 0.02 ? "warn" : "good";
-  const rejected = o.rejected || 0;
-  const tiles = [
-    { k: "Spend today", v: usd(t.win["1d"]), sub: tz, cls: "accent" },
-    { k: "Spend 7d", v: usd(t.win["7d"]), sub: "7 calendar days", cls: "accent" },
-    { k: "Spend all-time", v: usd(t.cost), sub: `${fmt(t.req)} requests` },
-    { k: "Requests 24h", v: fmt(o.forwarded || 0), sub: `${fmt(o.tokens || 0)} tokens` },
-    {
-      k: "Error rate 24h",
-      v: o.forwarded ? (errRate * 100).toFixed(1) + "%" : "—",
-      // Kept short: this line is one tile wide and ellipsises if it runs long.
-      sub: bad || rejected
-        ? [o.errors && `${fmt(o.errors)} failed`, o.blocked && `${fmt(o.blocked)} blocked`,
-           rejected && `${fmt(rejected)} rejected`].filter(Boolean).join(" · ")
-        : "no failures",
-      ink: o.forwarded ? sevInk(errSev) : null,
+
+// ============================ bar chart ============================
+// Single series, so no legend — the section title names the measure. 4px
+// rounded tops on the baseline, 2px gaps (see the marks spec).
+function barChart(box, points, { value, label, format = usd, note = "", tip }) {
+  if (!points.length) {
+    if (box.__mode !== "empty") {
+      clear(box).appendChild(el("div.empty", { text: "No data yet." }));
+      box.__mode = "empty";
+    }
+    return;
+  }
+  if (box.__mode !== "chart") {
+    clear(box);
+    box.__mode = "chart";
+    const chart = el("div.chart",
+      el("div.chart-head", el("span.t", { "data-ref": "peak" }), el("span.z", { "data-ref": "note" })),
+      el("div.bars", { "data-ref": "bars" }),
+      el("div.chart-axis", el("span", { "data-ref": "from" }), el("span", { "data-ref": "to" })));
+    box.appendChild(chart);
+    box.__refs = refs(chart);
+    box.__refs.bars.addEventListener("mousemove", e => {
+      const b = e.target.closest("[data-i]");
+      if (!b || !box.__points) return hideTip();
+      const p = box.__points[+b.dataset.i];
+      if (p && box.__tip) showTip(e, ...box.__tip(p));
+    });
+    box.__refs.bars.addEventListener("mouseleave", hideTip);
+  }
+  const r = box.__refs;
+  box.__points = points;
+  box.__tip = tip;
+  const max = Math.max(...points.map(value), 0);
+  txt(r.peak, "peak " + format(max));
+  txt(r.note, note);
+  txt(r.from, label(points[0]));
+  txt(r.to, label(points[points.length - 1]));
+  list(r.bars, points.map((p, i) => ({ p, i, last: i === points.length - 1 })), {
+    key: x => label(x.p),
+    create: () => el("span.b", el("i")),
+    update: (node, x) => {
+      const v = value(x.p) || 0;
+      att(node, "data-i", x.i);
+      cls(node, "zero", !v);
+      cls(node, "today", x.last);
+      sty(node.firstChild, "height", (max > 0 ? Math.max(2, Math.round(v / max * 100)) : 0) + "%");
     },
-    { k: "Active clients", v: String(t.activeClients), sub: `of ${(state.virtual_keys || []).length} keys` },
-  ];
-  $("#tiles").innerHTML = tiles.map(x => `<div class="tile ${x.cls || ""}">
-    <div class="k">${esc(x.k)}</div>
-    <div class="v"${x.ink ? ` style="color:${x.ink}"` : ""}>${esc(x.v)}</div>
-    <div class="sub">${esc(x.sub)}</div></div>`).join("");
-}
-
-// =====================================================================
-// OVERVIEW — spend chart, latency, model table
-// =====================================================================
-function renderSpendChart() {
-  // One series across all clients: the fleet's daily spend.
-  const byDate = new Map();
-  for (const vk of state.virtual_keys || []) {
-    for (const d of vk.daily || []) {
-      const cur = byDate.get(d.date) || { date: d.date, cost_usd: 0, requests: 0, tokens: 0 };
-      cur.cost_usd += d.cost_usd || 0;
-      cur.requests += d.requests || 0;
-      cur.tokens += tokTotal(d);
-      byDate.set(d.date, cur);
-    }
-  }
-  const points = Array.from(byDate.values()).sort((a, b) => a.date.localeCompare(b.date))
-    .map(d => ({ ...d, value: d.cost_usd, label: d.date }));
-  const box = $("#spendChart");
-  $("#spendRange").textContent = points.length ? `${points.length} days` : "";
-  box.innerHTML = barChart(points, { sub: () => state.timezone || "" });
-  bindChart(box, points, p => [p.date, [
-    ["Spend", usd(p.cost_usd)], ["Requests", fmt(p.requests)], ["Tokens", fmt(p.tokens)],
-  ]]);
-}
-
-function renderLatency() {
-  const o = auditOverview;
-  const box = $("#latencyPanel");
-  if (!o || !o.forwarded) {
-    box.innerHTML = `<div class="empty">No requests forwarded upstream in the last 24h.</div>`;
-    return;
-  }
-  // Percentiles, not averages: latency is long-tailed, and the mean describes
-  // nobody's experience of it.
-  const rows = [
-    ["Time to first byte", o.ttfb_p50, o.ttfb_p95],
-    ["Full response", o.latency_p50, o.latency_p95],
-  ];
-  const rejectedNote = o.rejected
-    ? `<div class="subtle" style="margin-top:8px">${fmt(o.rejected)} request${o.rejected > 1 ? "s were" : " was"}
-       rejected on an unknown key and never forwarded — excluded from these figures.</div>`
-    : "";
-  box.innerHTML = `<table class="tbl">
-    <thead><tr><th>Last 24h</th><th class="r">p50</th><th class="r">p95</th></tr></thead>
-    <tbody>${rows.map(([label, p50, p95]) => `<tr>
-      <td class="name">${esc(label)}</td>
-      <td class="strong mono">${esc(ms(p50))}</td>
-      <td class="strong mono">${esc(ms(p95))}</td></tr>`).join("")}</tbody>
-  </table>
-  <div class="subtle" style="margin-top:12px">
-    Over the ${esc(fmt(o.forwarded || 0))} request${o.forwarded === 1 ? "" : "s"} actually forwarded upstream.
-    Time to first byte is the part the proxy and upstream control; the full
-    response also covers however long the completion took to generate.
-  </div>${rejectedNote}`;
-}
-
-function renderModels() {
-  const rows = auditModels || [];
-  const box = $("#modelPanel");
-  if (!rows.length) {
-    box.innerHTML = `<div class="empty">No requests recorded in the last 24h.</div>`;
-    return;
-  }
-  const max = Math.max(...rows.map(r => r.cost_usd || 0), 1e-9);
-  box.innerHTML = `<table class="tbl">
-    <thead><tr><th>Model</th><th class="r">Share</th><th class="r">Requests</th>
-      <th class="r">Cost</th><th class="r">Avg TTFB</th><th class="r">Avg total</th></tr></thead>
-    <tbody>${rows.map((r, i) => {
-      const share = Math.round((r.cost_usd || 0) / max * 100);
-      const colour = SERIES[i % SERIES.length];
-      return `<tr>
-        <td class="name"><span class="swatch" style="display:inline-block;background:${colour}"></span> ${esc(r.model || "—")}</td>
-        <td class="r" style="width:120px">
-          <span class="track thin" style="display:block"><span class="bar" style="width:${share}%;background:${colour}"></span></span>
-        </td>
-        <td class="r mono">${esc(fmt(r.requests))}</td>
-        <td class="r strong mono">${esc(usd(r.cost_usd))}</td>
-        <td class="r mono">${esc(ms(r.avg_ttfb_ms))}</td>
-        <td class="r mono">${esc(ms(r.avg_latency_ms))}</td>
-      </tr>`;
-    }).join("")}</tbody>
-  </table>`;
-}
-
-// =====================================================================
-// UPSTREAMS — token cards
-// =====================================================================
-const tokRefs = new Map();
-function meterHTML(h, period, big) {
-  const u = h[`anthropic-ratelimit-unified-${period}-utilization`];
-  if (u === undefined) return "";
-  const p = pct(u), s = sev(u);
-  const reset = h[`anthropic-ratelimit-unified-${period}-reset`] || "";
-  return `<div class="meter">
-    <div class="meter-row">
-      <span class="period">${period}</span>
-      <span class="pct" style="color:${sevInk(s)}">${p}%</span>
-      <span class="reset" data-reset="${esc(reset)}">resets ${fmtReset(reset)}</span>
-    </div>
-    <div class="track ${big ? "" : "thin"}"><div class="bar" style="width:${Math.min(100, p)}%;background:${sevMark(s)}"></div></div>
-  </div>`;
-}
-const META_KEYS = ["anthropic-ratelimit-unified-status", "anthropic-ratelimit-unified-overage-status", "anthropic-ratelimit-unified-fallback"];
-function tokenCardHTML(name) {
-  const h = (state.headers || {})[name] || {};
-  const hl = healthLabel((state.health || {})[name]);
-  const isActive = name === state.active;
-  const isDefault = name === state.default_token;
-  const hasData = Object.keys(h).length > 0;
-  const preview = (state.token_previews || {})[name] || "";
-  const rawRows = Object.entries(h).sort((a, b) => a[0].localeCompare(b[0]))
-    .map(([k, v]) => `<tr><td>${esc(k)}</td><td>${esc(v)}</td></tr>`).join("");
-  const meta = META_KEYS.filter(k => h[k] !== undefined)
-    .map(k => `<span class="chip">${esc(k.replace("anthropic-ratelimit-unified-", ""))}: ${esc(h[k])}</span>`).join(" ");
-  return `
-    <div class="tok-top">
-      <span class="tok-name">${esc(name)}</span>
-      ${isActive ? badge("brand", "active") : ""}
-      ${isDefault ? badge("neutral", "default") : ""}
-      ${badge(hl.sev, hl.text)}
-    </div>
-    ${preview ? `<div class="tok-preview" title="Masked — use Reveal for the full token">${esc(preview)}</div>` : ""}
-    ${hasData ? meterHTML(h, "5h", true) + meterHTML(h, "7d", false)
-      : `<div class="subtle" style="padding:6px 0">No rate-limit data yet.</div>`}
-    ${meta ? `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:4px">${meta}</div>` : ""}
-    <div class="tok-actions">
-      <button class="btn primary act-select" ${isActive ? "disabled" : ""}>${isActive ? "Serving traffic" : "Set active"}</button>
-      <button class="btn ghost act-probe">Test</button>
-      <span class="grow"></span>
-      <button class="btn mini act-reveal" title="Reveal token" aria-label="Reveal token">${SVG.eye}</button>
-      <button class="btn mini act-edit" title="Edit / rotate token" aria-label="Edit token">${SVG.edit}</button>
-      <button class="btn mini del act-delete" title="Delete token" aria-label="Delete token">${SVG.trash}</button>
-    </div>
-    ${hasData ? `<details class="raw"><summary>Diagnostics</summary><table class="rawtable">${rawRows}</table></details>` : ""}`;
-}
-function renderTokens() {
-  const box = $("#tokens");
-  $("#tokCount").textContent = String(state.tokens.length);
-  const seen = new Set();
-  state.tokens.forEach(name => {
-    seen.add(name);
-    let card = tokRefs.get(name);
-    if (!card) {
-      card = document.createElement("div");
-      card.className = "tok";
-      tokRefs.set(name, card);
-      box.appendChild(card);
-    }
-    card.classList.toggle("is-active", name === state.active);
-    const html = tokenCardHTML(name);
-    if (card._html === html) return;   // unchanged: keep focus and open panels
-    const wasOpen = card.querySelector("details.raw")?.open;
-    card.innerHTML = html; card._html = html;
-    if (wasOpen) { const d = card.querySelector("details.raw"); if (d) d.open = true; }
-    card.querySelector(".act-select").onclick = () => selectToken(name);
-    card.querySelector(".act-probe").onclick = e => probeToken(name, e.currentTarget);
-    card.querySelector(".act-reveal").onclick = () => revealToken(name);
-    card.querySelector(".act-edit").onclick = () => editToken(name);
-    card.querySelector(".act-delete").onclick = () => deleteToken(name);
   });
-  for (const [name, card] of tokRefs) {
-    if (!seen.has(name)) { card.remove(); tokRefs.delete(name); }
-  }
+}
+
+const tipEl = () => $("#tip");
+function showTip(ev, title, rows) {
+  const node = tipEl();
+  node.innerHTML = `<div class="tt">${esc(title)}</div>` +
+    rows.map(([k, v]) => `<div class="tr"><span>${esc(k)}</span><span>${esc(v)}</span></div>`).join("");
+  node.classList.add("show");
+  node.setAttribute("aria-hidden", "false");
+  const r = node.getBoundingClientRect();
+  node.style.left = Math.min(window.innerWidth - r.width - 10, Math.max(8, ev.clientX + 12)) + "px";
+  node.style.top = Math.max(8, ev.clientY - r.height - 12) + "px";
+}
+function hideTip() {
+  tipEl().classList.remove("show");
+  tipEl().setAttribute("aria-hidden", "true");
 }
 
 // =====================================================================
-// CLIENTS
+// CLIENTS — split view: list on the left, detail on the right
 // =====================================================================
-const clientOpen = new Set();
-const clientRefs = new Map();
-const clientScope = new Map();
+const PERIODS = [
+  ["hour", "per hour", "resets on the hour"],
+  ["day", "per day", "resets at local midnight"],
+  ["week", "per week", "resets Monday midnight"],
+  ["month", "per month", "resets on the 1st"],
+];
+// Short labels: the control sits in a narrow pane and a native select gives
+// its dropdown arrow priority over the text.
+const SORTS = [
+  ["spend7d", "7d spend"], ["today", "Today"],
+  ["requests", "Requests"], ["name", "Name"],
+];
 const SCOPES = [["1d", "Today"], ["7d", "7 days"], ["30d", "30 days"], ["all", "All-time"]];
-const PERIOD_LABEL = { hour: "per hour", day: "per day", week: "per week", month: "per month" };
 
-function limitChip(limits) {
-  if (!limits || !limits.length) return "";
-  const w = limits[0];   // the server sorts tightest-first
-  const s = w.over ? "crit" : w.ratio >= 0.8 ? "warn" : "good";
-  const text = w.over
-    ? `over ${usd(w.limit_usd)} ${PERIOD_LABEL[w.period]}`
-    : `${usd(w.spent_usd)} / ${usd(w.limit_usd)} ${PERIOD_LABEL[w.period]}`;
-  return badge(s, text);
+const Clients = {
+  mounted: false,
+  selected: null,
+  query: "",
+  sort: "spend7d",
+  scope: "1d",
+  limitsDirty: false,     // never overwrite caps the operator is editing
+  saving: false,
+
+  mount() {
+    if (this.mounted) return;
+    this.mounted = true;
+    const root = clear($("#view-clients"));
+
+    const listPane = el("div.cl-list",
+      el("div.cl-toolbar",
+        el("input.inp.cl-search", {
+          type: "search", placeholder: "Search clients…", "aria-label": "Search clients",
+          autocomplete: "off", spellcheck: "false",
+          oninput: e => { this.query = e.target.value.trim().toLowerCase(); this.renderList(); },
+        }),
+        el("select.inp.cl-sort", {
+          "aria-label": "Sort clients",
+          onchange: e => { this.sort = e.target.value; this.renderList(); },
+        }, ...SORTS.map(([v, l]) => el("option", { value: v, text: l })))),
+      el("div.cl-rows", { "data-ref": "rows", role: "listbox", "aria-label": "Clients" }),
+      el("div.cl-foot",
+        el("button.btn.sm.primary", { type: "button", onclick: () => addKey() }, "+ Add key")));
+
+    const detail = el("div.cl-detail", { "data-ref": "detail" });
+    root.appendChild(el("div.cl-split", listPane, detail));
+    this.refs = refs(root);
+    this.buildDetail();
+  },
+
+  buildDetail() {
+    const d = clear(this.refs.detail);
+
+    d.appendChild(el("div.cl-empty", { "data-ref": "empty" },
+      el("div.empty", { text: "Select a client to see its usage and limits." })));
+
+    d.appendChild(el("div.cl-body", { "data-ref": "body" },
+      // --- header -------------------------------------------------
+      el("div.cl-head",
+        el("div.cl-title",
+          el("h3", { "data-ref": "name" }),
+          el("span", { "data-ref": "capBadge" })),
+        el("div.cl-sub",
+          el("span.mono", { "data-ref": "keyPreview" }),
+          el("span", { "data-ref": "traffic" })),
+        el("div.cl-actions",
+          btn("View requests", SVG.list, () => {
+            requestFilters.key = this.selected;
+            $("#fKey").value = this.selected;
+            go("requests");
+            Requests.reload(true);
+          }),
+          btn("Reveal key", SVG.eye, () => revealKey(this.selected)),
+          btn("Rotate", SVG.rotate, () => rotateKey(this.selected)),
+          btn("Rename", SVG.rename, () => renameKey(this.selected)),
+          btn("Delete", SVG.trash, () => deleteKey(this.selected), "danger"))),
+
+      // --- spend windows ------------------------------------------
+      el("div.wins", { "data-ref": "wins" }),
+
+      // --- daily chart --------------------------------------------
+      el("div.eyebrow", { text: "Daily spend", style: "margin-top:20px" }),
+      el("div", { "data-ref": "chart" }),
+
+      // --- limits editor ------------------------------------------
+      el("div.cl-section",
+        el("div.cl-section-head",
+          el("span.eyebrow", { text: "Spend limits" }),
+          el("span.rule"),
+          el("span.cl-savestate", { "data-ref": "saveState" })),
+        el("div.lim-rows", { "data-ref": "limRows" }),
+        el("div.cl-section-foot",
+          el("button.btn.primary.sm", {
+            "data-ref": "saveBtn", type: "button", disabled: true,
+            onclick: () => this.saveLimits(),
+          }, "Save limits"),
+          el("button.btn.ghost.sm", {
+            "data-ref": "revertBtn", type: "button", disabled: true,
+            onclick: () => { this.limitsDirty = false; this.renderDetail(); },
+          }, "Revert"),
+          el("span.grow"),
+          el("button.btn.ghost.sm", { type: "button", onclick: () => this.clearLimits() }, "Remove all caps"))),
+
+      // --- per-model ----------------------------------------------
+      el("div.cl-section",
+        el("div.cl-section-head",
+          el("span.eyebrow", { text: "By model" }),
+          el("span.rule"),
+          el("div.seg", { "data-ref": "scopeSeg", role: "group", "aria-label": "Model breakdown period" },
+            ...SCOPES.map(([k, label]) => el("button", {
+              type: "button", "data-scope": k,
+              onclick: () => { this.scope = k; this.renderDetail(); },
+            }, label)))),
+        el("div.tbl-scroll", el("table.tbl",
+          el("thead", el("tr", el("th", { text: "Model" }), el("th.r", { text: "Cost" }),
+            el("th.r", { text: "Req" }), el("th.r", { text: "Input" }), el("th.r", { text: "Output" }),
+            el("th.r", { text: "Cache rd" }), el("th.r", { text: "Cache wr" }))),
+          el("tbody", { "data-ref": "modelRows" }))),
+        el("div.empty", { "data-ref": "modelEmpty", text: "No usage in this period." }))));
+
+    // The four cap rows are built once; only their values change.
+    const rowsBox = d.querySelector("[data-ref=limRows]");
+    for (const [period, label, hint] of PERIODS) {
+      rowsBox.appendChild(el("div.lim-row",
+        el("div.lim-label", el("div.lim-period", { text: label }), el("div.lim-hint", { text: hint })),
+        el("div.lim-field",
+          el("span.lim-currency", { text: "$" }),
+          el("input.inp.lim-input", {
+            type: "number", min: "0", step: "0.01", placeholder: "no cap",
+            "data-period": period, "aria-label": label + " spend limit",
+            oninput: () => this.markDirty(),
+            onkeydown: e => { if (e.key === "Enter") { e.preventDefault(); this.saveLimits(); } },
+          })),
+        el("div.lim-usage",
+          el("div.track.thin", el("div.bar", { "data-ref": "bar-" + period })),
+          el("div.lim-text", { "data-ref": "text-" + period }))));
+    }
+    this.d = refs(this.refs.detail);
+  },
+
+  markDirty() {
+    this.limitsDirty = true;
+    this.d.saveBtn.disabled = false;
+    this.d.revertBtn.disabled = false;
+    cls(this.d.saveState, "ok", false);
+    cls(this.d.saveState, "dirty", true);
+    txt(this.d.saveState, "unsaved changes");
+  },
+
+  /** The rows, filtered and sorted. */
+  rows() {
+    const out = (state.virtual_keys || []).map(vk => {
+      const w = vk.windows || {};
+      let req = 0, cost = 0;
+      for (const m of Object.values(vk.usage || {})) { req += m.requests || 0; cost += m.cost_usd || 0; }
+      const caps = vk.limits || [];
+      return {
+        name: vk.name, preview: vk.preview || "", limits: caps, daily: vk.daily || [],
+        windows: w, lifetime: vk.usage || {}, req, cost,
+        today: w["1d"]?.cost_usd || 0, week: w["7d"]?.cost_usd || 0,
+        worst: caps.length ? caps[0] : null,   // the server sorts tightest-first
+      };
+    });
+    const by = {
+      spend7d: (a, b) => b.week - a.week || b.cost - a.cost,
+      today: (a, b) => b.today - a.today,
+      requests: (a, b) => b.req - a.req,
+      name: (a, b) => a.name.localeCompare(b.name),
+    }[this.sort];
+    return out.sort(by);
+  },
+
+  visible() {
+    return this.rows().filter(r => !this.query || r.name.toLowerCase().includes(this.query));
+  },
+
+  update() {
+    this.mount();
+    const all = this.rows();
+    // Keep the selection if it still exists; otherwise fall to the busiest.
+    const names = new Set(all.map(r => r.name));
+    if (!this.selected || !names.has(this.selected)) {
+      this.selected = all[0]?.name || null;
+      this.limitsDirty = false;
+    }
+    txt($("#clientCount"), String(all.length));
+    val(this.refs.root.querySelector(".cl-sort"), this.sort);
+    this.renderList();
+    this.renderDetail();
+  },
+
+  renderList() {
+    const rows = this.visible();
+    list(this.refs.rows, rows, {
+      key: r => r.name,
+      create: r => el("button.cl-row", {
+        type: "button", role: "option", "data-name": r.name,
+        onclick: () => this.select(r.name),
+      },
+        el("span.cl-dot"),
+        el("span.cl-main", el("span.cl-name"), el("span.cl-meta")),
+        el("span.cl-spend")),
+      update: (node, r) => {
+        const s = r.worst ? (r.worst.over ? "crit" : r.worst.ratio >= 0.8 ? "warn" : "good") : null;
+        cls(node, "sel", r.name === this.selected);
+        att(node, "aria-selected", String(r.name === this.selected));
+        sty(node.children[0], "background", s ? sevMark(s) : "var(--surface-3)");
+        att(node.children[0], "title", s
+          ? `${pct(r.worst.ratio)}% of the ${r.worst.period} cap` : "no spend cap");
+        txt(node.children[1].children[0], r.name);
+        txt(node.children[1].children[1], r.worst
+          ? `${pct(r.worst.ratio)}% of ${usd(r.worst.limit_usd)}/${r.worst.period}`
+          : `${fmt(r.req)} requests`);
+        txt(node.children[2], usd(this.sort === "today" ? r.today : r.week));
+      },
+    });
+    const none = this.refs.rows.querySelector(".cl-none");
+    if (!rows.length && !none) {
+      this.refs.rows.appendChild(el("div.empty.cl-none", { text: "No clients match." }));
+    } else if (rows.length && none) {
+      none.remove();
+    }
+  },
+
+  select(name) {
+    if (name === this.selected) return;
+    this.selected = name;
+    this.limitsDirty = false;
+    if (location.hash !== `#clients/${enc(name)}`) {
+      history.replaceState(null, "", `#clients/${enc(name)}`);
+    }
+    this.renderList();
+    this.renderDetail();
+  },
+
+  renderDetail() {
+    const r = this.rows().find(x => x.name === this.selected);
+    cls(this.d.empty, "hide", !!r);
+    cls(this.d.body, "hide", !r);
+    if (!r) return;
+
+    txt(this.d.name, r.name);
+    html(this.d.capBadge, r.worst
+      ? badgeHTML(r.worst.over ? "crit" : r.worst.ratio >= 0.8 ? "warn" : "good",
+        r.worst.over ? `over ${usd(r.worst.limit_usd)} ${r.worst.period}`
+          : `${pct(r.worst.ratio)}% of ${usd(r.worst.limit_usd)}/${r.worst.period}`)
+      : badgeHTML("neutral", "no cap"));
+    txt(this.d.keyPreview, r.preview || "vk-…");
+    txt(this.d.traffic, r.req ? `· ${fmt(r.req)} requests all-time · ${usd(r.cost)}` : "· no traffic yet");
+
+    const wins = [["1d", "Today"], ["3d", "3 days"], ["7d", "7 days"], ["30d", "30 days"]];
+    list(this.d.wins, wins.map(([k, label]) => ({ k, label, d: r.windows[k] || {} })), {
+      key: x => x.k,
+      create: () => el("div.win", el("div.k"), el("div.v"), el("div.sub")),
+      update: (node, x) => {
+        cls(node, "lead", x.k === "1d");
+        txt(node.children[0], x.label);
+        txt(node.children[1], usd(x.d.cost_usd));
+        txt(node.children[2], `${fmt(x.d.requests)} req · ${fmt(tokTotal(x.d))} tok`);
+      },
+    });
+
+    barChart(this.d.chart, r.daily || [], {
+      value: p => p.cost_usd, label: p => p.date, format: usd, note: state.timezone || "",
+      tip: p => [p.date, [["Spend", usd(p.cost_usd)], ["Requests", fmt(p.requests)]]],
+    });
+
+    this.renderLimits(r);
+    this.renderModels(r);
+  },
+
+  renderLimits(r) {
+    const byPeriod = {};
+    for (const l of r.limits || []) byPeriod[l.period] = l;
+    for (const [period] of PERIODS) {
+      const l = byPeriod[period];
+      const input = this.d.limRows.querySelector(`input[data-period="${period}"]`);
+      // Only push server values into the field when the operator isn't editing,
+      // so a live frame can never overwrite a number being typed.
+      if (!this.limitsDirty) val(input, l ? String(l.limit_usd) : "");
+      const s = l ? (l.over ? "crit" : l.ratio >= 0.8 ? "warn" : "good") : null;
+      const bar = this.d["bar-" + period];
+      sty(bar, "width", l ? Math.min(100, Math.round(l.ratio * 100)) + "%" : "0%");
+      sty(bar, "background", s ? sevMark(s) : "var(--surface-3)");
+      const text = this.d["text-" + period];
+      if (l) {
+        countdown(text, l.resets_at, `${usd(l.spent_usd)} of ${usd(l.limit_usd)} · resets `);
+        sty(text, "color", s ? sevInk(s) : "var(--muted)");
+      } else {
+        countdowns.delete(text);
+        txt(text, "no cap");
+        sty(text, "color", "var(--muted)");
+      }
+    }
+    if (!this.limitsDirty && !this.saving) {
+      this.d.saveBtn.disabled = true;
+      this.d.revertBtn.disabled = true;
+      cls(this.d.saveState, "dirty", false);
+      if (!this.d.saveState.__ok) txt(this.d.saveState, "");
+    }
+  },
+
+  renderModels(r) {
+    const source = this.scope === "all" ? r.lifetime : ((r.windows[this.scope] || {}).models || {});
+    const models = Object.entries(source)
+      .sort((a, b) => (b[1].cost_usd || 0) - (a[1].cost_usd || 0) || tokTotal(b[1]) - tokTotal(a[1]));
+    $$("[data-scope]", this.d.scopeSeg).forEach(b =>
+      att(b, "aria-pressed", String(b.dataset.scope === this.scope)));
+    cls(this.d.modelEmpty, "hide", models.length > 0);
+    list(this.d.modelRows, models.map(([name, m], i) => ({ name, m, i })), {
+      key: x => x.name,
+      create: () => el("tr",
+        el("td.name", el("span.swatch", { style: "display:inline-block" }), el("span")),
+        el("td.r.strong"), el("td.r"), el("td.r"), el("td.r"), el("td.r"), el("td.r")),
+      update: (node, x) => {
+        sty(node.children[0].children[0], "background", SERIES[x.i % SERIES.length]);
+        txt(node.children[0].children[1], " " + x.name);
+        txt(node.children[1], usd(x.m.cost_usd));
+        txt(node.children[2], fmt(x.m.requests));
+        txt(node.children[3], fmt(x.m.input_tokens));
+        txt(node.children[4], fmt(x.m.output_tokens));
+        txt(node.children[5], fmt(x.m.cache_read_input_tokens));
+        txt(node.children[6], fmt(x.m.cache_creation_input_tokens));
+      },
+    });
+  },
+
+  /** Read the four fields; returns null (and complains) on bad input. */
+  readLimits() {
+    const limits = {};
+    for (const [period, label] of PERIODS) {
+      const input = this.d.limRows.querySelector(`input[data-period="${period}"]`);
+      const raw = (input.value || "").replace(/^\$/, "").trim();
+      if (!raw) continue;
+      const v = Number(raw);
+      if (!isFinite(v) || v < 0) {
+        toast("err", `“${raw}” isn't a valid amount ${label}`);
+        input.focus();
+        return null;
+      }
+      if (v > 0) limits[period] = v;
+    }
+    return limits;
+  },
+
+  async saveLimits() {
+    if (this.saving) return;
+    const name = this.selected;
+    const limits = this.readLimits();
+    if (limits === null) return;
+    this.saving = true;
+    this.d.saveBtn.disabled = true;
+    cls(this.d.saveState, "dirty", true);
+    txt(this.d.saveState, "saving…");
+    try {
+      const d = await api("PUT", "/virtual-keys/" + enc(name) + "/limits", { limits });
+      // Apply the server's own evaluation straight away rather than waiting for
+      // the next state push. That is what makes a save look instant, and it is
+      // authoritative: `status` is computed from the values just persisted.
+      const vk = (state.virtual_keys || []).find(v => v.name === name);
+      if (vk) vk.limits = d.status || [];
+      this.limitsDirty = false;
+      this.saving = false;
+      this.renderList();
+      this.renderDetail();
+      const n = Object.keys(limits).length;
+      this.flashSaved(n ? `Saved ${n} cap${n > 1 ? "s" : ""}` : "Caps removed");
+      refresh();   // reconcile the rest of the dashboard in the background
+    } catch (err) {
+      this.saving = false;
+      this.d.saveBtn.disabled = false;
+      txt(this.d.saveState, "");
+      cls(this.d.saveState, "dirty", false);
+      toast("err", "Couldn't save limits: " + err.message);
+    }
+  },
+
+  async clearLimits() {
+    if (!await confirmDialog({
+      title: `Remove all caps on “${this.selected}”?`,
+      message: "This client will be able to spend without a limit.",
+      confirmLabel: "Remove caps", danger: true,
+    })) return;
+    for (const [period] of PERIODS) {
+      this.d.limRows.querySelector(`input[data-period="${period}"]`).value = "";
+    }
+    this.markDirty();
+    await this.saveLimits();
+  },
+
+  flashSaved(msg) {
+    const node = this.d.saveState;
+    node.__ok = true;
+    cls(node, "dirty", false);
+    cls(node, "ok", true);
+    txt(node, msg);
+    clearTimeout(node.__timer);
+    node.__timer = setTimeout(() => {
+      node.__ok = false;
+      cls(node, "ok", false);
+      txt(node, "");
+    }, 2600);
+  },
+};
+
+function btn(label, icon, onclick, kind = "") {
+  return el("button.btn.sm" + (kind ? "." + kind : ""), { type: "button", onclick },
+    el("span.btn-ico", { html: icon }), label);
 }
-function winsHTML(w) {
-  return `<div class="wins">` + [["1d", "Today"], ["3d", "3 days"], ["7d", "7 days"], ["30d", "30 days"]].map(([k, label], i) => {
-    const d = w[k] || {};
-    return `<div class="win ${i === 0 ? "lead" : ""}">
-      <div class="k">${label}</div>
-      <div class="v">${usd(d.cost_usd)}</div>
-      <div class="sub">${fmt(d.requests)} req · ${fmt(tokTotal(d))} tok</div>
-    </div>`;
-  }).join("") + `</div>`;
-}
-function capsHTML(limits) {
-  const body = (limits && limits.length) ? limits.map(l => {
-    const s = l.over ? "crit" : l.ratio >= 0.8 ? "warn" : "good";
-    return `<div class="cap">
-      <div class="cap-row">
-        <span class="period">${esc(PERIOD_LABEL[l.period] || l.period)}</span>
-        <span class="amt" style="color:${sevInk(s)}">${usd(l.spent_usd)}</span>
-        <span style="color:var(--muted)">of ${usd(l.limit_usd)}</span>
-        <span class="reset" data-reset="${l.resets_at || ""}">resets ${fmtReset(l.resets_at)}</span>
-      </div>
-      <div class="track thin"><div class="bar" style="width:${Math.min(100, Math.round(l.ratio * 100))}%;background:${sevMark(s)}"></div></div>
-    </div>`;
-  }).join("") : `<div class="subtle" style="font-style:italic">No spend limits — this client can spend without a cap.</div>`;
-  return `<div class="caps"><div class="eyebrow" style="margin-bottom:8px">Spend limits</div>${body}</div>`;
-}
-function clientInnerHTML(t, max) {
-  const scope = clientScope.get(t.name) || "1d";
-  const models = Object.entries(scope === "all" ? t.lifetime : ((t.windows[scope] || {}).models || {}))
-    .sort((a, b) => (b[1].cost_usd || 0) - (a[1].cost_usd || 0) || tokTotal(b[1]) - tokTotal(a[1]));
-  const rows = models.map(([mn, m], i) => `<tr>
-    <td class="name"><span class="swatch" style="display:inline-block;background:${SERIES[i % SERIES.length]}"></span> ${esc(mn)}</td>
-    <td class="strong">${usd(m.cost_usd)}</td><td>${fmt(m.requests)}</td><td>${fmt(m.input_tokens)}</td>
-    <td>${fmt(m.output_tokens)}</td><td>${fmt(m.cache_read_input_tokens)}</td><td>${fmt(m.cache_creation_input_tokens)}</td>
-  </tr>`).join("");
-  const share = Math.round(t.rank / max * 100);
-  const daily = (t.daily || []).map(d => ({ ...d, value: d.cost_usd, label: d.date }));
-  return `<button class="client-head" aria-expanded="${clientOpen.has(t.name)}" style="--sh:${share}%"
-      title="${share}% of the busiest client's recent spend">
-      <span class="client-id">
-        <svg class="caret" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
-        <span class="name">${esc(t.name)}</span>
-        ${limitChip(t.limits)}
-      </span>
-      <span class="client-nums">
-        <span class="cn"><div class="v">${usd(t.today)}</div><div class="k">today</div></span>
-        <span class="cn"><div class="v">${usd(t.week)}</div><div class="k">7d</div></span>
-        <span class="cn"><div class="v">${fmt(t.req)}</div><div class="k">req</div></span>
-      </span>
-    </button>
-    <div class="client-body">
-      ${winsHTML(t.windows)}
-      ${daily.length ? `<div class="eyebrow" style="margin-top:16px">Daily spend</div>${barChart(daily, { sub: () => state.timezone || "" })}` : ""}
-      ${capsHTML(t.limits)}
-      <div class="client-actions">
-        <button class="btn ck-limits" type="button">${SVG.gauge} Set limits</button>
-        <button class="btn ck-requests" type="button">${SVG.eye} View requests</button>
-        <button class="btn ck-reveal" type="button">${SVG.eye} Reveal key</button>
-        <button class="btn ck-rotate" type="button">${SVG.rotate} Rotate</button>
-        <button class="btn ck-rename" type="button">${SVG.rename} Rename</button>
-        <button class="btn danger ck-delete" type="button">${SVG.trash} Delete</button>
-        <span class="ckey" title="Masked — use Reveal for the full key">${esc(t.preview || "vk-…")}</span>
-      </div>
-      <div class="seg" role="group" aria-label="Model breakdown period" style="margin:14px 0 8px">
-        ${SCOPES.map(([k, label]) => `<button type="button" data-scope="${k}" aria-pressed="${scope === k}">${label}</button>`).join("")}
-      </div>
-      ${models.length ? `<div class="tbl-scroll"><table class="tbl"><thead><tr><th>Model</th><th class="r">Cost</th><th class="r">Req</th><th class="r">Input</th><th class="r">Output</th><th class="r">Cache rd</th><th class="r">Cache wr</th></tr></thead><tbody>${rows}</tbody></table></div>`
-      : `<div class="empty">No usage in this period.</div>`}
-    </div>`;
-}
-function bindClient(el, nm, daily) {
-  el.querySelector(".client-head").onclick = () => {
-    if (clientOpen.has(nm)) clientOpen.delete(nm); else clientOpen.add(nm);
-    el.classList.toggle("open");
-    el.querySelector(".client-head").setAttribute("aria-expanded", clientOpen.has(nm));
-  };
-  $$("[data-scope]", el).forEach(b => b.addEventListener("click", () => {
-    clientScope.set(nm, b.dataset.scope);
-    renderClients();
-  }));
-  bindChart(el, daily, p => [p.date, [["Spend", usd(p.cost_usd)], ["Requests", fmt(p.requests)]]]);
-  el.querySelector(".ck-limits")?.addEventListener("click", () => editLimits(nm));
-  el.querySelector(".ck-requests")?.addEventListener("click", () => { filters.key = nm; $("#fKey").value = nm; go("requests"); loadRequests(true); });
-  el.querySelector(".ck-reveal")?.addEventListener("click", () => revealKey(nm));
-  el.querySelector(".ck-rotate")?.addEventListener("click", () => rotateKey(nm));
-  el.querySelector(".ck-rename")?.addEventListener("click", () => renameKey(nm));
-  el.querySelector(".ck-delete")?.addEventListener("click", () => deleteKey(nm));
-}
-function renderClients() {
-  const box = $("#clients");
-  const vks = state.virtual_keys || [];
-  $("#clientCount").textContent = String(vks.length);
-  const totals = vks.map(vk => {
-    const windows = vk.windows || {};
-    const lifetime = vk.usage || {};
-    let req = 0, cost = 0;
-    for (const m of Object.values(lifetime)) { req += m.requests || 0; cost += m.cost_usd || 0; }
-    const today = windows["1d"]?.cost_usd || 0;
-    const week = windows["7d"]?.cost_usd || 0;
-    return {
-      name: vk.name, preview: vk.preview || "", limits: vk.limits || [], daily: vk.daily || [],
-      windows, lifetime, req, cost, today, week,
-      rank: week || cost,   // rank by recent spend — the number an operator acts on
-    };
-  }).sort((a, b) => b.rank - a.rank || b.cost - a.cost);
-  if (!totals.length) {
-    box.innerHTML = `<div class="card"><div class="empty">No clients configured.</div></div>`;
-    clientRefs.clear();
+
+// =====================================================================
+// UPSTREAMS
+// =====================================================================
+const Upstreams = {
+  mounted: false,
+  mount() {
+    if (this.mounted) return;
+    this.mounted = true;
+    this.box = $("#tokens");
+    this.log = $("#log");
+  },
+  update() {
+    this.mount();
+    txt($("#tokCount"), String(state.tokens.length));
+    list(this.box, state.tokens.map(n => ({ name: n })), {
+      key: t => t.name,
+      create: t => {
+        const node = el("div.tok",
+          el("div.tok-top", el("span.tok-name", { text: t.name }), el("span", { "data-ref": "badges" })),
+          el("div.tok-preview", { "data-ref": "preview" }),
+          el("div", { "data-ref": "meters" }),
+          el("div.tok-actions",
+            el("button.btn.primary.act-select", { type: "button", onclick: () => selectToken(t.name) }),
+            el("button.btn.ghost", { type: "button", onclick: e => probeToken(t.name, e.currentTarget) }, "Test"),
+            el("span.grow"),
+            el("button.btn.mini", { type: "button", title: "Reveal token", "aria-label": "Reveal token", html: SVG.eye, onclick: () => revealToken(t.name) }),
+            el("button.btn.mini", { type: "button", title: "Edit token", "aria-label": "Edit token", html: SVG.edit, onclick: () => editToken(t.name) }),
+            el("button.btn.mini.del", { type: "button", title: "Delete token", "aria-label": "Delete token", html: SVG.trash, onclick: () => deleteToken(t.name) })),
+          el("details.raw", { "data-ref": "raw" }, el("summary", { text: "Diagnostics" }),
+            el("table.rawtable", el("tbody", { "data-ref": "rawBody" }))));
+        node.__refs = refs(node);
+        return node;
+      },
+      update: (node, t) => {
+        const r = node.__refs;
+        const h = (state.headers || {})[t.name] || {};
+        const hl = healthLabel((state.health || {})[t.name]);
+        const isActive = t.name === state.active;
+        cls(node, "is-active", isActive);
+        html(r.badges,
+          (isActive ? badgeHTML("brand", "active") : "") +
+          (t.name === state.default_token ? badgeHTML("neutral", "default") : "") +
+          badgeHTML(hl.sev, hl.text));
+        txt(r.preview, (state.token_previews || {})[t.name] || "");
+        meters(r.meters, h);
+        const sel = node.querySelector(".act-select");
+        txt(sel, isActive ? "Serving traffic" : "Set active");
+        sel.disabled = isActive;
+        cls(r.raw, "hide", !Object.keys(h).length);
+        list(r.rawBody, Object.entries(h).sort((a, b) => a[0].localeCompare(b[0])).map(([k, v]) => ({ k, v })), {
+          key: x => x.k,
+          create: () => el("tr", el("td"), el("td")),
+          update: (n, x) => { txt(n.children[0], x.k); txt(n.children[1], x.v); },
+        });
+      },
+    });
+    this.renderLog();
+  },
+  renderLog() {
+    const logs = (state.rotation_log || []).slice().reverse();
+    if (!logs.length) {
+      if (this.log.__mode !== "empty") {
+        clear(this.log).appendChild(el("div.empty", { text: "No rotations yet." }));
+        this.log.__mode = "empty";
+      }
+      return;
+    }
+    if (this.log.__mode !== "rows") { clear(this.log); this.log.__mode = "rows"; }
+    list(this.log, logs, {
+      key: e => `${e.time}-${e.to}`,
+      create: () => el("div.logrow", el("div.when"), el("span")),
+      update: (node, e) => {
+        const sw = e.action === "switched";
+        cls(node, "switched", sw);
+        cls(node, "notify", !sw);
+        txt(node.children[0], new Date(e.time * 1000).toLocaleString());
+        html(node.children[1],
+          `${sw ? "Switched" : "Would switch"} <b>${esc(e.from)}</b> <span class="arrow">→</span> ` +
+          `<b>${esc(e.to)}</b> · ${esc(e.reason === "active_unusable" ? "active dead/rate-limited"
+            : `5h at ${Math.round((e.trigger_util_5h || 0) * 100)}%`)}`);
+      },
+    });
+  },
+};
+
+function meters(box, h) {
+  const rows = [["5h", true], ["7d", false]]
+    .filter(([p]) => h[`anthropic-ratelimit-unified-${p}-utilization`] !== undefined)
+    .map(([p, big]) => ({
+      p, big,
+      u: h[`anthropic-ratelimit-unified-${p}-utilization`],
+      reset: h[`anthropic-ratelimit-unified-${p}-reset`],
+    }));
+  if (!rows.length) {
+    if (box.__mode !== "empty") {
+      clear(box).appendChild(el("div.subtle", { text: "No rate-limit data yet.", style: "padding:6px 0" }));
+      box.__mode = "empty";
+    }
     return;
   }
-  const max = Math.max(1e-9, ...totals.map(t => t.rank));
-  const seen = new Set();
-  totals.forEach(t => {
-    seen.add(t.name);
-    let el = clientRefs.get(t.name);
-    if (!el) {
-      el = document.createElement("div");
-      el.className = "client";
-      el.dataset.name = t.name;
-      clientRefs.set(t.name, el);
-    }
-    const html = clientInnerHTML(t, max);
-    if (el._html !== html) {
-      el.innerHTML = html; el._html = html;
-      bindClient(el, t.name, (t.daily || []).map(d => ({ ...d, value: d.cost_usd, label: d.date })));
-    }
-    el.classList.toggle("open", clientOpen.has(t.name));
-    box.appendChild(el);   // reorder into sorted position; a no-op if already there
+  if (box.__mode !== "rows") { clear(box); box.__mode = "rows"; }
+  list(box, rows, {
+    key: r => r.p,
+    create: () => el("div.meter",
+      el("div.meter-row", el("span.period"), el("span.pct"), el("span.reset")),
+      el("div.track", el("div.bar"))),
+    update: (node, r) => {
+      const s = sev(r.u);
+      txt(node.children[0].children[0], r.p);
+      txt(node.children[0].children[1], pct(r.u) + "%");
+      sty(node.children[0].children[1], "color", sevInk(s));
+      countdown(node.children[0].children[2], r.reset, "resets ");
+      cls(node.children[1], "thin", !r.big);
+      sty(node.children[1].firstChild, "width", Math.min(100, pct(r.u)) + "%");
+      sty(node.children[1].firstChild, "background", sevMark(s));
+    },
   });
-  for (const [name, el] of clientRefs) {
-    if (!seen.has(name)) { el.remove(); clientRefs.delete(name); }
-  }
-  const live = new Set(clientRefs.values());
-  Array.from(box.children).forEach(c => { if (!live.has(c)) c.remove(); });
 }
 
 // =====================================================================
 // REQUESTS — the audit log
 // =====================================================================
-const filters = { q: "", key: "", outcome: "", hours: "24" };
-let rows = [];              // newest first
-let liveTail = true;
-let maxId = 0, minId = 0;
-let tailTimer = null;
-let selectedId = null;
-let auditOverview = null;
-let auditModels = null;
+const requestFilters = { q: "", key: "", outcome: "", hours: "24" };
+
+const Requests = {
+  rows: [],
+  live: true,
+  maxId: 0,
+  minId: 0,
+  timer: null,
+  selectedId: null,
+
+  update() {
+    const a = state.audit || {};
+    txt($("#auditChip"), a.mode === "off" ? "auditing off"
+      : `${a.mode} · ${fmt(a.rows || 0)} kept · ${bytes(a.bytes || 0)}`);
+    txt($("#navReqCount"), auditOverview?.forwarded ? fmt(auditOverview.forwarded) : "");
+    this.syncKeyFilter();
+  },
+
+  syncKeyFilter() {
+    const sel = $("#fKey");
+    const names = (state.virtual_keys || []).map(v => v.name);
+    const sig = names.join("|");
+    if (sel.__sig === sig) return;
+    sel.__sig = sig;
+    const cur = sel.value;
+    clear(sel);
+    sel.appendChild(el("option", { value: "", text: "All clients" }));
+    names.forEach(n => sel.appendChild(el("option", { value: n, text: n })));
+    sel.value = cur;
+  },
+
+  query(extra) {
+    const p = new URLSearchParams();
+    if (requestFilters.q) p.set("q", requestFilters.q);
+    if (requestFilters.key) p.set("key", requestFilters.key);
+    if (requestFilters.outcome) p.set("outcome", requestFilters.outcome);
+    if (requestFilters.hours) p.set("since", String(Date.now() / 1000 - Number(requestFilters.hours) * 3600));
+    p.set("limit", "100");
+    for (const k in extra || {}) p.set(k, extra[k]);
+    return p.toString();
+  },
+
+  async reload(reset) {
+    if (reset) { this.rows = []; this.maxId = 0; this.minId = 0; }
+    try {
+      const d = await api("GET", "/requests?" + this.query(this.minId ? { before_id: this.minId } : {}));
+      const fresh = d.requests || [];
+      this.rows = reset ? fresh : this.rows.concat(fresh);
+      if (this.rows.length) {
+        this.maxId = Math.max(this.maxId, ...this.rows.map(r => r.id));
+        this.minId = Math.min(...this.rows.map(r => r.id));
+      }
+      this.render();
+    } catch (err) { toast("err", "Couldn't load requests: " + err.message); }
+  },
+
+  async tail() {
+    if (!this.live || currentView !== "requests" || document.hidden) return;
+    try {
+      const d = await api("GET", "/requests?" + this.query({ after_id: String(this.maxId), limit: "50" }));
+      const fresh = d.requests || [];
+      if (!fresh.length) return;
+      const ids = new Set(fresh.map(r => r.id));
+      this.rows = fresh.concat(this.rows.filter(r => !ids.has(r.id)));
+      this.maxId = Math.max(this.maxId, ...fresh.map(r => r.id));
+      if (!this.minId) this.minId = Math.min(...this.rows.map(r => r.id));
+      this.render(ids);
+    } catch (err) { /* a failed tail poll just retries next tick */ }
+  },
+
+  start() { this.stop(); this.timer = setInterval(() => this.tail(), 2500); },
+  stop() { if (this.timer) { clearInterval(this.timer); this.timer = null; } },
+
+  render(newIds) {
+    const body = $("#reqBody");
+    const empty = $("#reqEmpty");
+    txt($("#reqCount"), this.rows.length ? `${this.rows.length} shown` : "");
+    if (!this.rows.length) {
+      clear(body);
+      empty.hidden = false;
+      txt(empty, state?.audit?.mode === "off"
+        ? "Request auditing is turned off — enable it under Settings."
+        : "No requests match these filters.");
+      return;
+    }
+    empty.hidden = true;
+    list(body, this.rows, {
+      key: r => r.id,
+      create: r => {
+        const node = el("tr", { onclick: () => this.open(r.id) },
+          el("td.when"), el("td"), el("td.sum"), el("td"),
+          el("td.num"), el("td.num.r"), el("td.num.r"), el("td.num.r"));
+        if (newIds && newIds.has(r.id)) {
+          node.classList.add("newrow");
+          setTimeout(() => node.classList.remove("newrow"), 1200);
+        }
+        return node;
+      },
+      update: (node, r) => {
+        att(node, "aria-selected", String(r.id === this.selectedId));
+        const summary = r.summary || (r.outcome === "rejected" ? "(unauthenticated request)" : r.path || "");
+        txt(node.children[0], clock(r.ts));
+        att(node.children[0], "title", new Date(r.ts * 1000).toLocaleString());
+        html(node.children[1], outcomeBadge(r));
+        txt(node.children[2], summary);
+        att(node.children[2], "title", summary);
+        txt(node.children[3], r.key_name || "—");
+        txt(node.children[4], (r.model || "—").replace(/^claude-/, ""));
+        att(node.children[4], "title", r.model || "");
+        txt(node.children[5], fmt(tokTotal(r)));
+        txt(node.children[6], usd(r.cost_usd));
+        txt(node.children[7], ms(r.latency_ms));
+        att(node.children[7], "title", "TTFB " + ms(r.ttfb_ms));
+      },
+    });
+    $("#moreBtn").hidden = this.rows.length < 25;
+  },
+
+  async open(id) {
+    this.selectedId = id;
+    this.render();
+    $("#drawer").classList.add("open");
+    $("#drawer").setAttribute("aria-hidden", "false");
+    $("#drawerScrim").classList.add("open");
+    clear($("#drawerBody")).appendChild(el("div.skl", { style: "height:120px" }));
+    try {
+      const d = await api("GET", "/requests/" + id);
+      txt($("#drawerTitle"), `${d.model || d.path || "Request"} · ${clock(d.ts)}`);
+      $("#drawerBody").innerHTML = detailHTML(d);
+      $("#drawerCopy").onclick = async () => {
+        const ok = await copyText(JSON.stringify(d, null, 2), document.body);
+        toast(ok ? "ok" : "err", ok ? "Request JSON copied" : "Couldn't copy");
+      };
+    } catch (err) {
+      clear($("#drawerBody")).appendChild(el("div.empty", { text: err.message }));
+    }
+  },
+
+  close() {
+    $("#drawer").classList.remove("open");
+    $("#drawer").setAttribute("aria-hidden", "true");
+    $("#drawerScrim").classList.remove("open");
+    this.selectedId = null;
+    this.render();
+  },
+};
 
 function outcomeBadge(r) {
-  if (r.outcome === "blocked") return badge("warn", "over budget");
-  if (r.outcome === "rejected") return badge("crit", "rejected");
-  if (r.outcome === "error" || r.status >= 400) return badge("crit", String(r.status || "error"));
-  if (r.streamed) return badge("good", "stream");
-  return badge("good", "ok");
-}
-function reqRowHTML(r) {
-  const tokens = (r.input_tokens || 0) + (r.output_tokens || 0) + (r.cache_read_input_tokens || 0) + (r.cache_creation_input_tokens || 0);
-  const summary = r.summary || (r.outcome === "rejected" ? "(unauthenticated request)" : r.path || "");
-  return `<td class="when" title="${esc(new Date(r.ts * 1000).toLocaleString())}">${esc(clock(r.ts))}</td>
-    <td>${outcomeBadge(r)}</td>
-    <td class="sum" title="${esc(summary)}">${esc(summary)}</td>
-    <td>${esc(r.key_name || "—")}</td>
-    <td class="num" title="${esc(r.model || "")}">${esc((r.model || "—").replace(/^claude-/, ""))}</td>
-    <td class="num r">${esc(fmt(tokens))}</td>
-    <td class="num r">${esc(usd(r.cost_usd))}</td>
-    <td class="num r" title="TTFB ${esc(ms(r.ttfb_ms))}">${esc(ms(r.latency_ms))}</td>`;
-}
-function renderRequests(newIds) {
-  const body = $("#reqBody");
-  const empty = $("#reqEmpty");
-  $("#reqCount").textContent = rows.length ? `${rows.length} shown` : "";
-  $("#navReqCount").textContent = auditOverview?.requests ? fmt(auditOverview.requests) : "";
-  if (!rows.length) {
-    body.innerHTML = "";
-    empty.hidden = false;
-    empty.textContent = state?.audit?.mode === "off"
-      ? "Request auditing is turned off — enable it under Settings."
-      : "No requests match these filters.";
-    return;
-  }
-  empty.hidden = true;
-  // Keyed patch by row id, so a live tail prepends without redrawing (and
-  // un-selecting) everything already on screen.
-  const existing = new Map(Array.from(body.children).map(tr => [+tr.dataset.id, tr]));
-  const frag = document.createDocumentFragment();
-  for (const r of rows) {
-    let tr = existing.get(r.id);
-    if (!tr) {
-      tr = document.createElement("tr");
-      tr.dataset.id = r.id;
-      tr.innerHTML = reqRowHTML(r);
-      tr.onclick = () => openRequest(r.id);
-      if (newIds && newIds.has(r.id)) tr.classList.add("newrow");
-    } else {
-      existing.delete(r.id);
-    }
-    tr.setAttribute("aria-selected", String(r.id === selectedId));
-    frag.appendChild(tr);
-  }
-  for (const tr of existing.values()) tr.remove();
-  body.appendChild(frag);
-  $("#moreBtn").hidden = rows.length < 25;
+  if (r.outcome === "blocked") return badgeHTML("warn", "over budget");
+  if (r.outcome === "rejected") return badgeHTML("crit", "rejected");
+  if (r.outcome === "error" || r.status >= 400) return badgeHTML("crit", String(r.status || "error"));
+  return badgeHTML("good", r.streamed ? "stream" : "ok");
 }
 
-function queryString(extra) {
-  const p = new URLSearchParams();
-  if (filters.q) p.set("q", filters.q);
-  if (filters.key) p.set("key", filters.key);
-  if (filters.outcome) p.set("outcome", filters.outcome);
-  if (filters.hours) p.set("since", String(Date.now() / 1000 - Number(filters.hours) * 3600));
-  p.set("limit", "100");
-  for (const k in extra || {}) p.set(k, extra[k]);
-  return p.toString();
-}
-async function loadRequests(reset) {
-  if (reset) { rows = []; maxId = 0; minId = 0; }
-  try {
-    const d = await api("GET", "/requests?" + queryString(minId ? { before_id: minId } : {}));
-    const fresh = d.requests || [];
-    rows = reset ? fresh : rows.concat(fresh);
-    if (rows.length) {
-      maxId = Math.max(maxId, ...rows.map(r => r.id));
-      minId = Math.min(...rows.map(r => r.id));
-    }
-    renderRequests();
-  } catch (err) {
-    toast("err", "Couldn't load requests: " + err.message);
-  }
-}
-async function tailRequests() {
-  if (!liveTail || currentView !== "requests" || document.hidden) return;
-  try {
-    const d = await api("GET", "/requests?" + queryString({ after_id: String(maxId), limit: "50" }));
-    const fresh = d.requests || [];
-    if (!fresh.length) return;
-    const ids = new Set(fresh.map(r => r.id));
-    rows = fresh.concat(rows.filter(r => !ids.has(r.id)));
-    maxId = Math.max(maxId, ...fresh.map(r => r.id));
-    if (!minId) minId = Math.min(...rows.map(r => r.id));
-    renderRequests(ids);
-  } catch (err) { /* a failed tail poll just retries on the next tick */ }
-}
-function startTail() {
-  stopTail();
-  tailTimer = setInterval(tailRequests, 2500);
-}
-function stopTail() { if (tailTimer) { clearInterval(tailTimer); tailTimer = null; } }
-
-// ---- request detail drawer ----
-function turn(role, text, cls) {
+function turn(role, text, kind) {
   if (!text) return "";
-  return `<div class="turn ${cls || role}">
+  return `<div class="turn ${kind || role}">
     <div class="turn-head">${esc(role)}<span class="len">${esc(fmt(text.length))} chars</span></div>
     <div class="turn-body">${esc(text)}</div></div>`;
 }
+
 function blockText(content) {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return content == null ? "" : JSON.stringify(content, null, 2);
@@ -841,31 +1051,25 @@ function blockText(content) {
     return JSON.stringify(b);
   }).filter(Boolean).join("\n\n");
 }
-function renderDetail(d) {
+
+function detailHTML(d) {
   const req = d.request;
   const meta = [
-    ["Time", new Date(d.ts * 1000).toLocaleString()],
-    ["Client", d.key_name || "—"],
-    ["Model", d.model || "—"],
-    ["Status", String(d.status || "—")],
-    ["Outcome", d.outcome || "—"],
-    ["Upstream", d.token_name || "—"],
-    ["Attempts", String(d.attempts || 1)],
-    ["TTFB", ms(d.ttfb_ms)],
-    ["Total", ms(d.latency_ms)],
-    ["Input", fmt(d.input_tokens)],
-    ["Output", fmt(d.output_tokens)],
-    ["Cache read", fmt(d.cache_read_input_tokens)],
-    ["Cache write", fmt(d.cache_creation_input_tokens)],
-    ["Cost", usd(d.cost_usd)],
-    ["Client IP", d.client_ip || "—"],
-    ["Request ID", d.request_id || "—"],
+    ["Time", new Date(d.ts * 1000).toLocaleString()], ["Client", d.key_name || "—"],
+    ["Model", d.model || "—"], ["Status", String(d.status || "—")],
+    ["Outcome", d.outcome || "—"], ["Upstream", d.token_name || "—"],
+    ["Attempts", String(d.attempts || 1)], ["TTFB", ms(d.ttfb_ms)],
+    ["Total", ms(d.latency_ms)], ["Input", fmt(d.input_tokens)],
+    ["Output", fmt(d.output_tokens)], ["Cache read", fmt(d.cache_read_input_tokens)],
+    ["Cache write", fmt(d.cache_creation_input_tokens)], ["Cost", usd(d.cost_usd)],
+    ["Client IP", d.client_ip || "—"], ["Request ID", d.request_id || "—"],
   ];
   let body = `<div class="kv">${meta.map(([k, v]) =>
     `<div><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div></div>`).join("")}</div>`;
-
-  if (d.error) body += `<div class="turn"><div class="turn-head" style="color:var(--crit-ink)">Error</div><div class="turn-body">${esc(d.error)}</div></div>`;
-
+  if (d.error) {
+    body += `<div class="turn"><div class="turn-head" style="color:var(--crit-ink)">Error</div>
+      <div class="turn-body">${esc(d.error)}</div></div>`;
+  }
   if (req && typeof req === "object") {
     const params = ["max_tokens", "temperature", "top_p", "top_k", "stream", "stop_sequences"]
       .filter(k => req[k] !== undefined)
@@ -884,48 +1088,9 @@ function renderDetail(d) {
   } else {
     body += `<div class="subtle">No request body stored${state?.audit?.mode === "meta" ? " — auditing is in metadata-only mode." : "."}</div>`;
   }
-
   if (d.response) body += turn("response", d.response, "assistant");
   if (d.truncated) body += `<div class="subtle" style="margin-top:8px">⚠ Bodies were truncated to the configured per-request cap.</div>`;
   return body;
-}
-async function openRequest(id) {
-  selectedId = id;
-  renderRequests();
-  $("#drawer").classList.add("open");
-  $("#drawer").setAttribute("aria-hidden", "false");
-  $("#drawerScrim").classList.add("open");
-  $("#drawerBody").innerHTML = `<div class="skl" style="height:120px"></div>`;
-  try {
-    const d = await api("GET", "/requests/" + id);
-    $("#drawerTitle").textContent = `${d.model || d.path || "Request"} · ${clock(d.ts)}`;
-    $("#drawerBody").innerHTML = renderDetail(d);
-    $("#drawerCopy").onclick = async () => {
-      const ok = await copyText(JSON.stringify(d, null, 2), document.body);
-      toast(ok ? "ok" : "err", ok ? "Request JSON copied" : "Couldn't copy");
-    };
-  } catch (err) {
-    $("#drawerBody").innerHTML = `<div class="empty">${esc(err.message)}</div>`;
-  }
-}
-function closeDrawer() {
-  $("#drawer").classList.remove("open");
-  $("#drawer").setAttribute("aria-hidden", "true");
-  $("#drawerScrim").classList.remove("open");
-  selectedId = null;
-  renderRequests();
-}
-
-async function loadAuditSummary() {
-  try {
-    const [o, m] = await Promise.all([
-      api("GET", "/audit/overview?hours=24"),
-      api("GET", "/audit/models?hours=24"),
-    ]);
-    auditOverview = o;
-    auditModels = m.models || [];
-    if (state) { renderTiles(); renderLatency(); renderModels(); }
-  } catch (err) { /* the overview degrades to "no data" on its own */ }
 }
 
 // =====================================================================
@@ -961,167 +1126,215 @@ const CFG = [
 ];
 const cget = (o, p) => p.split(".").reduce((a, k) => (a && a[k] !== undefined ? a[k] : undefined), o);
 
-function buildForm() {
-  const cfg = state.config || {};
-  lastCfgJSON = JSON.stringify(cfg);
-  const f = $("#cfgForm");
-  f.innerHTML = CFG.map(grp => `<div class="cfg-group"><div class="glabel">${esc(grp.g)}</div>${grp.rows.map(([path, type, label, hint]) => {
-    const v = cget(cfg, path);
-    let ctl;
-    if (type === "bool") {
-      ctl = `<label class="switch"><input type="checkbox" data-path="${path}" data-type="bool" ${v ? "checked" : ""} aria-label="${esc(label)}"><span class="sl"></span></label>`;
-    } else if (type.startsWith("select:")) {
-      const opts = type.slice(7).split(",");
-      ctl = `<select class="inp" data-path="${path}" data-type="text" aria-label="${esc(label)}">${
-        opts.map(o => `<option value="${esc(o)}" ${o === v ? "selected" : ""}>${esc(o)}</option>`).join("")}</select>`;
-    } else if (type === "text") {
-      ctl = `<input class="inp wide" type="text" spellcheck="false" data-path="${path}" data-type="text" value="${esc(v)}" aria-label="${esc(label)}">`;
-    } else {
-      ctl = `<input class="inp" type="number" step="any" min="0" data-path="${path}" data-type="num" value="${esc(v)}" aria-label="${esc(label)}">`;
-    }
-    return `<div class="cfg-row"><span class="lab"><div class="t">${esc(label)}</div><div class="h">${esc(hint)}</div></span>${ctl}</div>`;
-  }).join("")}</div>`).join("") +
-    `<div class="cfg-foot"><button type="submit" class="btn primary" id="saveCfg">Save settings</button>
-     <button type="button" class="btn ghost" id="revertCfg">Revert</button></div>`;
-  $$("[data-path]", f).forEach(el => el.addEventListener("input", () => { cfgDirty = true; }));
-  f.onsubmit = saveConfig;
-  $("#revertCfg").onclick = () => { cfgDirty = false; buildForm(); toast("info", "Reverted to saved settings"); };
-}
-async function saveConfig(e) {
-  e.preventDefault();
-  const f = $("#cfgForm"), btn = $("#saveCfg");
-  const payload = {};
-  $$("[data-path]", f).forEach(el => {
-    const t = el.dataset.type;
-    const val = t === "bool" ? el.checked : t === "text" ? el.value.trim() : parseFloat(el.value);
-    const [a, b] = el.dataset.path.split(".");
-    if (b) { (payload[a] = payload[a] || {})[b] = val; } else { payload[a] = val; }
-  });
-  btn.disabled = true; btn.textContent = "Saving…";
-  try {
-    const d = await api("POST", "/config", payload);
-    cfgDirty = false;
-    state.config = d.config;
-    buildForm();
-    toast("ok", "Settings saved");
-  } catch (err) {
-    toast("err", "Couldn't save: " + err.message);
-  } finally {
-    btn.disabled = false; btn.textContent = "Save settings";
-  }
-}
+const Settings = {
+  built: false,
+  dirty: false,
 
-function renderAuditPanel() {
-  const a = state.audit || {};
-  const used = a.bytes || 0, cap = a.max_bytes || 1;
-  const ratio = Math.min(1, used / cap);
-  const s = ratio >= 0.9 ? "crit" : ratio >= 0.7 ? "warn" : "good";
-  const modeBadge = a.mode === "off" ? badge("neutral", "off")
-    : a.mode === "meta" ? badge("warn", "metadata only") : badge("good", "full capture");
-  const span = (a.oldest && a.newest)
-    ? `${ago(a.oldest)} of history` : "no records yet";
-  $("#auditPanel").innerHTML = `
-    <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap">
-      ${modeBadge}
-      <span class="chip">${esc(fmt(a.rows || 0))} requests</span>
-      <span class="chip">${esc(span)}</span>
-    </div>
-    <div class="meter">
-      <div class="meter-row">
-        <span class="period">storage</span>
-        <span class="pct" style="color:${sevInk(s)}">${esc(bytes(used))}</span>
-        <span class="reset">of ${esc(bytes(cap))} cap · ${esc(String(a.retention_days || 7))}d retention</span>
-      </div>
-      <div class="track"><div class="bar" style="width:${Math.round(ratio * 100)}%;background:${sevMark(s)}"></div></div>
-    </div>
-    <div class="subtle" style="margin:10px 0 14px">
-      Whichever limit bites first wins: records past ${esc(String(a.retention_days || 7))} days are dropped, and if the
-      file still exceeds the cap the oldest go too. Writes happen on a background
-      thread, so capture never adds latency to a request.
-      ${a.dropped ? `<br><b style="color:var(--warn-ink)">${esc(fmt(a.dropped))} record(s) dropped</b> — the writer fell behind a burst.` : ""}
-    </div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap">
-      <button class="btn sm" id="sweepAudit">Run retention now</button>
-      <button class="btn sm danger" id="purgeAudit">Purge all records</button>
-    </div>`;
-  $("#sweepAudit").onclick = async ev => {
-    const b = ev.currentTarget; b.disabled = true; b.textContent = "Sweeping…";
-    try { const d = await api("POST", "/audit/sweep"); toast("ok", `Removed ${d.removed_age + d.removed_size} record(s)`); await refresh(); }
-    catch (err) { toast("err", "Sweep failed: " + err.message); }
-    finally { b.disabled = false; b.textContent = "Run retention now"; }
-  };
-  $("#purgeAudit").onclick = async () => {
+  update() {
+    if (!this.built) this.build();
+    else if (!this.dirty) this.fill();
+    this.renderAudit();
+    this.renderPricing();
+  },
+
+  build() {
+    this.built = true;
+    const f = clear($("#cfgForm"));
+    for (const grp of CFG) {
+      const g = el("div.cfg-group", el("div.glabel", { text: grp.g }));
+      for (const [path, type, label, hint] of grp.rows) {
+        let ctl;
+        if (type === "bool") {
+          ctl = el("label.switch",
+            el("input", { type: "checkbox", "data-path": path, "data-type": "bool", "aria-label": label, onchange: () => this.markDirty() }),
+            el("span.sl"));
+        } else if (type.startsWith("select:")) {
+          ctl = el("select.inp", { "data-path": path, "data-type": "text", "aria-label": label, onchange: () => this.markDirty() },
+            ...type.slice(7).split(",").map(o => el("option", { value: o, text: o })));
+        } else if (type === "text") {
+          ctl = el("input.inp.wide", { type: "text", spellcheck: "false", "data-path": path, "data-type": "text", "aria-label": label, oninput: () => this.markDirty() });
+        } else {
+          ctl = el("input.inp", { type: "number", step: "any", min: "0", "data-path": path, "data-type": "num", "aria-label": label, oninput: () => this.markDirty() });
+        }
+        g.appendChild(el("div.cfg-row",
+          el("span.lab", el("div.t", { text: label }), el("div.h", { text: hint })), ctl));
+      }
+      f.appendChild(g);
+    }
+    f.appendChild(el("div.cfg-foot",
+      el("button.btn.primary#saveCfg", { type: "submit" }, "Save settings"),
+      el("button.btn.ghost", {
+        type: "button",
+        onclick: () => { this.dirty = false; this.fill(); toast("info", "Reverted to saved settings"); },
+      }, "Revert")));
+    f.onsubmit = e => this.save(e);
+    this.fill();
+  },
+
+  markDirty() { this.dirty = true; },
+
+  fill() {
+    const cfg = state.config || {};
+    for (const node of $$("[data-path]", $("#cfgForm"))) {
+      const v = cget(cfg, node.dataset.path);
+      if (node.type === "checkbox") { if (!isEditing(node)) node.checked = !!v; }
+      else val(node, v);
+    }
+  },
+
+  async save(e) {
+    e.preventDefault();
+    const b = $("#saveCfg");
+    const payload = {};
+    for (const node of $$("[data-path]", $("#cfgForm"))) {
+      const t = node.dataset.type;
+      const v = t === "bool" ? node.checked : t === "text" ? node.value.trim() : parseFloat(node.value);
+      const [a, sub] = node.dataset.path.split(".");
+      if (sub) { (payload[a] = payload[a] || {})[sub] = v; } else { payload[a] = v; }
+    }
+    b.disabled = true;
+    txt(b, "Saving…");
+    try {
+      const d = await api("POST", "/config", payload);
+      this.dirty = false;
+      state.config = d.config;
+      this.fill();
+      toast("ok", "Settings saved");
+    } catch (err) {
+      toast("err", "Couldn't save: " + err.message);
+    } finally {
+      b.disabled = false;
+      txt(b, "Save settings");
+    }
+  },
+
+  renderAudit() {
+    const a = state.audit || {};
+    const used = a.bytes || 0, cap = a.max_bytes || 1;
+    const ratio = Math.min(1, used / cap);
+    const s = ratio >= 0.9 ? "crit" : ratio >= 0.7 ? "warn" : "good";
+    const box = $("#auditPanel");
+    if (!box.__built) {
+      box.__built = true;
+      clear(box).appendChild(el("div", { style: "display:flex;align-items:center;gap:10px;margin-bottom:14px;flex-wrap:wrap" },
+        el("span", { "data-ref": "mode" }), el("span.chip", { "data-ref": "rows" }), el("span.chip", { "data-ref": "span" })));
+      box.appendChild(el("div.meter",
+        el("div.meter-row", el("span.period", { text: "storage" }),
+          el("span.pct", { "data-ref": "used" }), el("span.reset", { "data-ref": "cap" })),
+        el("div.track", el("div.bar", { "data-ref": "bar" }))));
+      box.appendChild(el("div.subtle", { "data-ref": "note", style: "margin:10px 0 14px" }));
+      box.appendChild(el("div", { style: "display:flex;gap:8px;flex-wrap:wrap" },
+        el("button.btn.sm", { type: "button", onclick: e => this.sweep(e.currentTarget) }, "Run retention now"),
+        el("button.btn.sm.danger", { type: "button", onclick: () => this.purge() }, "Purge all records")));
+      box.__refs = refs(box);
+    }
+    const r = box.__refs;
+    html(r.mode, a.mode === "off" ? badgeHTML("neutral", "off")
+      : a.mode === "meta" ? badgeHTML("warn", "metadata only") : badgeHTML("good", "full capture"));
+    txt(r.rows, `${fmt(a.rows || 0)} requests`);
+    txt(r.span, a.oldest && a.newest ? `${ago(a.oldest).replace(" ago", "")} of history` : "no records yet");
+    txt(r.used, bytes(used));
+    sty(r.used, "color", sevInk(s));
+    txt(r.cap, `of ${bytes(cap)} cap · ${a.retention_days || 7}d retention`);
+    sty(r.bar, "width", Math.round(ratio * 100) + "%");
+    sty(r.bar, "background", sevMark(s));
+    html(r.note, `Whichever limit bites first wins: records past ${a.retention_days || 7} days are dropped,
+      and if the file still exceeds the cap the oldest go too. Writes happen on a background thread,
+      so capture never adds latency to a request.` +
+      (a.dropped ? `<br><b style="color:var(--warn-ink)">${fmt(a.dropped)} record(s) dropped</b> — the writer fell behind a burst.` : ""));
+  },
+
+  async sweep(b) {
+    b.disabled = true; txt(b, "Sweeping…");
+    try {
+      const d = await api("POST", "/audit/sweep");
+      toast("ok", `Removed ${d.removed_age + d.removed_size} record(s)`);
+      await refresh();
+    } catch (err) { toast("err", "Sweep failed: " + err.message); }
+    finally { b.disabled = false; txt(b, "Run retention now"); }
+  },
+
+  async purge() {
     if (!await confirmDialog({
       title: "Purge the audit log?",
       message: "Every recorded request, prompt, and completion is deleted. Usage and cost history are <b>not</b> affected. This can't be undone.",
       confirmLabel: "Purge everything", danger: true,
     })) return;
-    try { const d = await api("POST", "/audit/purge"); toast("ok", `Purged ${fmt(d.removed)} records`); rows = []; maxId = minId = 0; renderRequests(); await refresh(); }
-    catch (err) { toast("err", "Purge failed: " + err.message); }
-  };
-}
+    try {
+      const d = await api("POST", "/audit/purge");
+      toast("ok", `Purged ${fmt(d.removed)} records`);
+      Requests.rows = []; Requests.maxId = Requests.minId = 0; Requests.render();
+      await refresh();
+    } catch (err) { toast("err", "Purge failed: " + err.message); }
+  },
 
-const PRICE_SRC = {
-  online: { sev: "good", text: "live price list" },
-  cache: { sev: "warn", text: "cached price list" },
-  fallback: { sev: "crit", text: "built-in fallback rates" },
+  renderPricing() {
+    const p = state.pricing || {};
+    const SRC = {
+      online: { sev: "good", text: "live price list" },
+      cache: { sev: "warn", text: "cached price list" },
+      fallback: { sev: "crit", text: "built-in fallback rates" },
+    };
+    const s = SRC[p.source] || { sev: "neutral", text: p.source || "unknown" };
+    const box = $("#pricingPanel");
+    if (!box.__built) {
+      box.__built = true;
+      clear(box).appendChild(el("div.cfg-row",
+        el("span.lab", el("div.t", { "data-ref": "src" }), el("div.h", { "data-ref": "when" })),
+        el("button.btn.sm", { type: "button", onclick: e => this.refreshPrices(e.currentTarget) }, "Refresh now")));
+      box.appendChild(el("div.cfg-row", { "data-ref": "unpricedRow" },
+        el("span.lab", el("div.t", { "data-ref": "unpriced", style: "color:var(--warn-ink)" }),
+          el("div.h.mono", { "data-ref": "unpricedList" }))));
+      box.appendChild(el("div.cfg-row", el("span.lab", el("div.h", {
+        text: "Rates come from the LiteLLM community price list and are applied when a request is recorded, so past spend never changes when prices do.",
+      }))));
+      box.__refs = refs(box);
+    }
+    const r = box.__refs;
+    html(r.src, badgeHTML(s.sev, s.text) + ` <span class="chip">${fmt(p.models || 0)} models</span>`);
+    txt(r.when, `Fetched ${p.fetched_at ? new Date(p.fetched_at * 1000).toLocaleString() : "never"}` +
+      (p.last_error ? ` · last attempt failed: ${p.last_error}` : ""));
+    const un = p.unpriced_models || [];
+    cls(r.unpricedRow, "hide", !un.length);
+    txt(r.unpriced, `${un.length} model${un.length > 1 ? "s" : ""} with no published price`);
+    txt(r.unpricedList, un.join(", ") + " — counted as $0.00");
+  },
+
+  async refreshPrices(b) {
+    b.disabled = true; txt(b, "Fetching…");
+    try {
+      const d = await api("POST", "/pricing/refresh");
+      toast("ok", `Loaded ${d.models} model prices`);
+      await refresh();
+    } catch (err) { toast("err", "Price refresh failed: " + err.message); }
+    finally { b.disabled = false; txt(b, "Refresh now"); }
+  },
 };
-function renderPricing() {
-  const p = state.pricing || {};
-  const s = PRICE_SRC[p.source] || { sev: "neutral", text: p.source || "unknown" };
-  const when = p.fetched_at ? new Date(p.fetched_at * 1000).toLocaleString() : "never";
-  const unpriced = p.unpriced_models || [];
-  $("#pricingPanel").innerHTML = `
-    <div class="cfg-row"><span class="lab">
-      <div class="t">${badge(s.sev, s.text)} <span class="chip">${esc(String(p.models || 0))} models</span></div>
-      <div class="h">Fetched ${esc(when)}${p.last_error ? ` · last attempt failed: ${esc(p.last_error)}` : ""}</div>
-    </span><button type="button" class="btn sm" id="refreshPrices">Refresh now</button></div>
-    ${unpriced.length ? `<div class="cfg-row"><span class="lab">
-      <div class="t" style="color:var(--warn-ink)">${unpriced.length} model${unpriced.length > 1 ? "s" : ""} with no published price</div>
-      <div class="h mono">${esc(unpriced.join(", "))} — counted as $0.00</div></span></div>` : ""}
-    <div class="cfg-row"><span class="lab"><div class="h">Rates come from the LiteLLM community price list and are applied when a
-      request is recorded, so past spend never changes when prices do.</div></span></div>`;
-  $("#refreshPrices").onclick = async ev => {
-    const b = ev.currentTarget; b.disabled = true; b.textContent = "Fetching…";
-    try { const d = await api("POST", "/pricing/refresh"); toast("ok", `Loaded ${d.models} model prices`); await refresh(); }
-    catch (err) { toast("err", "Price refresh failed: " + err.message); }
-    finally { b.disabled = false; b.textContent = "Refresh now"; }
-  };
-}
-
-function renderLog() {
-  const logs = state.rotation_log || [];
-  const box = $("#log");
-  if (!logs.length) { box.innerHTML = `<div class="empty">No rotations yet.</div>`; return; }
-  box.innerHTML = logs.slice().reverse().map(e => {
-    const when = new Date(e.time * 1000).toLocaleString();
-    const sw = e.action === "switched";
-    const why = e.reason === "active_unusable" ? "active dead/rate-limited" : `5h at ${Math.round((e.trigger_util_5h || 0) * 100)}%`;
-    return `<div class="logrow ${sw ? "switched" : "notify"}"><div class="when">${esc(when)}</div>${sw ? "Switched" : "Would switch"} <b>${esc(e.from)}</b> <span class="arrow">→</span> <b>${esc(e.to)}</b> · ${esc(why)}</div>`;
-  }).join("");
-}
 
 // =====================================================================
-// Actions — tokens
+// Actions
 // =====================================================================
 async function selectToken(name) {
   try {
     await api("POST", "/select", { name });
-    state.active = name; renderHero(); renderTokens();
+    state.active = name;
+    Overview.update(); Upstreams.update();
     toast("ok", `Now serving via “${name}”`);
     refresh();
   } catch (err) { toast("err", "Switch failed: " + err.message); }
 }
-async function probeToken(name, btn) {
-  const old = btn.textContent;
-  btn.disabled = true; btn.textContent = "Testing…";
+
+async function probeToken(name, b) {
+  const old = b.textContent;
+  b.disabled = true; txt(b, "Testing…");
   try {
     const d = await api("POST", "/probe", { name });
     toast(d.healthy ? "ok" : "err", d.healthy ? `“${name}” is healthy` : `“${name}” — ${d.status}`);
     await refresh();
   } catch (err) { toast("err", "Probe failed: " + err.message); }
-  finally { btn.disabled = false; btn.textContent = old; }
+  finally { b.disabled = false; txt(b, old); }
 }
+
 async function addToken() {
   const data = await formDialog({
     title: "Add upstream token",
@@ -1141,6 +1354,7 @@ async function addToken() {
     await refresh();
   } catch (err) { toast("err", "Couldn't add token: " + err.message); }
 }
+
 async function editToken(name) {
   const data = await formDialog({
     title: `Edit “${name}”`,
@@ -1162,6 +1376,7 @@ async function editToken(name) {
     await refresh();
   } catch (err) { toast("err", "Update failed: " + err.message); }
 }
+
 async function deleteToken(name) {
   if (!await confirmDialog({
     title: `Delete token “${name}”?`,
@@ -1174,6 +1389,7 @@ async function deleteToken(name) {
     await refresh();
   } catch (err) { toast("err", "Delete failed: " + err.message); }
 }
+
 async function revealToken(name) {
   try {
     const d = await api("POST", "/tokens/" + enc(name) + "/reveal");
@@ -1181,9 +1397,6 @@ async function revealToken(name) {
   } catch (err) { toast("err", "Couldn't reveal: " + err.message); }
 }
 
-// =====================================================================
-// Actions — virtual keys
-// =====================================================================
 async function addKey() {
   const data = await formDialog({
     title: "Add virtual key",
@@ -1199,9 +1412,11 @@ async function addKey() {
   try {
     const d = await api("POST", "/virtual-keys", { name: data.name, key: data.key || undefined });
     await refresh();
+    Clients.select(d.name);
     revealDialog({ title: `Key created · ${d.name}`, label: "Virtual key", value: d.key, note: "Copy it now and give it to the client — it's shown in full only here." });
   } catch (err) { toast("err", "Couldn't create key: " + err.message); }
 }
+
 async function rotateKey(name) {
   if (!await confirmDialog({
     title: `Rotate “${name}”?`,
@@ -1214,15 +1429,21 @@ async function rotateKey(name) {
     revealDialog({ title: `Rotated · ${d.name}`, label: "New virtual key", value: d.key, note: "Update the client with this new value now." });
   } catch (err) { toast("err", "Rotate failed: " + err.message); }
 }
+
 async function renameKey(name) {
-  const data = await formDialog({ title: `Rename “${name}”`, submitLabel: "Rename", fields: [{ name: "name", label: "New client name", value: name }] });
+  const data = await formDialog({
+    title: `Rename “${name}”`, submitLabel: "Rename",
+    fields: [{ name: "name", label: "New client name", value: name }],
+  });
   if (!data || !data.name || data.name === name) return;
   try {
     await api("PATCH", "/virtual-keys/" + enc(name), { name: data.name });
+    Clients.selected = data.name;
     toast("ok", `Renamed to “${data.name}”`);
     await refresh();
   } catch (err) { toast("err", "Rename failed: " + err.message); }
 }
+
 async function deleteKey(name) {
   if (!await confirmDialog({
     title: `Delete key “${name}”?`,
@@ -1231,10 +1452,12 @@ async function deleteKey(name) {
   })) return;
   try {
     await api("DELETE", "/virtual-keys/" + enc(name));
+    Clients.selected = null;
     toast("ok", `Deleted “${name}”`);
     await refresh();
   } catch (err) { toast("err", "Delete failed: " + err.message); }
 }
+
 async function revealKey(name) {
   try {
     const d = await api("POST", "/virtual-keys/" + enc(name) + "/reveal");
@@ -1242,110 +1465,51 @@ async function revealKey(name) {
   } catch (err) { toast("err", "Couldn't reveal: " + err.message); }
 }
 
-// All four periods are edited together and sent as one replace-all payload, so
-// clearing a box is how you remove a cap.
-const LIMIT_PERIODS = [
-  ["hour", "$ per hour", "resets on the hour"],
-  ["day", "$ per day", "resets at local midnight"],
-  ["week", "$ per week", "resets Monday at local midnight"],
-  ["month", "$ per month", "resets on the 1st"],
-];
-async function editLimits(name) {
-  const vk = (state.virtual_keys || []).find(v => v.name === name) || {};
-  const cur = {};
-  for (const l of (vk.limits || [])) cur[l.period] = l.limit_usd;
-  const tz = state.timezone || "local time";
-  const data = await formDialog({
-    title: `Spend limits · ${name}`,
-    desc: `Requests are rejected with HTTP 429 while any cap is exceeded. Windows are calendar-aligned in ${tz}. Leave a box blank for no cap.`,
-    submitLabel: "Save limits",
-    fields: LIMIT_PERIODS.map(([p, label, hint]) => ({
-      name: p, label, hint,
-      value: cur[p] !== undefined ? String(cur[p]) : "",
-      placeholder: "no cap",
-    })),
-  });
-  if (!data) return;
-  const limits = {};
-  for (const [p] of LIMIT_PERIODS) {
-    const raw = (data[p] || "").replace(/^\$/, "").trim();
-    if (!raw) continue;
-    const v = Number(raw);
-    if (!isFinite(v) || v < 0) { toast("err", `“${raw}” isn't a valid amount for ${p}`); return; }
-    if (v > 0) limits[p] = v;
-  }
-  try {
-    await api("PUT", "/virtual-keys/" + enc(name) + "/limits", { limits });
-    const n = Object.keys(limits).length;
-    toast("ok", n ? `Saved ${n} limit${n > 1 ? "s" : ""} for “${name}”` : `Removed all limits for “${name}”`);
-    await refresh();
-  } catch (err) { toast("err", "Couldn't save limits: " + err.message); }
-}
-
 // =====================================================================
-// System status + render orchestration
+// System status + orchestration
 // =====================================================================
 function renderSystem() {
-  const hh = (state.health || {})[state.active];
-  const activeSev = healthLabel(hh).sev;
+  const hl = healthLabel((state.health || {})[state.active]);
   const h = (state.headers || {})[state.active] || {};
   const u5 = h["anthropic-ratelimit-unified-5h-utilization"];
   const blocked = (state.virtual_keys || []).filter(vk => (vk.limits || []).some(l => l.over)).length;
   let overall = "good", label = "All systems nominal";
-  if (activeSev === "crit") { overall = "crit"; label = "Active token unavailable"; }
+  if (hl.sev === "crit") { overall = "crit"; label = "Active token unavailable"; }
   else if (u5 !== undefined && sev(u5) === "crit") { overall = "crit"; label = "Capacity exhausted"; }
-  else if (activeSev === "warn" || (u5 !== undefined && sev(u5) === "warn")) { overall = "warn"; label = "Degraded — high utilization"; }
+  else if (hl.sev === "warn" || (u5 !== undefined && sev(u5) === "warn")) { overall = "warn"; label = "Degraded — high utilization"; }
   else if (blocked) { overall = "warn"; label = `${blocked} client${blocked > 1 ? "s" : ""} over budget`; }
-  $("#sysdot").className = "sysdot " + overall;
-  $("#syslabel").textContent = label;
+  const dot = $("#sysdot");
+  ["good", "warn", "crit"].forEach(c => cls(dot, c, c === overall));
+  txt($("#syslabel"), label);
 }
-function syncKeyFilter() {
-  const sel = $("#fKey");
-  const names = (state.virtual_keys || []).map(v => v.name);
-  const sig = names.join("|");
-  if (sel._sig === sig) return;
-  sel._sig = sig;
-  const cur = sel.value;
-  sel.innerHTML = `<option value="">All clients</option>` +
-    names.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join("");
-  sel.value = cur;
-}
+
 function renderAll() {
   renderSystem();
-  renderHero();
-  renderTiles();
-  renderSpendChart();
-  renderLatency();
-  renderModels();
-  renderTokens();
-  renderClients();
-  renderAuditPanel();
-  renderPricing();
-  renderLog();
-  syncKeyFilter();
-  const a = state.audit || {};
-  $("#auditChip").textContent = a.mode === "off" ? "auditing off"
-    : `${a.mode} · ${fmt(a.rows || 0)} kept · ${bytes(a.bytes || 0)}`;
-  const cfgJSON = JSON.stringify(state.config || {});
-  if (!cfgDirty && cfgJSON !== lastCfgJSON) buildForm();   // never clobber an edit in progress
-  $("#authnote").textContent =
-    (state.auth_enabled ? "Admin auth: on" : "Tailnet-only · no admin auth") + ` · v${state.version || "?"}`;
+  Overview.update();
+  Clients.update();
+  Upstreams.update();
+  Requests.update();
+  Settings.update();
+  txt($("#authnote"),
+    (state.auth_enabled ? "Admin auth: on" : "Tailnet-only · no admin auth") + ` · v${state.version || "?"}`);
 }
+
 function clearStale() {
   $("#banner").classList.remove("show");
-  $$(".stale").forEach(e => e.classList.remove("stale"));
 }
+
 function applyState(data) {
   state = data;
   lastBeat = Date.now();
   clearStale();
   renderAll();
 }
+
 function connError(msg) {
-  $("#bannerText").textContent = "Live connection lost — reconnecting… (" + msg + ")";
+  txt($("#bannerText"), "Live connection lost — reconnecting… (" + msg + ")");
   $("#banner").classList.add("show");
-  ["hero", "tokens", "clients", "tiles"].forEach(id => { if (state) $("#" + id)?.classList.add("stale"); });
 }
+
 async function refresh() {
   try {
     const r = await fetch("/state", { cache: "no-store" });
@@ -1353,6 +1517,7 @@ async function refresh() {
     applyState(await r.json());
   } catch (err) { connError(err.message); }
 }
+
 function connectSSE() {
   try { if (es) es.close(); } catch (e) { /* already closed */ }
   es = new EventSource("/events");
@@ -1362,35 +1527,62 @@ function connectSSE() {
     applyState(data);
   });
   es.addEventListener("ping", () => { lastBeat = Date.now(); clearStale(); });
+  es.addEventListener("bye", () => { /* pod draining; EventSource reconnects to the new one */ });
   es.onopen = () => { lastBeat = Date.now(); clearStale(); };
-  es.onerror = () => connError("stream closed");   // EventSource retries on its own
+  es.onerror = () => connError("stream closed");
 }
+
 function tick() {
   if (lastBeat) {
     const s = Math.round((Date.now() - lastBeat) / 1000);
-    $("#synctext").textContent = s < 5 ? "live" : `${s}s ago`;
+    txt($("#synctext"), s < 5 ? "live" : `${s}s ago`);
   }
-  $$("[data-reset]").forEach(el => {
-    const ts = el.getAttribute("data-reset");
-    if (ts) el.textContent = el.classList.contains("reset") ? "resets " + fmtReset(ts) : fmtReset(ts);
-  });
+  for (const [node, { ts, prefix }] of countdowns) {
+    if (!node.isConnected) { countdowns.delete(node); continue; }
+    txt(node, prefix + fmtReset(ts));
+  }
+}
+
+async function loadAuditSummary() {
+  try {
+    const [o, m] = await Promise.all([
+      api("GET", "/audit/overview?hours=24"),
+      api("GET", "/audit/models?hours=24"),
+    ]);
+    auditOverview = o;
+    auditModels = m.models || [];
+    if (state) { Overview.update(); Requests.update(); }
+  } catch (err) { /* the overview degrades to "no data" on its own */ }
 }
 
 // =====================================================================
 // Router
 // =====================================================================
-function go(view) {
+function go(view, sub) {
+  if (!VIEWS.includes(view)) view = "overview";
   currentView = view;
-  $$("#nav button").forEach(b => b.setAttribute("aria-selected", String(b.dataset.view === view)));
-  $$(".view").forEach(v => v.classList.toggle("active", v.id === "view-" + view));
-  history.replaceState(null, "", "#" + view);
+  $$("#nav button").forEach(b => att(b, "aria-selected", String(b.dataset.view === view)));
+  $$(".view").forEach(v => cls(v, "active", v.id === "view-" + view));
+  const target = view === "clients" && (sub || Clients.selected)
+    ? `#clients/${enc(sub || Clients.selected)}` : "#" + view;
+  if (location.hash !== target) history.replaceState(null, "", target);
   if (view === "requests") {
-    if (!rows.length) loadRequests(true);
-    if (liveTail) startTail();
+    if (!Requests.rows.length) Requests.reload(true);
+    if (Requests.live) Requests.start();
   } else {
-    stopTail();
+    Requests.stop();
   }
   if (view === "overview") loadAuditSummary();
+}
+
+function routeFromHash() {
+  const [view, sub] = location.hash.replace(/^#/, "").split("/");
+  if (view === "clients" && sub) {
+    const name = decodeURIComponent(sub);
+    if (Clients.selected !== name) { Clients.selected = name; Clients.limitsDirty = false; }
+    if (state) Clients.update();
+  }
+  go(view || "overview");
 }
 
 // =====================================================================
@@ -1416,52 +1608,48 @@ $("#refreshBtn").onclick = () => {
   b.style.transform = "rotate(360deg)";
   setTimeout(() => { b.style.transform = ""; }, 400);
   refresh();
-  if (currentView === "requests") loadRequests(true);
+  if (currentView === "requests") Requests.reload(true);
   loadAuditSummary();
   if (!es || es.readyState === 2) connectSSE();
 };
 $("#addTokenBtn").onclick = addToken;
-$("#addKeyBtn").onclick = addKey;
 $$("#nav button").forEach(b => { b.onclick = () => go(b.dataset.view); });
 
-// request filters — the search box debounces so typing doesn't fire a query per keystroke
 let searchTimer = null;
 $("#fSearch").addEventListener("input", e => {
-  filters.q = e.target.value.trim();
+  requestFilters.q = e.target.value.trim();
   clearTimeout(searchTimer);
-  searchTimer = setTimeout(() => loadRequests(true), 280);
+  searchTimer = setTimeout(() => Requests.reload(true), 280);
 });
-$("#fKey").addEventListener("change", e => { filters.key = e.target.value; loadRequests(true); });
-$("#fOutcome").addEventListener("change", e => { filters.outcome = e.target.value; loadRequests(true); });
-$("#fRange").addEventListener("change", e => { filters.hours = e.target.value; loadRequests(true); });
+$("#fKey").addEventListener("change", e => { requestFilters.key = e.target.value; Requests.reload(true); });
+$("#fOutcome").addEventListener("change", e => { requestFilters.outcome = e.target.value; Requests.reload(true); });
+$("#fRange").addEventListener("change", e => { requestFilters.hours = e.target.value; Requests.reload(true); });
 $("#fClear").onclick = () => {
-  filters.q = ""; filters.key = ""; filters.outcome = ""; filters.hours = "24";
+  Object.assign(requestFilters, { q: "", key: "", outcome: "", hours: "24" });
   $("#fSearch").value = ""; $("#fKey").value = ""; $("#fOutcome").value = ""; $("#fRange").value = "24";
-  loadRequests(true);
+  Requests.reload(true);
 };
-$("#moreBtn").onclick = () => loadRequests(false);
+$("#moreBtn").onclick = () => Requests.reload(false);
 $("#liveBtn").onclick = () => {
-  liveTail = !liveTail;
-  $("#liveBtn").setAttribute("aria-pressed", String(liveTail));
-  $("#liveDot").style.visibility = liveTail ? "visible" : "hidden";
-  if (liveTail && currentView === "requests") { startTail(); tailRequests(); } else { stopTail(); }
+  Requests.live = !Requests.live;
+  att($("#liveBtn"), "aria-pressed", String(Requests.live));
+  sty($("#liveDot"), "visibility", Requests.live ? "visible" : "hidden");
+  if (Requests.live && currentView === "requests") { Requests.start(); Requests.tail(); } else { Requests.stop(); }
 };
-$("#drawerClose").onclick = closeDrawer;
-$("#drawerScrim").onclick = closeDrawer;
+$("#drawerClose").onclick = () => Requests.close();
+$("#drawerScrim").onclick = () => Requests.close();
 document.addEventListener("keydown", e => {
-  if (e.key === "Escape" && $("#drawer").classList.contains("open")) closeDrawer();
+  if (e.key === "Escape" && $("#drawer").classList.contains("open")) Requests.close();
 });
-// Pause the tail while the tab is hidden — a backgrounded console should cost nothing.
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden) stopTail();
-  else if (liveTail && currentView === "requests") { startTail(); tailRequests(); }
+  if (document.hidden) Requests.stop();
+  else if (Requests.live && currentView === "requests") { Requests.start(); Requests.tail(); }
 });
+window.addEventListener("hashchange", routeFromHash);
 
 // ============================ boot ============================
-refresh();                      // instant first paint via GET /state
-connectSSE();                   // then switch to the live push feed
+refresh().then(routeFromHash);
+connectSSE();
 loadAuditSummary();
 setInterval(tick, 1000);
 setInterval(loadAuditSummary, 60000);
-go((location.hash || "#overview").slice(1) in { overview: 1, requests: 1, clients: 1, upstreams: 1, settings: 1 }
-  ? location.hash.slice(1) : "overview");

@@ -124,15 +124,9 @@
   </section>
 
   <!-- ============================ CLIENTS ============================ -->
-  <section class="view" id="view-clients" role="tabpanel" aria-label="Clients">
-    <div class="sec-head">
-      <h2>Clients</h2><span class="count" id="clientCount"></span><span class="rule"></span>
-      <button class="btn sm" id="addKeyBtn" type="button">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>Add key
-      </button>
-    </div>
-    <div id="clients"></div>
-  </section>
+  <!-- Built in JS (see console.js § CLIENTS): a list pane and a detail pane. -->
+  <section class="view" id="view-clients" role="tabpanel" aria-label="Clients"></section>
+  <span class="vh" id="clientCount"></span>
 
   <!-- ============================ UPSTREAMS ============================ -->
   <section class="view" id="view-upstreams" role="tabpanel" aria-label="Upstream tokens">
@@ -188,6 +182,8 @@
 <div class="tip" id="tip" role="tooltip" aria-hidden="true"></div>
 <div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
 
+<!-- Classic scripts in order: primitives first, then the app that uses them. -->
+<script src="/assets/console-dom.js?v=__BUILD__"></script>
 <script src="/assets/console.js?v=__BUILD__"></script>
 </body>
 </html>

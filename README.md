@@ -78,13 +78,15 @@ Open `http://<tailscale-ip>:8182` (Basic auth). Five views:
 |------|----------------|
 | **Overview** | Active-token 5h capacity gauge, fleet spend tiles, daily spend chart, TTFB/total latency percentiles, cost and volume by model |
 | **Requests** | The live audit log — search, filter by client/outcome/window, click any row for the full prompt, tool definitions, and completion |
-| **Clients** | Per-key spend windows, a daily chart, spend limits, per-model breakdown, and key rotate/rename/reveal |
+| **Clients** | Split view: a searchable, sortable list beside a detail pane with spend windows, a daily chart, an inline spend-limit editor, and the per-model breakdown. Selecting a client deep-links (`#clients/<name>`) and never moves the layout |
 | **Upstreams** | Per-token 5h/7d utilization, health, live switch, probe, and the rotation log |
 | **Settings** | Auto-rotation, auditing, probes, timezone, pricing, and the audit storage meter |
 
-Dashboard state streams over Server-Sent Events and only re-renders when
-something actually changed, so scroll position, open panels, and half-typed
-forms survive a live feed. The request log polls separately, and only while its
+Dashboard state streams over Server-Sent Events, and views **patch** the DOM
+rather than rebuilding it — individual values are written only when they change
+and a field you are editing is never written to at all. That is what keeps
+scroll position, selection, and half-typed forms intact under a live feed.
+`scripts/ui-smoke.py` asserts those properties against a running instance. The request log polls separately, and only while its
 tab is on screen. Dark and light themes are both first-class — each palette was
 validated for colourblind separation and contrast against its own surface,
 rather than one being flipped from the other.

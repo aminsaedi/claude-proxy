@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Literal
@@ -169,6 +170,8 @@ class VirtualKeyStore:
         self._by_name: dict[str, str] = {}
         self._by_key: dict[str, str] = {}
         self._sig: frozenset = frozenset()
+        # Serialises overlapping reloads; see reload_if_changed.
+        self._lock = threading.Lock()
         self.load()
 
     def load(self) -> None:
@@ -180,17 +183,33 @@ class VirtualKeyStore:
         self._sig = frozenset(by_name.items())
 
     def reload_if_changed(self) -> bool:
-        try:
-            by_name = {vk["name"]: vk["key"] for vk in db.list_virtual_keys()}
-        except Exception as e:  # noqa: BLE001 - keep serving cached keys on DB error
-            log.warning("Failed to reload virtual keys: %s", e)
-            return False
-        sig = frozenset(by_name.items())
-        if sig == self._sig or not by_name:
-            return False
-        self._by_name = by_name
-        self._by_key = {v: k for k, v in by_name.items()}
-        self._sig = sig
+        """Adopt key edits from the DB, whoever made them.
+
+        The read and the adopt are held under one lock together, and that
+        pairing is the point. Two reloads can overlap — the background loop
+        every few seconds, and an explicit one right after an admin write — and
+        if the slow background read were allowed to finish *after* the admin's,
+        it would install its older snapshot on top. For a rotation that means
+        the key you just revoked starts working again until the next tick.
+
+        Serialising read-with-adopt makes the reload that started last also
+        finish last, so the freshest view of the database is the one that wins.
+        The request path never takes this lock: ``resolve`` reads a dict that is
+        only ever swapped in by whole-reference assignment, so it sees the old
+        map or the new one, never a half-built one.
+        """
+        with self._lock:
+            try:
+                by_name = {vk["name"]: vk["key"] for vk in db.list_virtual_keys()}
+            except Exception as e:  # noqa: BLE001 - keep serving cached keys on DB error
+                log.warning("Failed to reload virtual keys: %s", e)
+                return False
+            sig = frozenset(by_name.items())
+            if sig == self._sig or not by_name:
+                return False
+            self._by_name = by_name
+            self._by_key = {v: k for k, v in by_name.items()}
+            self._sig = sig
         log.info("Reloaded virtual keys from DB (%d keys)", len(by_name))
         return True
 

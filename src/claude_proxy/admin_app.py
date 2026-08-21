@@ -115,6 +115,7 @@ async def _snapshot(state) -> dict:  # noqa: ANN001
 # path traversal impossible by construction instead of by sanitising.
 _ASSETS = {
     "console.css": "text/css; charset=utf-8",
+    "console-dom.js": "application/javascript; charset=utf-8",
     "console.js": "application/javascript; charset=utf-8",
 }
 
