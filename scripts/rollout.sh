@@ -41,7 +41,14 @@ say() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
 KUBECTL_SSH="${KUBECTL_SSH:-}"
 kube() {
   if [[ -n "$KUBECTL_SSH" ]]; then
-    ssh -o BatchMode=yes "$KUBECTL_SSH" kubectl "$@"
+    # ssh flattens its arguments into one string and hands it to a remote
+    # shell, so anything the shell would look at twice — the parens in a
+    # go-template, the braces in a jsonpath — has to be quoted for that second
+    # pass or it never reaches kubectl intact.
+    local quoted=""
+    local arg
+    for arg in "$@"; do quoted+=" $(printf '%q' "$arg")"; done
+    ssh -o BatchMode=yes "$KUBECTL_SSH" "kubectl${quoted}"
   else
     kubectl "$@"
   fi
