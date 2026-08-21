@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, Field, field_validator
 
+from .audit import MODES as AUDIT_MODES
 from .budgets import DEFAULT_TIMEZONE
 from .pricing import LITELLM_URL
 
@@ -58,6 +59,59 @@ class Pricing(BaseModel):
         return v
 
 
+class Audit(BaseModel):
+    """Request + prompt audit log (see ``audit.py``).
+
+    ``mode`` is the privacy dial: ``off`` records nothing, ``meta`` records one
+    row per request without any prompt text, ``full`` also stores the prompt and
+    the completion. Retention is enforced on both axes — whichever bites first.
+    """
+
+    mode: str = "full"
+    retention_days: int = 7
+    max_gb: float = 2.0
+    # Per-body cap. Claude Code sends very large prompts; storing every byte of
+    # a 2MB context would burn the size budget on a handful of requests, and
+    # the head of a prompt is what identifies it.
+    max_body_kb: int = 256
+
+    @field_validator("mode")
+    @classmethod
+    def _mode(cls, v: str) -> str:
+        if v not in AUDIT_MODES:
+            raise ValueError(f"mode must be one of {', '.join(AUDIT_MODES)}")
+        return v
+
+    @field_validator("retention_days")
+    @classmethod
+    def _days(cls, v: int) -> int:
+        if not 1 <= v <= 365:
+            raise ValueError("retention_days must be between 1 and 365")
+        return v
+
+    @field_validator("max_gb")
+    @classmethod
+    def _gb(cls, v: float) -> float:
+        if not 0.05 <= v <= 512:
+            raise ValueError("max_gb must be between 0.05 and 512")
+        return v
+
+    @field_validator("max_body_kb")
+    @classmethod
+    def _body(cls, v: int) -> int:
+        if not 1 <= v <= 8192:
+            raise ValueError("max_body_kb must be between 1 and 8192")
+        return v
+
+    @property
+    def max_bytes(self) -> int:
+        return int(self.max_gb * 1024**3)
+
+    @property
+    def max_body_bytes(self) -> int:
+        return self.max_body_kb * 1024
+
+
 class AppConfig(BaseModel):
     """Top-level, hot-reloadable proxy configuration (mirrors config.yaml)."""
 
@@ -68,6 +122,7 @@ class AppConfig(BaseModel):
     # Calendar boundaries for the daily views and for every spend limit.
     timezone: str = DEFAULT_TIMEZONE
     pricing: Pricing = Field(default_factory=Pricing)
+    audit: Audit = Field(default_factory=Audit)
     # How long the hourly usage series is kept on disk (memory keeps ~40 days).
     usage_retention_days: int = 400
 

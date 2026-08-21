@@ -38,6 +38,11 @@ spec:
   storageClassName: local-path
   resources:
     requests:
+      # Left at the original value on purpose. local-path is hostPath-backed:
+      # it does not enforce this request and does not support expansion, so
+      # raising the number would buy nothing and would make `kubectl apply`
+      # fail on an immutable field. The real ceiling is free space on the node;
+      # the audit log polices itself against its own 2GB budget.
       storage: 1Gi
 ---
 apiVersion: apps/v1
@@ -49,9 +54,24 @@ metadata:
     app: claude-proxy
 spec:
   replicas: 1
-  # RWO local-path volume lives on one node; never run two pods against it.
+  # Zero-downtime rollout. The surge pod and the outgoing pod overlap for a few
+  # seconds, which is only safe because of two properties established elsewhere:
+  #
+  #  * Both land on the same node (nodeSelector below), and a ReadWriteOnce
+  #    volume is node-scoped, not pod-scoped — so both can mount the PVC.
+  #  * Usage is written to SQLite as additive deltas rather than as a whole-table
+  #    replace (see db.add_usage), so two writers sum instead of clobbering.
+  #
+  # maxUnavailable: 0 is the load-bearing setting: the old pod is only torn down
+  # once the new one is ready, so there is never a moment with nothing serving.
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  # Don't count a pod as available until it has held ready for this long, so a
+  # pod that starts and immediately crashes can't be mistaken for a good rollout.
+  minReadySeconds: 10
   selector:
     matchLabels:
       app: claude-proxy
@@ -60,6 +80,10 @@ spec:
       labels:
         app: claude-proxy
     spec:
+      # Long enough for in-flight work to finish: a streaming completion can
+      # legitimately run for minutes, and killing one is precisely the
+      # user-visible downtime this rollout strategy exists to avoid.
+      terminationGracePeriodSeconds: 120
       # local-path PVC binds to a node; toronto is the public front door with clean egress.
       nodeSelector:
         kubernetes.io/hostname: toronto
@@ -70,7 +94,7 @@ spec:
       initContainers:
         # Seed the SQLite DB into the PVC on first run only (idempotent).
         - name: seed-db
-          image: 100.69.180.101:31500/claude-proxy:v8
+          image: 100.69.180.101:31500/claude-proxy:v9
           command: ["sh", "-c", "test -f /data/claude_proxy.db || cp /seed/claude_proxy.db /data/claude_proxy.db"]
           volumeMounts:
             - name: data
@@ -80,13 +104,22 @@ spec:
               readOnly: true
       containers:
         - name: proxy
-          image: 100.69.180.101:31500/claude-proxy:v8
+          image: 100.69.180.101:31500/claude-proxy:v9
           imagePullPolicy: Always
           env:
             - name: CLAUDE_PROXY_DATA_DIR
               value: /data
             - name: CLAUDE_PROXY_DB
               value: /data/claude_proxy.db
+            - name: CLAUDE_PROXY_AUDIT_DB
+              value: /data/audit.db
+            # Belt to the preStop hook's braces: if the hook is ever skipped,
+            # the process still fails readiness first and waits before it stops
+            # accepting connections.
+            - name: PROXY_DRAIN_LEAD
+              value: "3"
+            - name: PROXY_DRAIN_TIMEOUT
+              value: "90"
             # Admin UI has no auth by design — it's only reachable via the
             # tailnet-only Tailscale LoadBalancer below. To re-enable HTTP Basic
             # auth, add ADMIN_USER / ADMIN_PASSWORD env (e.g. from a Secret).
@@ -95,26 +128,46 @@ spec:
               containerPort: 8080
             - name: admin
               containerPort: 8090
+          lifecycle:
+            preStop:
+              # Endpoint removal and SIGTERM race: the kubelet sends both at
+              # once, and the ingress learns about the removal asynchronously.
+              # Sleeping here delays SIGTERM so requests still being routed to
+              # this pod are served by a process that is very much alive.
+              exec:
+                command: ["sh", "-c", "sleep 6"]
+          # Liveness asks "is this process wedged", readiness asks "should it get
+          # traffic". They MUST be different endpoints here: /healthz answers 503
+          # while draining on purpose, and a liveness probe reading that would
+          # kill the pod in the middle of the very drain it is protecting.
           livenessProbe:
             httpGet:
-              path: /healthz
+              path: /livez
               port: 8080
-            initialDelaySeconds: 10
             periodSeconds: 20
             failureThreshold: 3
           readinessProbe:
             httpGet:
               path: /healthz
               port: 8080
-            initialDelaySeconds: 5
-            periodSeconds: 10
+            periodSeconds: 3
+            failureThreshold: 2
+            successThreshold: 1
+          # Covers a cold start (schema migration, pricing load) without a long
+          # initialDelay on the liveness probe.
+          startupProbe:
+            httpGet:
+              path: /livez
+              port: 8080
+            periodSeconds: 2
+            failureThreshold: 30
           resources:
             requests:
               cpu: 50m
               memory: 128Mi
             limits:
-              cpu: "1"
-              memory: 512Mi
+              cpu: "2"
+              memory: 768Mi
           volumeMounts:
             - name: data
               mountPath: /data
@@ -182,3 +235,18 @@ spec:
                 name: claude-proxy
                 port:
                   number: 8080
+---
+# Keeps a voluntary disruption (node drain, cluster upgrade) from taking the
+# only replica down. With replicas:1 this means a drain blocks until the surge
+# pod is ready somewhere — which, given the node-pinned local-path volume, is a
+# deliberate signal to a human rather than a silent outage.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: claude-proxy
+  namespace: claude-proxy
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: claude-proxy

@@ -243,21 +243,46 @@ def load_usage(path: Path | None = None) -> dict:
     return out
 
 
-def replace_usage(stats: dict, path: Path | None = None) -> None:
-    """Overwrite the usage table from the in-memory snapshot (called by the flusher)."""
-    rows = [
-        (key_name, model, *(m.get(f, 0) for f in _USAGE_COLUMNS))
-        for key_name, models in stats.items()
-        for model, m in models.items()
-    ]
+def add_usage(rows: list[tuple], path: Path | None = None) -> None:
+    """Apply lifetime *deltas*: ``(key_name, model, *_USAGE_COLUMNS)``.
+
+    Additive rather than a whole-table rewrite, which matters twice over. It
+    makes a flush cost O(what changed) instead of O(all history), and — the
+    reason it is written this way — it stays correct when two processes share
+    the file. A rolling deploy overlaps an old and a new pod for a few seconds;
+    with a replace-from-my-snapshot write the second flush would silently erase
+    whatever the other process had counted. Two additive writers just both land.
+    """
+    if not rows:
+        return
+    sets = ", ".join(f"{c} = {c} + excluded.{c}" for c in _USAGE_COLUMNS)
     with cursor(path) as conn:
-        conn.execute("DELETE FROM usage")
         conn.executemany(
             "INSERT INTO usage (key_name, model, input_tokens, output_tokens, "
             "cache_read_input_tokens, cache_creation_input_tokens, requests, cost_usd) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            f"VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            f"ON CONFLICT(key_name, model) DO UPDATE SET {sets}",
             rows,
         )
+
+
+def read_usage(pairs: list[tuple[str, str]], path: Path | None = None) -> dict:
+    """Authoritative lifetime totals for specific ``(key_name, model)`` pairs.
+
+    Read back after a flush so a process that shares the DB with another one
+    converges on the true totals instead of drifting on its own local view.
+    """
+    if not pairs:
+        return {}
+    out: dict[tuple[str, str], dict[str, float]] = {}
+    with cursor(path) as conn:
+        for key_name, model in pairs:
+            row = conn.execute(
+                "SELECT * FROM usage WHERE key_name = ? AND model = ?", (key_name, model)
+            ).fetchone()
+            if row is not None:
+                out[(key_name, model)] = {f: row[f] for f in _USAGE_COLUMNS}
+    return out
 
 
 # --- hourly usage (time series) -------------------------------------------
@@ -276,28 +301,39 @@ def load_usage_hourly(since: int = 0, path: Path | None = None) -> list[dict]:
     ]
 
 
-def upsert_usage_hourly(rows: list[tuple], path: Path | None = None) -> None:
-    """Write whole buckets: (hour_start, key_name, model, *_USAGE_COLUMNS).
+def add_usage_hourly(rows: list[tuple], path: Path | None = None) -> None:
+    """Apply bucket *deltas*: ``(hour_start, key_name, model, *_USAGE_COLUMNS)``.
 
-    The in-memory tracker holds the authoritative total for every bucket it has
-    loaded, so this replaces values rather than incrementing them — which makes
-    a re-flush after a failed one idempotent.
+    Additive for the same reason as :func:`add_usage` — see the note there on
+    why a shared file rules out replace-from-snapshot writes.
     """
     if not rows:
         return
+    sets = ", ".join(f"{c} = {c} + excluded.{c}" for c in _USAGE_COLUMNS)
     with cursor(path) as conn:
         conn.executemany(
             "INSERT INTO usage_hourly (hour_start, key_name, model, input_tokens, "
             "output_tokens, cache_read_input_tokens, cache_creation_input_tokens, "
             "requests, cost_usd) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
-            "ON CONFLICT(hour_start, key_name, model) DO UPDATE SET "
-            "input_tokens = excluded.input_tokens, "
-            "output_tokens = excluded.output_tokens, "
-            "cache_read_input_tokens = excluded.cache_read_input_tokens, "
-            "cache_creation_input_tokens = excluded.cache_creation_input_tokens, "
-            "requests = excluded.requests, cost_usd = excluded.cost_usd",
+            f"ON CONFLICT(hour_start, key_name, model) DO UPDATE SET {sets}",
             rows,
         )
+
+
+def read_usage_hourly(keys: list[tuple[int, str, str]], path: Path | None = None) -> dict:
+    """Authoritative bucket totals for specific ``(hour, key_name, model)`` keys."""
+    if not keys:
+        return {}
+    out: dict[tuple[int, str, str], dict[str, float]] = {}
+    with cursor(path) as conn:
+        for hour, key_name, model in keys:
+            row = conn.execute(
+                "SELECT * FROM usage_hourly WHERE hour_start = ? AND key_name = ? AND model = ?",
+                (int(hour), key_name, model),
+            ).fetchone()
+            if row is not None:
+                out[(hour, key_name, model)] = {f: row[f] for f in _USAGE_COLUMNS}
+    return out
 
 
 def prune_usage_hourly(before: int, path: Path | None = None) -> int:

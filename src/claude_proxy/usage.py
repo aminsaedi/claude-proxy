@@ -66,9 +66,10 @@ class UsageTracker:
         self._memory_days = memory_days
         self._stats: dict[str, dict[str, dict[str, float]]] = self._load()
         self._hourly: dict[str, dict[int, dict[str, dict[str, float]]]] = self._load_hourly()
-        self._dirty_hours: set[tuple[int, str, str]] = set()
+        # Un-persisted deltas, not absolute values. See ``flush``.
+        self._pending: dict[tuple[str, str], dict[str, float]] = {}
+        self._pending_hourly: dict[tuple[int, str, str], dict[str, float]] = {}
         self._lock = asyncio.Lock()
-        self._dirty = False
         self._flush_interval = flush_interval
 
     @staticmethod
@@ -102,10 +103,16 @@ class UsageTracker:
         cache_read: int = 0,
         cache_creation: int = 0,
         now: float | None = None,
-    ) -> None:
+    ) -> float:
+        """Book one request's usage and return what it cost, in USD.
+
+        The cost is returned rather than only recorded because the caller (the
+        audit log) needs the same number, and pricing it twice would mean two
+        table lookups for one request.
+        """
         total = input_tokens + output_tokens + cache_read + cache_creation
         if not key_name or total == 0:
-            return
+            return 0.0
         model = model or "unknown"
         now = time.time() if now is None else now
         hour = hour_of(now)
@@ -129,8 +136,12 @@ class UsageTracker:
 
             bucket = self._hourly.setdefault(key_name, {}).setdefault(hour, {})
             _add(bucket.setdefault(model, _empty()), delta)
-            self._dirty_hours.add((hour, key_name, model))
-            self._dirty = True
+
+            # Accumulate what still has to reach the DB, separately from the
+            # running totals, so a flush writes "+= this much" rather than
+            # "= my whole view of the world".
+            _add(self._pending.setdefault((key_name, model), _empty()), delta)
+            _add(self._pending_hourly.setdefault((hour, key_name, model), _empty()), delta)
 
         metrics.INPUT_TOKENS.labels(key_name=key_name, model=model).inc(input_tokens)
         metrics.OUTPUT_TOKENS.labels(key_name=key_name, model=model).inc(output_tokens)
@@ -141,6 +152,7 @@ class UsageTracker:
             "USAGE key=%s model=%s in=%d out=%d cache_r=%d cache_w=%d cost=$%.4f",
             key_name, model, input_tokens, output_tokens, cache_read, cache_creation, cost,
         )
+        return cost
 
     # --- reads ------------------------------------------------------------
     #
@@ -231,26 +243,57 @@ class UsageTracker:
     # --- persistence ------------------------------------------------------
 
     async def flush(self) -> None:
+        """Push accumulated deltas to disk, then adopt what the DB now holds.
+
+        Writing deltas is what makes a shared database file safe (see
+        ``db.add_usage``). Reading the affected rows straight back is the other
+        half of that: if a second process is also writing — the overlap window
+        of a rolling deploy — this is how each one learns about the other's
+        traffic instead of enforcing spend limits against a half-blind view.
+        """
         async with self._lock:
-            if not self._dirty:
+            if not self._pending and not self._pending_hourly:
                 return
-            snapshot = copy.deepcopy(self._stats)
-            hourly_rows = [
-                (hour, key, model, *(self._hourly[key][hour][model].get(f, 0) for f in _ALL))
-                for hour, key, model in self._dirty_hours
-                if model in self._hourly.get(key, {}).get(hour, {})
-            ]
-            dirty_hours = self._dirty_hours
-            self._dirty_hours = set()
-            self._dirty = False
+            pending = self._pending
+            pending_hourly = self._pending_hourly
+            self._pending = {}
+            self._pending_hourly = {}
+        rows = [(k, m, *(d.get(f, 0) for f in _ALL)) for (k, m), d in pending.items()]
+        hourly_rows = [
+            (h, k, m, *(d.get(f, 0) for f in _ALL))
+            for (h, k, m), d in pending_hourly.items()
+        ]
         try:
-            await asyncio.to_thread(db.replace_usage, snapshot)
-            await asyncio.to_thread(db.upsert_usage_hourly, hourly_rows)
+            await asyncio.to_thread(db.add_usage, rows)
+            await asyncio.to_thread(db.add_usage_hourly, hourly_rows)
+            truth = await asyncio.to_thread(db.read_usage, list(pending))
+            truth_hourly = await asyncio.to_thread(db.read_usage_hourly, list(pending_hourly))
         except Exception as e:  # noqa: BLE001
             log.warning("Failed to persist usage stats: %s", e)
-            async with self._lock:
-                self._dirty_hours |= dirty_hours  # retry next tick
-                self._dirty = True
+            async with self._lock:  # fold the deltas back in and retry next tick
+                for lifetime_key, delta in pending.items():
+                    _add(self._pending.setdefault(lifetime_key, _empty()), delta)
+                for bucket_key, delta in pending_hourly.items():
+                    _add(self._pending_hourly.setdefault(bucket_key, _empty()), delta)
+            return
+        async with self._lock:
+            self._adopt(truth, truth_hourly)
+
+    def _adopt(self, truth: dict, truth_hourly: dict) -> None:
+        """Replace local totals with the DB's, re-adding anything since the read.
+
+        A request can land between the write and the read-back; its delta is
+        already in ``_pending`` again, so folding that in keeps the in-memory
+        view a superset of the durable one rather than losing the straggler.
+        """
+        for (key_name, model), totals in truth.items():
+            merged = dict(totals)
+            _add(merged, self._pending.get((key_name, model), {}))
+            self._stats.setdefault(key_name, {})[model] = merged
+        for (hour, key_name, model), totals in truth_hourly.items():
+            merged = dict(totals)
+            _add(merged, self._pending_hourly.get((hour, key_name, model), {}))
+            self._hourly.setdefault(key_name, {}).setdefault(hour, {})[model] = merged
 
     def prune_memory(self, now: float | None = None) -> None:
         """Drop in-RAM buckets past the retention horizon (the DB keeps more)."""

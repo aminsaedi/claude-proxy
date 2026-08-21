@@ -57,7 +57,13 @@ def main() -> None:
         except Exception:  # noqa: BLE001
             usage = {}
         if usage:
-            db.replace_usage(usage)
+            db.add_usage([
+                (key_name, model,
+                 m.get("input_tokens", 0), m.get("output_tokens", 0),
+                 m.get("cache_read_input_tokens", 0), m.get("cache_creation_input_tokens", 0),
+                 m.get("requests", 0), m.get("cost_usd", 0.0))
+                for key_name, models in usage.items() for model, m in models.items()
+            ])
             print(f"usage: imported {sum(len(v) for v in usage.values())} rows")
 
     print("done.")

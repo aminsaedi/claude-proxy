@@ -7,3 +7,8 @@ PyYAML==6.0.3
 pydantic==2.13.3
 prometheus-client==0.21.1
 rich==15.0.0
+# uvloop + httptools replace uvicorn's asyncio/h11 defaults. This process is
+# pure I/O, so the cheaper event loop and C HTTP parser are a straight latency
+# win on every proxied request.
+uvloop==0.21.0
+httptools==0.6.4

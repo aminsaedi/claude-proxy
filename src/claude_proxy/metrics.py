@@ -74,9 +74,36 @@ FAILOVERS = Counter(
 )
 REQUEST_LATENCY = Histogram(
     "proxy_request_latency_seconds",
-    "Upstream request latency in seconds (time to first response)",
+    "End-to-end request duration in seconds (for streams, until the last byte)",
     ["model"],
-    buckets=(0.1, 0.25, 0.5, 1, 2, 4, 8, 16, 32, 64),
+    buckets=(0.1, 0.25, 0.5, 1, 2, 4, 8, 16, 32, 64, 128, 300),
+)
+UPSTREAM_TTFB = Histogram(
+    "proxy_upstream_ttfb_seconds",
+    "Time to the upstream response headers — the part of latency the proxy "
+    "and upstream control, isolated from how long a completion takes to generate",
+    ["model"],
+    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2, 4, 8, 16, 32),
+)
+AUDIT_QUEUED = Gauge(
+    "proxy_audit_queue_depth",
+    "Audit records waiting to be written by the background writer thread",
+)
+AUDIT_WRITTEN = Gauge(
+    "proxy_audit_records_written",
+    "Audit records written to disk since this process started",
+)
+AUDIT_DROPPED = Gauge(
+    "proxy_audit_records_dropped",
+    "Audit records discarded because the queue was full (never blocks a request)",
+)
+AUDIT_BYTES = Gauge(
+    "proxy_audit_db_bytes",
+    "On-disk size of the audit database",
+)
+AUDIT_ROWS = Gauge(
+    "proxy_audit_rows",
+    "Number of requests currently retained in the audit database",
 )
 
 

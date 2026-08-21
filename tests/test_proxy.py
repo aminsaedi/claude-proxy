@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import time
+
 import httpx
 
 from claude_proxy.app import UPSTREAM, AppState
+from claude_proxy.audit import AuditLog
 from claude_proxy.proxy_app import build_proxy_app
 
 
@@ -158,3 +162,202 @@ async def test_connection_errors_everywhere_return_502():
     assert r.status_code == 502
     assert r.json()["error"]["type"] == "api_error"
     await state.client.aclose()
+
+
+# =====================================================================
+# Audit capture on the request path
+# =====================================================================
+
+def _audited(handler, tmp_path, **kw):
+    """A state whose audit log writes to a throwaway file, already running."""
+    state = _make_state(handler)
+    state.audit = AuditLog(tmp_path / "audit.db", **kw)
+    state.audit.start()
+    return state
+
+
+def _wait(state, n=1, timeout=5.0):
+    deadline = time.time() + timeout
+    while state.audit.written < n and time.time() < deadline:
+        time.sleep(0.02)
+    assert state.audit.written >= n, f"audit writer stalled at {state.audit.written}/{n}"
+
+
+async def test_audit_captures_a_completed_request(tmp_path):
+    # A model the pricing table knows, so the recorded cost is a real number.
+    state = _audited(lambda req: httpx.Response(200, json={
+        "model": "claude-opus-5",
+        "content": [{"type": "text", "text": "the answer"}],
+        "usage": {"input_tokens": 12, "output_tokens": 34,
+                  "cache_read_input_tokens": 5, "cache_creation_input_tokens": 1},
+    }), tmp_path)
+    app = build_proxy_app(state)
+    try:
+        async with _asgi(app) as ac:
+            r = await ac.post("/v1/messages", headers={"x-api-key": "vk-alice"},
+                              json={"model": "claude-opus-5",
+                                    "messages": [{"role": "user", "content": "what is 2+2"}]})
+        assert r.status_code == 200
+        # the correlation id is echoed so a client can quote it in a bug report
+        assert r.headers["x-proxy-request-id"]
+        assert r.headers["x-proxy-upstream"] == "a"
+
+        _wait(state)
+        row = state.audit.query()[0]
+        assert row["key_name"] == "alice"
+        assert row["model"] == "claude-opus-5"
+        assert row["status"] == 200 and row["outcome"] == "ok"
+        assert row["input_tokens"] == 12 and row["output_tokens"] == 34
+        assert row["cost_usd"] > 0            # priced from the same lookup as usage
+        assert row["latency_ms"] is not None and row["ttfb_ms"] is not None
+        assert row["summary"] == "what is 2+2"
+        assert row["token_name"] == "a"
+        assert row["request_id"] == r.headers["x-proxy-request-id"]
+
+        full = state.audit.get(row["id"])
+        assert full["request"]["messages"][0]["content"] == "what is 2+2"
+        assert "the answer" in full["response"]
+    finally:
+        state.audit.stop()
+        await state.client.aclose()
+
+
+async def test_audit_records_a_budget_block_without_calling_upstream(tmp_path):
+    state = _audited(lambda req: httpx.Response(200, json={}), tmp_path)
+    state.limits.set("alice", {"day": 1.0})
+    await state.usage.record("alice", "claude-opus-5", input_tokens=10_000_000)
+    app = build_proxy_app(state)
+    try:
+        async with _asgi(app) as ac:
+            r = await ac.post("/v1/messages", headers={"x-api-key": "vk-alice"},
+                              json={"model": "claude-opus-5"})
+        assert r.status_code == 429
+        _wait(state)
+        row = state.audit.query()[0]
+        assert row["outcome"] == "blocked" and row["status"] == 429
+        assert "Spend limit" in row["error"]
+    finally:
+        state.limits.set("alice", {})
+        state.audit.stop()
+        await state.client.aclose()
+
+
+async def test_audit_records_a_rejection_but_never_its_body(tmp_path):
+    """An unauthenticated caller must not be able to write into the audit store."""
+    state = _audited(lambda req: httpx.Response(200, json={}), tmp_path)
+    app = build_proxy_app(state)
+    try:
+        async with _asgi(app) as ac:
+            r = await ac.post("/v1/messages", headers={"x-api-key": "nope"},
+                              json={"messages": [{"role": "user", "content": "x" * 5000}]})
+        assert r.status_code == 401
+        _wait(state)
+        row = state.audit.query()[0]
+        assert row["outcome"] == "rejected" and row["status"] == 401
+        assert not row["summary"]
+        assert state.audit.get(row["id"])["request"] is None
+    finally:
+        state.audit.stop()
+        await state.client.aclose()
+
+
+async def test_audit_off_adds_no_rows(tmp_path):
+    state = _audited(lambda req: httpx.Response(
+        200, json={"model": "m", "usage": {"input_tokens": 1, "output_tokens": 1}}),
+        tmp_path, mode="off")
+    app = build_proxy_app(state)
+    try:
+        async with _asgi(app) as ac:
+            assert (await ac.post("/v1/messages", headers={"x-api-key": "vk-alice"},
+                                  json={"model": "m"})).status_code == 200
+        await asyncio.sleep(0.2)   # give a writer that shouldn't exist a chance to run
+        assert state.audit.query() == []
+        # usage accounting is independent of auditing and must still be booked
+        assert (await state.usage.snapshot())["alice"]["m"]["requests"] >= 1
+    finally:
+        state.audit.stop()
+        await state.client.aclose()
+
+
+# =====================================================================
+# Streaming
+# =====================================================================
+
+_SSE = (
+    b'event: message_start\n'
+    b'data: {"type":"message_start","message":{"model":"claude-opus-5","usage":'
+    b'{"input_tokens":7,"cache_read_input_tokens":11,"cache_creation_input_tokens":2}}}\n\n'
+    b'event: ping\ndata: {"type":"ping"}\n\n'
+    b'event: content_block_delta\n'
+    b'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hel"}}\n\n'
+    b'event: content_block_delta\n'
+    b'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"lo"}}\n\n'
+    b'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":3}}\n\n'
+    b'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":9}}\n\n'
+    b'data: [DONE]\n\n'
+)
+
+
+def _sse_handler(request):
+    return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=_SSE)
+
+
+async def test_streaming_passes_through_and_captures_text(tmp_path):
+    state = _audited(_sse_handler, tmp_path)
+    app = build_proxy_app(state)
+    try:
+        async with _asgi(app) as ac:
+            r = await ac.post("/v1/messages", headers={"x-api-key": "vk-alice"},
+                              json={"model": "claude-opus-5", "stream": True,
+                                    "messages": [{"role": "user", "content": "hi"}]})
+        assert r.status_code == 200
+        assert r.content == _SSE, "the client's bytes must be relayed untouched"
+
+        _wait(state)
+        row = state.audit.query()[0]
+        assert row["streamed"] == 1
+        assert row["input_tokens"] == 7
+        assert row["cache_read_input_tokens"] == 11
+        # message_delta reports output_tokens cumulatively, so the high-water
+        # mark is the true count — summing them would give 12, not 9.
+        assert row["output_tokens"] == 9
+        assert state.audit.get(row["id"])["response"] == "Hello"
+    finally:
+        state.audit.stop()
+        await state.client.aclose()
+
+
+async def test_streaming_books_usage_once(tmp_path):
+    state = _audited(_sse_handler, tmp_path)
+    app = build_proxy_app(state)
+    try:
+        async with _asgi(app) as ac:
+            await ac.post("/v1/messages", headers={"x-api-key": "vk-alice"},
+                          json={"model": "claude-opus-5", "stream": True})
+        snap = await state.usage.snapshot()
+        m = snap["alice"]["claude-opus-5"]
+        assert m["requests"] == 1 and m["output_tokens"] == 9
+    finally:
+        state.audit.stop()
+        await state.client.aclose()
+
+
+# =====================================================================
+# Draining (zero-downtime rollout)
+# =====================================================================
+
+async def test_healthz_reports_draining_so_the_ingress_removes_the_pod():
+    state = _make_state(lambda req: httpx.Response(200, json={}))
+    app = build_proxy_app(state)
+    try:
+        async with _asgi(app) as ac:
+            assert (await ac.get("/healthz")).status_code == 200
+            state.draining = True
+            r = await ac.get("/healthz")
+            assert r.status_code == 503
+            assert r.json()["status"] == "draining"
+            # Traffic already in flight is still served — only readiness changes.
+            assert (await ac.post("/v1/messages", headers={"x-api-key": "vk-alice"},
+                                  json={"model": "m"})).status_code == 200
+    finally:
+        await state.client.aclose()

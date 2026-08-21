@@ -61,10 +61,7 @@ def test_rotate_virtual_key(dbpath):
 
 def test_rename_virtual_key_migrates_usage(dbpath):
     db.add_virtual_key("alice", "vk-a", path=dbpath)
-    db.replace_usage({"alice": {"claude-opus-4-8": {
-        "input_tokens": 3, "output_tokens": 4,
-        "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "requests": 1,
-    }}}, path=dbpath)
+    db.add_usage([("alice", "claude-opus-4-8", 3, 4, 0, 0, 1, 0.0)], path=dbpath)
     assert db.rename_virtual_key("alice", "alicia", path=dbpath) is True
     assert [v["name"] for v in db.list_virtual_keys(path=dbpath)] == ["alicia"]
     # usage history followed the rename
@@ -85,13 +82,33 @@ def test_config_roundtrip(dbpath):
     assert db.get_config_json(path=dbpath) == {"a": 9}
 
 
-def test_usage_replace_and_load(dbpath):
-    stats = {"alice": {"claude-opus-4-8": {
+def test_usage_writes_are_additive(dbpath):
+    """Two writes to the same (key, model) sum instead of overwriting.
+
+    This is what lets an old and a new pod share the database during a rolling
+    deploy without either one erasing the other's traffic.
+    """
+    db.add_usage([("alice", "claude-opus-4-8", 10, 20, 5, 1, 2, 0.125)], path=dbpath)
+    assert db.load_usage(path=dbpath) == {"alice": {"claude-opus-4-8": {
         "input_tokens": 10, "output_tokens": 20,
         "cache_read_input_tokens": 5, "cache_creation_input_tokens": 1, "requests": 2,
         "cost_usd": 0.125,
     }}}
-    db.replace_usage(stats, path=dbpath)
-    assert db.load_usage(path=dbpath) == stats
-    db.replace_usage({}, path=dbpath)
-    assert db.load_usage(path=dbpath) == {}
+    db.add_usage([("alice", "claude-opus-4-8", 1, 2, 0, 0, 1, 0.5)], path=dbpath)
+    row = db.load_usage(path=dbpath)["alice"]["claude-opus-4-8"]
+    assert row["input_tokens"] == 11 and row["requests"] == 3
+    assert row["cost_usd"] == pytest.approx(0.625)
+    assert db.read_usage([("alice", "claude-opus-4-8")], path=dbpath)[
+        ("alice", "claude-opus-4-8")]["output_tokens"] == 22
+    db.add_usage([], path=dbpath)  # a no-op flush must not touch anything
+    assert db.load_usage(path=dbpath)["alice"]["claude-opus-4-8"]["requests"] == 3
+
+
+def test_usage_hourly_writes_are_additive(dbpath):
+    db.add_usage_hourly([(3600, "alice", "m", 1, 2, 0, 0, 1, 0.25)], path=dbpath)
+    db.add_usage_hourly([(3600, "alice", "m", 4, 0, 0, 0, 1, 0.25)], path=dbpath)
+    rows = db.load_usage_hourly(path=dbpath)
+    assert len(rows) == 1
+    assert rows[0]["input_tokens"] == 5 and rows[0]["requests"] == 2
+    assert db.read_usage_hourly([(3600, "alice", "m")], path=dbpath)[
+        (3600, "alice", "m")]["cost_usd"] == pytest.approx(0.5)

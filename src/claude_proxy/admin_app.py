@@ -21,7 +21,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from prometheus_client import CONTENT_TYPE_LATEST, REGISTRY, generate_latest
 from pydantic import ValidationError
 
-from . import budgets, db, health, metrics
+from . import __version__, budgets, db, health, metrics
 from .config import save_config
 from .models import AppConfig
 from .paths import STATIC_DIR
@@ -93,8 +93,30 @@ async def _snapshot(state) -> dict:  # noqa: ANN001
         "auth_enabled": admin_auth_enabled(),
         "pricing": state.pricing.status(),
         "timezone": state.config.timezone,
+        # Live counters are read straight off the in-process object; the
+        # storage figures come from the cached background reading so a frame
+        # never opens the audit database.
+        "audit": {
+            **state.audit_stats,
+            "mode": state.audit.mode,
+            "queued": state.audit.depth(),
+            "dropped": state.audit.dropped,
+            "written": state.audit.written,
+            "retention_days": state.audit.retention_days,
+            "max_bytes": state.audit.max_bytes,
+        },
+        "started_at": state.started_at,
+        "version": __version__,
     }
 
+
+# Assets the console is allowed to fetch, with their content types. An explicit
+# map rather than a directory listing: `name` comes from the URL, and this makes
+# path traversal impossible by construction instead of by sanitising.
+_ASSETS = {
+    "console.css": "text/css; charset=utf-8",
+    "console.js": "application/javascript; charset=utf-8",
+}
 
 _ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 _ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
@@ -121,8 +143,35 @@ def build_admin_app(state) -> FastAPI:  # noqa: ANN001
     protected = [Depends(_require_auth)] if admin_auth_enabled() else []
 
     @app.get("/", response_class=HTMLResponse, dependencies=protected)
-    async def index() -> str:
-        return (STATIC_DIR / "admin.html").read_text()
+    async def index() -> HTMLResponse:
+        # The shell itself is never cached, and it stamps the build version
+        # into the asset URLs. That pairing is what lets the assets be cached
+        # hard: a new version changes their URLs, so no browser can be left
+        # running last release's JavaScript against this release's API.
+        html = (STATIC_DIR / "console.html").read_text().replace("__BUILD__", __version__)
+        return HTMLResponse(html, headers={"Cache-Control": "no-store"})
+
+    @app.get("/assets/{name}", dependencies=protected)
+    async def asset(name: str) -> Response:
+        """Serve the console's CSS/JS.
+
+        The console is split out of the HTML rather than inlined so it can be
+        edited as real files and cached as real files. Assets carry the build
+        version in their URL, so they can be cached hard and still turn over
+        the instant a new version ships.
+        """
+        if name not in _ASSETS:
+            raise HTTPException(status_code=404, detail="Not found")
+        path = STATIC_DIR / name
+        try:
+            body = path.read_bytes()
+        except OSError:
+            raise HTTPException(status_code=404, detail="Not found") from None
+        return Response(
+            content=body,
+            media_type=_ASSETS[name],
+            headers={"Cache-Control": "public, max-age=604800, immutable"},
+        )
 
     @app.get("/state", dependencies=protected)
     async def get_state() -> JSONResponse:
@@ -147,6 +196,13 @@ def build_admin_app(state) -> FastAPI:  # noqa: ANN001
                 # Prime the client with the current state immediately on connect.
                 while True:
                     if await request.is_disconnected():
+                        break
+                    if state.draining:
+                        # A long-lived stream would otherwise keep uvicorn's
+                        # graceful shutdown waiting out its whole timeout. Tell
+                        # the console to reconnect (it will land on the new pod)
+                        # and let go.
+                        yield "event: bye\ndata: draining\n\n"
                         break
                     ev.clear()  # clear before snapshotting so a concurrent
                     #             notify() during this pass isn't lost
@@ -349,6 +405,80 @@ def build_admin_app(state) -> FastAPI:  # noqa: ANN001
                                          **status})
         return JSONResponse({"ok": True, **status})
 
+    # --- request / prompt audit ------------------------------------------
+    @app.get("/requests", dependencies=protected)
+    async def list_requests(request: Request) -> JSONResponse:
+        """A page of recorded requests, newest first, without the bodies.
+
+        Every query runs in a worker thread: the audit database is on the same
+        disk as everything else, and a big scan must not stall the event loop
+        that is simultaneously proxying traffic.
+        """
+        q = request.query_params
+        try:
+            rows = await asyncio.to_thread(
+                state.audit.query,
+                limit=int(q.get("limit", 100)),
+                before_id=int(q["before_id"]) if q.get("before_id") else None,
+                after_id=int(q["after_id"]) if q.get("after_id") else None,
+                key_name=q.get("key") or None,
+                model=q.get("model") or None,
+                status=int(q["status"]) if q.get("status") else None,
+                outcome=q.get("outcome") or None,
+                since=float(q["since"]) if q.get("since") else None,
+                search=q.get("q") or None,
+            )
+        except (TypeError, ValueError) as e:
+            return JSONResponse(status_code=400, content={"error": f"bad filter: {e}"})
+        return JSONResponse({
+            "requests": rows,
+            # Cursor for the next page; absent once the last page is short.
+            "next_before_id": rows[-1]["id"] if rows else None,
+            "mode": state.audit.mode,
+        })
+
+    @app.get("/requests/{row_id}", dependencies=protected)
+    async def get_request(row_id: int) -> JSONResponse:
+        row = await asyncio.to_thread(state.audit.get, row_id)
+        if row is None:
+            return JSONResponse(status_code=404, content={"error": "No such request"})
+        return JSONResponse(row)
+
+    @app.get("/audit/stats", dependencies=protected)
+    async def audit_stats() -> JSONResponse:
+        stats = await asyncio.to_thread(state.audit.stats)
+        state.audit_stats = stats
+        return JSONResponse(stats)
+
+    @app.get("/audit/overview", dependencies=protected)
+    async def audit_overview(request: Request) -> JSONResponse:
+        hours = float(request.query_params.get("hours", 24))
+        since = time.time() - max(0.1, hours) * 3600
+        return JSONResponse(await asyncio.to_thread(state.audit.overview, since))
+
+    @app.get("/audit/models", dependencies=protected)
+    async def audit_models(request: Request) -> JSONResponse:
+        hours = float(request.query_params.get("hours", 24))
+        since = time.time() - max(0.1, hours) * 3600
+        rows = await asyncio.to_thread(state.audit.top_models, since)
+        return JSONResponse({"models": rows, "since": since})
+
+    @app.post("/audit/purge", dependencies=protected)
+    async def audit_purge() -> JSONResponse:
+        removed = await asyncio.to_thread(state.audit.purge)
+        state.audit_stats = await asyncio.to_thread(state.audit.stats)
+        state.notify()
+        log.warning("Audit log purged via admin API (%d records removed)", removed)
+        return JSONResponse({"ok": True, "removed": removed})
+
+    @app.post("/audit/sweep", dependencies=protected)
+    async def audit_sweep() -> JSONResponse:
+        """Run retention now instead of waiting for the writer's timer."""
+        result = await asyncio.to_thread(state.audit.sweep)
+        state.audit_stats = await asyncio.to_thread(state.audit.stats)
+        state.notify()
+        return JSONResponse({"ok": True, **result})
+
     @app.post("/select", dependencies=protected)
     async def select(request: Request) -> JSONResponse:
         name = (await request.json()).get("name", "")
@@ -377,7 +507,7 @@ def build_admin_app(state) -> FastAPI:  # noqa: ANN001
     async def set_config(request: Request) -> JSONResponse:
         body = await request.json()
         merged = state.config.model_dump()
-        for section in ("auto_rotation", "pricing"):
+        for section in ("auto_rotation", "pricing", "audit"):
             sub = body.get(section)
             if isinstance(sub, dict):
                 merged[section].update(sub)
@@ -395,6 +525,7 @@ def build_admin_app(state) -> FastAPI:  # noqa: ANN001
         save_config(cfg)
         if cfg.pricing.source_url != prev_url:
             state.pricing.url = cfg.pricing.source_url
+        state.apply_audit_config()  # mode / retention take effect immediately
         state.notify()
         log.info("Config updated via admin API")
         return JSONResponse({"ok": True, "config": cfg.model_dump()})

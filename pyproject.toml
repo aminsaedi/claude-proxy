@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-proxy"
-version = "2.1.0"
+version = "3.0.0"
 description = "Self-hosted Anthropic API proxy with virtual keys, usage/cost tracking, spend limits, and token failover/rotation"
 requires-python = ">=3.11"
 dependencies = [
@@ -15,6 +15,11 @@ dependencies = [
   "pydantic==2.13.3",
   "prometheus-client==0.21.1",
   "rich==15.0.0",
+  # uvloop + httptools replace the asyncio/h11 defaults in uvicorn. This
+  # process is pure I/O, so the cheaper event loop and C HTTP parser are a
+  # straight latency win on every request.
+  "uvloop==0.21.0; sys_platform != 'win32'",
+  "httptools==0.6.4",
 ]
 
 [project.optional-dependencies]
@@ -35,7 +40,7 @@ package-dir = {"" = "src"}
 where = ["src"]
 
 [tool.setuptools.package-data]
-claude_proxy = ["static/*.html"]
+claude_proxy = ["static/*.html", "static/*.css", "static/*.js"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

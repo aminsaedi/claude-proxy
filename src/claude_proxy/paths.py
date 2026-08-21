@@ -15,6 +15,13 @@ DATA_DIR = Path(os.environ.get("CLAUDE_PROXY_DATA_DIR", ".")).resolve()
 # SQLite is the single source of truth for tokens, virtual keys, config, and usage.
 DB_FILE = Path(os.environ.get("CLAUDE_PROXY_DB", str(DATA_DIR / "claude_proxy.db")))
 
+# Request/prompt audit log. A separate file from the main DB on purpose: its
+# write volume is orders of magnitude higher, and isolating it keeps that
+# traffic off the tokens/keys/usage tables entirely (see audit.py).
+AUDIT_DB_FILE = Path(
+    os.environ.get("CLAUDE_PROXY_AUDIT_DB", str(DATA_DIR / "audit.db"))
+)
+
 # Cached copy of the online model price list (see pricing.py).
 PRICING_CACHE_FILE = Path(
     os.environ.get("CLAUDE_PROXY_PRICING_CACHE", str(DATA_DIR / "model_prices.json"))
