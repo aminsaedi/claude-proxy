@@ -661,10 +661,18 @@ class AuditLog:
         average, because latency is the classic long-tailed distribution where
         the mean tells you about nobody: a p95 that has doubled is a real user
         complaint, a mean that has doubled might be one slow batch job.
+
+        They also cover *only requests that reached upstream*. A rejected key or
+        a blocked budget is answered locally in about a microsecond, and letting
+        those into the sample makes latency look better the more requests you
+        turn away — the p50 drops purely because more of the population never
+        left the building. Restricting both series to rows with a TTFB keeps
+        them measuring the same population as each other, and the one an
+        operator actually means.
         """
         out = {
             "since": since, "requests": 0, "errors": 0, "blocked": 0,
-            "cost_usd": 0.0, "tokens": 0,
+            "rejected": 0, "forwarded": 0, "cost_usd": 0.0, "tokens": 0,
             "ttfb_p50": None, "ttfb_p95": None,
             "latency_p50": None, "latency_p95": None,
         }
@@ -676,6 +684,8 @@ class AuditLog:
             row = conn.execute(
                 "SELECT COUNT(*) AS n, "
                 "SUM(outcome = 'error') AS errors, SUM(outcome = 'blocked') AS blocked, "
+                "SUM(outcome = 'rejected') AS rejected, "
+                "SUM(ttfb_ms IS NOT NULL) AS forwarded, "
                 "SUM(cost_usd) AS cost, "
                 "SUM(input_tokens + output_tokens + cache_read_input_tokens + "
                 "    cache_creation_input_tokens) AS tokens "
@@ -684,6 +694,8 @@ class AuditLog:
             out["requests"] = row["n"] or 0
             out["errors"] = row["errors"] or 0
             out["blocked"] = row["blocked"] or 0
+            out["rejected"] = row["rejected"] or 0
+            out["forwarded"] = row["forwarded"] or 0
             out["cost_usd"] = row["cost"] or 0.0
             out["tokens"] = row["tokens"] or 0
             for column, prefix in (("ttfb_ms", "ttfb"), ("latency_ms", "latency")):
@@ -716,22 +728,26 @@ class AuditLog:
             conn.close()
 
 
+# Only requests that actually reached upstream carry a TTFB, so this doubles as
+# "was this forwarded" — and using it for both series keeps them comparable.
+_FORWARDED = "ts >= ? AND ttfb_ms IS NOT NULL AND {column} IS NOT NULL"
+
+
 def _percentile(conn: sqlite3.Connection, column: str, since: float, q: float) -> float | None:
-    """The q-th percentile of ``column`` since ``ts``, or None with no data.
+    """The q-th percentile of ``column`` over forwarded requests, or None.
 
     ``column`` is never user input — it comes from a fixed tuple at the one call
     site — so interpolating it into the SQL is safe here.
     """
+    where = _FORWARDED.format(column=column)
     n = conn.execute(
-        f"SELECT COUNT({column}) AS n FROM requests WHERE ts >= ? AND {column} IS NOT NULL",
-        (since,),
+        f"SELECT COUNT({column}) AS n FROM requests WHERE {where}", (since,),
     ).fetchone()["n"]
     if not n:
         return None
     offset = min(n - 1, int(n * q))
     row = conn.execute(
-        f"SELECT {column} AS v FROM requests WHERE ts >= ? AND {column} IS NOT NULL "
-        f"ORDER BY {column} LIMIT 1 OFFSET ?",
+        f"SELECT {column} AS v FROM requests WHERE {where} ORDER BY {column} LIMIT 1 OFFSET ?",
         (since, offset),
     ).fetchone()
     return row["v"] if row else None

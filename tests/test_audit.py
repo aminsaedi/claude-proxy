@@ -186,10 +186,40 @@ def test_overview_reports_percentiles_and_error_counts(tmp_path):
         _drain(log, 100)
         o = log.overview(since=now - 60)
         assert o["requests"] == 100
+        assert o["forwarded"] == 100
         assert o["errors"] == 5
         assert o["latency_p50"] == pytest.approx(51, abs=2)
         assert o["latency_p95"] == pytest.approx(96, abs=2)
         assert o["ttfb_p50"] == pytest.approx(25.5, abs=1)
+    finally:
+        log.stop()
+
+
+def test_latency_percentiles_ignore_requests_that_never_left(tmp_path):
+    """A rejected key is answered locally in microseconds.
+
+    Counting those makes latency look better the more traffic you turn away,
+    and — since only forwarded requests record a TTFB — it also puts the two
+    series on different populations, which is how p50(ttfb) ended up *above*
+    p50(latency) in production.
+    """
+    log = _log(tmp_path)
+    try:
+        now = time.time()
+        for _ in range(10):    # real work: slow, and forwarded
+            log.submit(_rec(ts=now, latency_ms=5000.0, ttfb_ms=4000.0))
+        for _ in range(90):    # unknown key: instant, never forwarded
+            log.submit(_rec(ts=now, latency_ms=0.2, ttfb_ms=None,
+                            outcome="rejected", status=401))
+        _drain(log, 100)
+
+        o = log.overview(since=now - 60)
+        assert o["requests"] == 100
+        assert o["forwarded"] == 10
+        assert o["rejected"] == 90
+        assert o["latency_p50"] == pytest.approx(5000)
+        assert o["ttfb_p50"] == pytest.approx(4000)
+        assert o["ttfb_p50"] < o["latency_p50"], "TTFB can never exceed total latency"
     finally:
         log.stop()
 

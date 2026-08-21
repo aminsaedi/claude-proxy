@@ -10,7 +10,10 @@
 #   ./scripts/rollout.sh v9 --dry-run             # show what would happen
 #   ./scripts/rollout.sh --verify-only            # just probe, don't deploy
 #
-# Requires: kubectl with access to the cluster, and a virtual key in $VK.
+# kubectl runs locally by default. The API server here only listens on the
+# control plane's loopback, so set KUBECTL_SSH to drive it from there instead:
+#
+#   KUBECTL_SSH=amin@mx ./scripts/rollout.sh v9
 set -euo pipefail
 
 NS=claude-proxy
@@ -33,6 +36,25 @@ for arg in "$@"; do
 done
 
 say() { printf '\n\033[1m== %s ==\033[0m\n' "$*"; }
+
+# kubectl, wherever it has to run from.
+KUBECTL_SSH="${KUBECTL_SSH:-}"
+kube() {
+  if [[ -n "$KUBECTL_SSH" ]]; then
+    ssh -o BatchMode=yes "$KUBECTL_SSH" kubectl "$@"
+  else
+    kubectl "$@"
+  fi
+}
+# apply reads the manifest from *this* machine either way, so a remote kubectl
+# is fed on stdin rather than being asked for a path it cannot see.
+kube_apply() {
+  if [[ -n "$KUBECTL_SSH" ]]; then
+    ssh -o BatchMode=yes "$KUBECTL_SSH" "kubectl apply -f -" < "$MANIFEST"
+  else
+    kubectl apply -f "$MANIFEST"
+  fi
+}
 
 # --- the probe -------------------------------------------------------------
 # /healthz on the public endpoint: cheap, needs no key, and — crucially — is the
@@ -67,14 +89,18 @@ report() {
 
 if $DRY_RUN; then
   say "Dry run"
-  kubectl -n "$NS" diff -f "$MANIFEST" || true
+  if [[ -n "$KUBECTL_SSH" ]]; then
+    ssh -o BatchMode=yes "$KUBECTL_SSH" "kubectl -n $NS diff -f -" < "$MANIFEST" || true
+  else
+    kubectl -n "$NS" diff -f "$MANIFEST" || true
+  fi
   exit 0
 fi
 
 if ! $VERIFY_ONLY; then
   [[ -n "$TAG" ]] || { echo "usage: $0 <image-tag> [--dry-run]" >&2; exit 2; }
   say "Pre-flight"
-  kubectl -n "$NS" get deploy "$DEPLOY" -o wide
+  kube -n "$NS" get deploy "$DEPLOY" -o wide
   echo "  target image: ${REGISTRY}/${DEPLOY}:${TAG}"
 fi
 
@@ -85,15 +111,15 @@ sleep 3   # a short baseline before anything changes
 
 if ! $VERIFY_ONLY; then
   say "Applying manifest"
-  kubectl apply -f "$MANIFEST"
+  kube_apply
 
   # apply already carries the new tag, but set it explicitly so re-running with
   # the same manifest and a new tag still triggers a rollout.
-  kubectl -n "$NS" set image "deploy/$DEPLOY" \
-    "${CONTAINER}=${REGISTRY}/${DEPLOY}:${TAG}" --record=false
+  kube -n "$NS" set image "deploy/$DEPLOY" \
+    "${CONTAINER}=${REGISTRY}/${DEPLOY}:${TAG}"
 
   say "Waiting for the rollout"
-  kubectl -n "$NS" rollout status "deploy/$DEPLOY" --timeout=10m
+  kube -n "$NS" rollout status "deploy/$DEPLOY" --timeout=10m
 
   say "Settling"
   sleep 15   # keep probing after the old pod goes, to catch a late gap
@@ -105,9 +131,12 @@ trap - EXIT
 
 if ! $VERIFY_ONLY; then
   say "Now running"
-  kubectl -n "$NS" get pods -o wide
-  kubectl -n "$NS" get deploy "$DEPLOY" \
-    -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+  kube -n "$NS" get pods -o wide
+  # No jsonpath here: a remote kubectl runs through a second shell, which eats
+  # the backslash in {"\n"} and makes kubectl reject the expression.
+  kube -n "$NS" get deploy "$DEPLOY" \
+    -o go-template='{{(index .spec.template.spec.containers 0).image}}'
+  echo
 fi
 
 report

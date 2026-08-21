@@ -358,18 +358,26 @@ function renderTiles() {
   const t = sumUsage();
   const tz = state.timezone || "local";
   const o = auditOverview || {};
-  const errRate = o.requests ? (o.errors / o.requests) : 0;
+  // Rate over *forwarded* requests: a rejected key never reached upstream, so
+  // counting it as a failure of the upstream would be misleading in both
+  // directions — it inflates the rate, and a flood of them would drown out a
+  // real upstream problem.
+  const bad = (o.errors || 0) + (o.blocked || 0);
+  const errRate = o.forwarded ? (o.errors || 0) / o.forwarded : 0;
   const errSev = errRate >= 0.1 ? "crit" : errRate >= 0.02 ? "warn" : "good";
+  const rejected = o.rejected || 0;
   const tiles = [
     { k: "Spend today", v: usd(t.win["1d"]), sub: tz, cls: "accent" },
     { k: "Spend 7d", v: usd(t.win["7d"]), sub: "7 calendar days", cls: "accent" },
     { k: "Spend all-time", v: usd(t.cost), sub: `${fmt(t.req)} requests` },
-    { k: "Requests 24h", v: fmt(o.requests || 0), sub: `${fmt(o.tokens || 0)} tokens` },
+    { k: "Requests 24h", v: fmt(o.forwarded || 0), sub: `${fmt(o.tokens || 0)} tokens` },
     {
       k: "Error rate 24h",
-      v: o.requests ? (errRate * 100).toFixed(1) + "%" : "—",
-      sub: `${fmt(o.errors || 0)} failed · ${fmt(o.blocked || 0)} blocked`,
-      ink: o.requests ? sevInk(errSev) : null,
+      v: o.forwarded ? (errRate * 100).toFixed(1) + "%" : "—",
+      sub: bad || rejected
+        ? `${fmt(o.errors || 0)} failed · ${fmt(o.blocked || 0)} blocked · ${fmt(rejected)} rejected`
+        : "no failures",
+      ink: o.forwarded ? sevInk(errSev) : null,
     },
     { k: "Active clients", v: String(t.activeClients), sub: `of ${(state.virtual_keys || []).length} keys` },
   ];
@@ -407,8 +415,8 @@ function renderSpendChart() {
 function renderLatency() {
   const o = auditOverview;
   const box = $("#latencyPanel");
-  if (!o || !o.requests) {
-    box.innerHTML = `<div class="empty">No requests recorded in the last 24h.</div>`;
+  if (!o || !o.forwarded) {
+    box.innerHTML = `<div class="empty">No requests forwarded upstream in the last 24h.</div>`;
     return;
   }
   // Percentiles, not averages: latency is long-tailed, and the mean describes
@@ -417,6 +425,10 @@ function renderLatency() {
     ["Time to first byte", o.ttfb_p50, o.ttfb_p95],
     ["Full response", o.latency_p50, o.latency_p95],
   ];
+  const rejectedNote = o.rejected
+    ? `<div class="subtle" style="margin-top:8px">${fmt(o.rejected)} request${o.rejected > 1 ? "s were" : " was"}
+       rejected on an unknown key and never forwarded — excluded from these figures.</div>`
+    : "";
   box.innerHTML = `<table class="tbl">
     <thead><tr><th>Last 24h</th><th class="r">p50</th><th class="r">p95</th></tr></thead>
     <tbody>${rows.map(([label, p50, p95]) => `<tr>
@@ -425,9 +437,10 @@ function renderLatency() {
       <td class="strong mono">${esc(ms(p95))}</td></tr>`).join("")}</tbody>
   </table>
   <div class="subtle" style="margin-top:12px">
+    Over the ${esc(fmt(o.forwarded || 0))} request${o.forwarded === 1 ? "" : "s"} actually forwarded upstream.
     Time to first byte is the part the proxy and upstream control; the full
     response also covers however long the completion took to generate.
-  </div>`;
+  </div>${rejectedNote}`;
 }
 
 function renderModels() {
