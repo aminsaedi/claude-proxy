@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-proxy"
-version = "3.0.1"
+version = "3.0.2"
 description = "Self-hosted Anthropic API proxy with virtual keys, usage/cost tracking, spend limits, and token failover/rotation"
 requires-python = ">=3.11"
 dependencies = [

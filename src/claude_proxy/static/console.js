@@ -374,8 +374,10 @@ function renderTiles() {
     {
       k: "Error rate 24h",
       v: o.forwarded ? (errRate * 100).toFixed(1) + "%" : "—",
+      // Kept short: this line is one tile wide and ellipsises if it runs long.
       sub: bad || rejected
-        ? `${fmt(o.errors || 0)} failed · ${fmt(o.blocked || 0)} blocked · ${fmt(rejected)} rejected`
+        ? [o.errors && `${fmt(o.errors)} failed`, o.blocked && `${fmt(o.blocked)} blocked`,
+           rejected && `${fmt(rejected)} rejected`].filter(Boolean).join(" · ")
         : "no failures",
       ink: o.forwarded ? sevInk(errSev) : null,
     },

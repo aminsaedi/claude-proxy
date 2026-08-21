@@ -708,7 +708,12 @@ class AuditLog:
         return out
 
     def top_models(self, since: float, limit: int = 8) -> list[dict]:
-        """Spend and volume grouped by model — the request-view header strip."""
+        """Spend and volume by model, over forwarded requests only.
+
+        Rejected requests carry no model, so including them adds a nameless row
+        with zero cost and a microsecond latency to a table about models — and
+        drags the average latency column with it.
+        """
         try:
             conn = self._connect()
         except Exception:  # noqa: BLE001
@@ -717,8 +722,8 @@ class AuditLog:
             rows = conn.execute(
                 "SELECT model, COUNT(*) AS requests, SUM(cost_usd) AS cost_usd, "
                 "AVG(latency_ms) AS avg_latency_ms, AVG(ttfb_ms) AS avg_ttfb_ms "
-                "FROM requests WHERE ts >= ? GROUP BY model "
-                "ORDER BY cost_usd DESC LIMIT ?",
+                "FROM requests WHERE ts >= ? AND ttfb_ms IS NOT NULL "
+                "GROUP BY model ORDER BY cost_usd DESC LIMIT ?",
                 (float(since), int(limit)),
             ).fetchall()
             return [dict(r) for r in rows]

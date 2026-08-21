@@ -232,6 +232,10 @@ def test_top_models_ranks_by_spend(tmp_path):
         log.submit(_rec(ts=now, model="dear", cost_usd=5.0))
         log.submit(_rec(ts=now, model="dear", cost_usd=1.0))
         _drain(log, 3)
+        # A rejected request has no model and never reached upstream; it must
+        # not appear as a nameless row in a table about models.
+        log.submit(_rec(ts=now, model="", ttfb_ms=None, outcome="rejected", cost_usd=0.0))
+        _drain(log, 4)
         rows = log.top_models(since=now - 60)
         assert [r["model"] for r in rows] == ["dear", "cheap"]
         assert rows[0]["requests"] == 2 and rows[0]["cost_usd"] == pytest.approx(6.0)
