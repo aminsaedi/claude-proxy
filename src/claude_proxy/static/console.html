@@ -10,18 +10,20 @@
 </head>
 <body>
 
+<a class="skip" href="#scroll">Skip to content</a>
+
 <header class="topbar">
-  <span class="brand">
+  <h1 class="brand">
     <svg width="21" height="21" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="var(--brand)"/><path d="M9 22 L16 9 L23 22" stroke="var(--on-brand)" stroke-width="2.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
     Claude Proxy <span class="sub">Console</span>
-  </span>
+  </h1>
 
   <nav class="nav" id="nav" role="tablist" aria-label="Console sections">
-    <button role="tab" data-view="overview"  aria-selected="true">Overview</button>
-    <button role="tab" data-view="requests"  aria-selected="false">Requests<span class="pip" id="navReqCount"></span></button>
-    <button role="tab" data-view="clients"   aria-selected="false">Clients</button>
-    <button role="tab" data-view="upstreams" aria-selected="false">Upstreams</button>
-    <button role="tab" data-view="settings"  aria-selected="false">Settings</button>
+    <button role="tab" data-view="overview"  aria-controls="view-overview" aria-selected="true" tabindex="0">Overview</button>
+    <button role="tab" data-view="requests"  aria-controls="view-requests" aria-selected="false" tabindex="-1">Requests<span class="pip" id="navReqCount"></span></button>
+    <button role="tab" data-view="clients"   aria-controls="view-clients" aria-selected="false" tabindex="-1">Clients</button>
+    <button role="tab" data-view="upstreams" aria-controls="view-upstreams" aria-selected="false" tabindex="-1">Upstreams</button>
+    <button role="tab" data-view="settings"  aria-controls="view-settings" aria-selected="false" tabindex="-1">Settings</button>
   </nav>
 
   <span class="grow"></span>
@@ -36,133 +38,135 @@
   </button>
 </header>
 
-<main class="wrap">
-  <div class="banner" id="banner" role="alert">
-    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>
-    <span id="bannerText">Can't reach the proxy.</span>
-  </div>
+<main class="scroll" id="scroll" tabindex="-1">
+  <div class="wrap">
+    <div class="banner" id="banner" role="alert">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M12 9v4M12 17h.01"/><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/></svg>
+      <span id="bannerText">Can't reach the proxy.</span>
+    </div>
 
-  <!-- ============================ OVERVIEW ============================ -->
-  <section class="view active" id="view-overview" role="tabpanel" aria-label="Overview">
-    <div class="hero" id="hero">
-      <div class="skl" style="height:136px"></div>
-      <div class="grid" style="gap:12px">
-        <div class="skl" style="height:22px;width:40%"></div>
-        <div class="skl" style="height:14px;width:70%"></div>
+    <!-- ============================ OVERVIEW ============================ -->
+    <section class="view active" id="view-overview" role="tabpanel" aria-label="Overview">
+      <div class="hero" id="hero">
+        <div class="skl" style="height:136px"></div>
+        <div class="grid" style="gap:12px">
+          <div class="skl" style="height:22px;width:40%"></div>
+          <div class="skl" style="height:14px;width:70%"></div>
+        </div>
       </div>
-    </div>
 
-    <div class="sec">
-      <div class="sec-head"><h2>Fleet totals</h2><span class="rule"></span></div>
-      <div class="tiles" id="tiles"></div>
-    </div>
-
-    <div class="sec grid cols-3-1">
-      <div>
-        <div class="sec-head"><h2>Spend by day</h2><span class="count" id="spendRange"></span><span class="rule"></span></div>
-        <div class="card panel" id="spendChart"></div>
+      <div class="sec">
+        <div class="sec-head"><h2>Fleet totals</h2><span class="rule"></span></div>
+        <div class="tiles" id="tiles"></div>
       </div>
-      <div>
-        <div class="sec-head"><h2>Latency</h2><span class="rule"></span></div>
-        <div class="card panel" id="latencyPanel"></div>
+
+      <div class="sec grid cols-3-1">
+        <div>
+          <div class="sec-head"><h2>Spend by day</h2><span class="count" id="spendRange"></span><span class="rule"></span></div>
+          <div class="card panel" id="spendChart"></div>
+        </div>
+        <div>
+          <div class="sec-head"><h2>Latency</h2><span class="rule"></span></div>
+          <div class="card panel" id="latencyPanel"></div>
+        </div>
       </div>
-    </div>
 
-    <div class="sec">
-      <div class="sec-head"><h2>By model</h2><span class="count" id="modelRange">last 24h</span><span class="rule"></span></div>
-      <div class="card panel tbl-scroll" id="modelPanel"></div>
-    </div>
-  </section>
-
-  <!-- ============================ REQUESTS ============================ -->
-  <section class="view" id="view-requests" role="tabpanel" aria-label="Request log">
-    <div class="sec-head">
-      <h2>Request log</h2><span class="count" id="reqCount"></span><span class="rule"></span>
-      <span class="chip" id="auditChip"></span>
-      <button class="btn sm" id="liveBtn" aria-pressed="true"><span class="livedot" id="liveDot"></span>Live</button>
-    </div>
-
-    <div class="filters">
-      <input type="search" id="fSearch" placeholder="Search prompts, models, paths…" autocomplete="off" spellcheck="false" aria-label="Search requests">
-      <select id="fKey" aria-label="Filter by client"><option value="">All clients</option></select>
-      <select id="fOutcome" aria-label="Filter by outcome">
-        <option value="">All outcomes</option>
-        <option value="ok">OK</option>
-        <option value="error">Errors</option>
-        <option value="blocked">Over budget</option>
-        <option value="rejected">Rejected</option>
-      </select>
-      <select id="fRange" aria-label="Time range">
-        <option value="1">Last hour</option>
-        <option value="24" selected>Last 24h</option>
-        <option value="72">Last 3 days</option>
-        <option value="168">Last 7 days</option>
-        <option value="">All retained</option>
-      </select>
-      <button class="btn sm ghost" id="fClear">Clear</button>
-    </div>
-
-    <div class="card reqscroll">
-      <table class="reqtable" id="reqTable">
-        <thead><tr>
-          <th style="width:74px">Time</th>
-          <th style="width:1px"></th>
-          <th>Prompt</th>
-          <th style="width:110px">Client</th>
-          <th style="width:130px">Model</th>
-          <th class="r" style="width:78px">Tokens</th>
-          <th class="r" style="width:70px">Cost</th>
-          <th class="r" style="width:78px">Latency</th>
-        </tr></thead>
-        <tbody id="reqBody"></tbody>
-      </table>
-      <div class="empty" id="reqEmpty">Loading…</div>
-    </div>
-    <div style="display:flex;justify-content:center;margin-top:14px">
-      <button class="btn" id="moreBtn" hidden>Load older</button>
-    </div>
-  </section>
-
-  <!-- ============================ CLIENTS ============================ -->
-  <!-- Built in JS (see console.js § CLIENTS): a list pane and a detail pane. -->
-  <section class="view" id="view-clients" role="tabpanel" aria-label="Clients"></section>
-  <span class="vh" id="clientCount"></span>
-
-  <!-- ============================ UPSTREAMS ============================ -->
-  <section class="view" id="view-upstreams" role="tabpanel" aria-label="Upstream tokens">
-    <div class="sec-head">
-      <h2>Upstream tokens</h2><span class="count" id="tokCount"></span><span class="rule"></span>
-      <button class="btn sm" id="addTokenBtn" type="button">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>Add token
-      </button>
-    </div>
-    <div class="grid cols-2" id="tokens"></div>
-
-    <div class="sec">
-      <div class="sec-head"><h2>Rotation log</h2><span class="rule"></span></div>
-      <div class="card panel"><div class="log" id="log"><div class="empty">No rotations yet.</div></div></div>
-    </div>
-  </section>
-
-  <!-- ============================ SETTINGS ============================ -->
-  <section class="view" id="view-settings" role="tabpanel" aria-label="Settings">
-    <div class="grid cols-2">
-      <div>
-        <div class="sec-head"><h2>Configuration</h2><span class="rule"></span></div>
-        <form class="card panel" id="cfgForm"></form>
+      <div class="sec">
+        <div class="sec-head"><h2>By model</h2><span class="count" id="modelRange">last 24h</span><span class="rule"></span></div>
+        <div class="card panel tbl-scroll" id="modelPanel"></div>
       </div>
-      <div>
-        <div class="sec-head"><h2>Audit storage</h2><span class="rule"></span></div>
-        <div class="card panel" id="auditPanel"></div>
-        <div class="sec-head" style="margin-top:22px"><h2>Pricing</h2><span class="rule"></span></div>
-        <div class="card panel" id="pricingPanel"></div>
-      </div>
-    </div>
-  </section>
+    </section>
 
-  <div class="foot">
-    <span>Prometheus metrics at <a href="/metrics" target="_blank" rel="noopener">/metrics</a></span>
-    <span id="authnote"></span>
+    <!-- ============================ REQUESTS ============================ -->
+    <section class="view" id="view-requests" role="tabpanel" aria-label="Request log">
+      <div class="sec-head">
+        <h2>Request log</h2><span class="count" id="reqCount"></span><span class="rule"></span>
+        <span class="chip" id="auditChip"></span>
+        <button class="btn sm" id="liveBtn" aria-pressed="true"><span class="livedot" id="liveDot"></span>Live</button>
+      </div>
+
+      <div class="filters">
+        <input type="search" id="fSearch" placeholder="Search prompts, models, paths…" autocomplete="off" spellcheck="false" aria-label="Search requests">
+        <select id="fKey" aria-label="Filter by client"><option value="">All clients</option></select>
+        <select id="fOutcome" aria-label="Filter by outcome">
+          <option value="">All outcomes</option>
+          <option value="ok">OK</option>
+          <option value="error">Errors</option>
+          <option value="blocked">Over budget</option>
+          <option value="rejected">Rejected</option>
+        </select>
+        <select id="fRange" aria-label="Time range">
+          <option value="1">Last hour</option>
+          <option value="24" selected>Last 24h</option>
+          <option value="72">Last 3 days</option>
+          <option value="168">Last 7 days</option>
+          <option value="">All retained</option>
+        </select>
+        <button class="btn sm ghost" id="fClear">Clear</button>
+      </div>
+
+      <div class="card reqscroll">
+        <table class="reqtable" id="reqTable">
+          <thead><tr>
+            <th style="width:74px">Time</th>
+            <th style="width:1px"></th>
+            <th>Prompt</th>
+            <th style="width:110px">Client</th>
+            <th style="width:130px">Model</th>
+            <th class="r" style="width:78px">Tokens</th>
+            <th class="r" style="width:70px">Cost</th>
+            <th class="r" style="width:78px">Latency</th>
+          </tr></thead>
+          <tbody id="reqBody"></tbody>
+        </table>
+        <div class="empty" id="reqEmpty">Loading…</div>
+      </div>
+      <div style="display:flex;justify-content:center;margin-top:14px">
+        <button class="btn" id="moreBtn" hidden>Load older</button>
+      </div>
+    </section>
+
+    <!-- ============================ CLIENTS ============================ -->
+    <!-- Built in JS (see console.js § CLIENTS): a list pane and a detail pane. -->
+    <section class="view" id="view-clients" role="tabpanel" aria-label="Clients"></section>
+    <span class="vh" id="clientCount"></span>
+
+    <!-- ============================ UPSTREAMS ============================ -->
+    <section class="view" id="view-upstreams" role="tabpanel" aria-label="Upstream tokens">
+      <div class="sec-head">
+        <h2>Upstream tokens</h2><span class="count" id="tokCount"></span><span class="rule"></span>
+        <button class="btn sm" id="addTokenBtn" type="button">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>Add token
+        </button>
+      </div>
+      <div class="grid cols-2" id="tokens"></div>
+
+      <div class="sec">
+        <div class="sec-head"><h2>Rotation log</h2><span class="rule"></span></div>
+        <div class="card panel"><div class="log" id="log"><div class="empty">No rotations yet.</div></div></div>
+      </div>
+    </section>
+
+    <!-- ============================ SETTINGS ============================ -->
+    <section class="view" id="view-settings" role="tabpanel" aria-label="Settings">
+      <div class="grid cols-2">
+        <div>
+          <div class="sec-head"><h2>Configuration</h2><span class="rule"></span></div>
+          <form class="card panel" id="cfgForm"></form>
+        </div>
+        <div>
+          <div class="sec-head"><h2>Audit storage</h2><span class="rule"></span></div>
+          <div class="card panel" id="auditPanel"></div>
+          <div class="sec-head" style="margin-top:22px"><h2>Pricing</h2><span class="rule"></span></div>
+          <div class="card panel" id="pricingPanel"></div>
+        </div>
+      </div>
+    </section>
+
+    <div class="foot">
+      <span>Prometheus metrics at <a href="/metrics" target="_blank" rel="noopener">/metrics</a></span>
+      <span id="authnote"></span>
+    </div>
   </div>
 </main>
 

@@ -7,9 +7,12 @@ throws away what you were typing. These are the properties that actually broke
 in practice, asserted against a running instance:
 
   * every view renders, in both themes, with no console errors;
+  * no scroll container is nested inside another one on the same axis — the
+    whole point of the shell is that the wheel only ever moves one thing;
   * saving a spend limit is reflected immediately, not after a page refresh;
   * a live update never overwrites a field being edited;
-  * live updates patch the DOM instead of rebuilding it (nodes keep identity).
+  * live updates patch the DOM instead of rebuilding it (nodes keep identity);
+  * the request drawer takes focus, seals the page behind it, and gives it back.
 
     pip install playwright && playwright install chromium
     python scripts/ui-smoke.py http://127.0.0.1:8090
@@ -40,6 +43,49 @@ CHROME = os.environ.get("CHROME_PATH") or None
 
 failures: list[str] = []
 
+# Every element that actually scrolls, per axis, as "tag.class > tag.class"
+# pairs where one sits inside the other. A non-empty result is a nested
+# same-axis scrollbox: two wheel targets stacked, which is the thing this
+# console was rebuilt to not have.
+NESTED_SCROLLERS = """() => {
+  const name = n => n === document.scrollingElement ? '<page>'
+    : n.tagName.toLowerCase() + (n.id ? '#' + n.id : '') +
+      (n.className && typeof n.className === 'string' ? '.' + n.className.trim().split(/\\s+/)[0] : '');
+  // The viewport takes its overflow from <html>, or from <body> when <html> is
+  // `visible` — so `body { overflow: hidden }` is what makes the page itself
+  // stop being a wheel target, even though scrollHeight still reports the
+  // content's full size.
+  const rootCS = getComputedStyle(document.documentElement);
+  const bodyCS = getComputedStyle(document.body);
+  const viewportOverflow = axis => {
+    const key = axis === 'y' ? 'overflowY' : 'overflowX';
+    return rootCS[key] === 'visible' ? bodyCS[key] : rootCS[key];
+  };
+  const wheelable = ov => ov === 'auto' || ov === 'scroll' || ov === 'visible';
+  const scrollers = axis => {
+    const out = [];
+    const de = document.documentElement;
+    const over = axis === 'y' ? de.scrollHeight > innerHeight + 1 : de.scrollWidth > innerWidth + 1;
+    if (over && wheelable(viewportOverflow(axis))) out.push(document.scrollingElement);
+    for (const n of document.querySelectorAll('*')) {
+      const cs = getComputedStyle(n);
+      const ov = axis === 'y' ? cs.overflowY : cs.overflowX;
+      if (ov !== 'auto' && ov !== 'scroll') continue;
+      if (axis === 'y' ? n.scrollHeight > n.clientHeight + 1 : n.scrollWidth > n.clientWidth + 1) out.push(n);
+    }
+    return out;
+  };
+  const bad = [];
+  for (const axis of ['y', 'x']) {
+    const list = scrollers(axis);
+    for (const a of list) for (const b of list) {
+      if (a === b) continue;
+      if (a === document.scrollingElement || a.contains(b)) bad.push(axis + ': ' + name(a) + ' > ' + name(b));
+    }
+  }
+  return bad;
+}"""
+
 
 def check(name: str, ok: bool, detail: str = "") -> None:
     print(f"  {'PASS' if ok else 'FAIL'}  {name}{'  — ' + detail if detail else ''}")
@@ -66,8 +112,61 @@ with sync_playwright() as p:
             page.wait_for_timeout(700)
             body = page.locator(f"#view-{view}").inner_text()
             check(f"{view} renders", len(body.strip()) > 40, f"{len(body)} chars")
+            nested = page.evaluate(NESTED_SCROLLERS)
+            check(f"{view} has no nested scrollers", not nested, "; ".join(nested)[:160])
         check("no JS errors", not errors, "; ".join(dict.fromkeys(errors))[:200])
         page.close()
+
+    print("\n== narrow viewport ==")
+    page = browser.new_page(viewport={"width": 620, "height": 900})
+    page.goto(BASE, wait_until="networkidle")
+    page.wait_for_timeout(1200)
+    for view in VIEWS:
+        page.click(f'#nav button[data-view="{view}"]')
+        page.wait_for_timeout(500)
+        nested = page.evaluate(NESTED_SCROLLERS)
+        check(f"{view} has no nested scrollers at 620px", not nested, "; ".join(nested)[:160])
+    page.close()
+
+    print("\n== request drawer ==")
+    errors = []
+    page = browser.new_page(viewport={"width": 1500, "height": 980})
+    page.on("pageerror", lambda e: errors.append(str(e)))
+    page.goto(BASE, wait_until="networkidle")
+    page.click('#nav button[data-view="requests"]')
+    page.wait_for_timeout(1500)
+    if page.locator("#reqBody tr").count():
+        page.locator("#reqBody tr").first.focus()
+        page.keyboard.press("Enter")          # rows must open from the keyboard
+        page.wait_for_timeout(900)
+        check("drawer opens from the keyboard", page.locator("#drawer.open").count() == 1)
+        check("focus moves into the drawer",
+              page.evaluate("document.activeElement.closest('#drawer') !== null"))
+        check("page behind the drawer is inert", page.evaluate("$('#scroll').inert === true"))
+        check("drawer has no nested scrollers", not page.evaluate(NESTED_SCROLLERS),
+              "; ".join(page.evaluate(NESTED_SCROLLERS))[:160])
+        # Prompt turns are clamped and expanded in place; none of them may
+        # grow a scrollbar of their own inside the drawer's own scroller.
+        inner = page.evaluate(
+            """() => [...document.querySelectorAll('.turn-body')]
+                 .filter(n => n.scrollHeight > n.clientHeight + 1 &&
+                              ['auto','scroll'].includes(getComputedStyle(n).overflowY)).length""")
+        check("no prompt turn scrolls inside the drawer", inner == 0, f"{inner} scrolling turn(s)")
+        clamped = page.locator(".turn-more").count()
+        if clamped:
+            page.locator(".turn-more").first.click()
+            page.wait_for_timeout(400)
+            check("expanding a turn adds no scrollbox", not page.evaluate(NESTED_SCROLLERS),
+                  f"{clamped} expandable turn(s)")
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(400)
+        check("Escape closes and un-inerts", page.evaluate("$('#scroll').inert === false"))
+        check("focus returns to the row",
+              page.evaluate("document.activeElement.tagName.toLowerCase() === 'tr'"))
+    else:
+        print("  SKIP  drawer checks — no requests in the log")
+    check("no JS errors", not errors, "; ".join(dict.fromkeys(errors))[:200])
+    page.close()
 
     print("\n== clients: selection and saving ==")
     errors = []

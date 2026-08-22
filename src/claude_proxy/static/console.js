@@ -471,8 +471,11 @@ const Clients = {
         el("div.lim-field",
           el("span.lim-currency", { text: "$" }),
           el("input.inp.lim-input", {
-            type: "number", min: "0", step: "0.01", placeholder: "no cap",
+            type: "number", min: "0", step: "0.01", inputmode: "decimal", placeholder: "no cap",
             "data-period": period, "aria-label": label + " spend limit",
+            // A focused number input eats the wheel and silently edits the
+            // value while you are only trying to scroll past it.
+            onwheel: e => { if (document.activeElement === e.currentTarget) e.currentTarget.blur(); },
             oninput: () => this.markDirty(),
             onkeydown: e => { if (e.key === "Enter") { e.preventDefault(); this.saveLimits(); } },
           })),
@@ -964,7 +967,13 @@ const Requests = {
     list(body, this.rows, {
       key: r => r.id,
       create: r => {
-        const node = el("tr", { onclick: () => this.open(r.id) },
+        const node = el("tr", {
+          tabindex: "0",
+          onclick: () => this.open(r.id),
+          onkeydown: e => {
+            if (e.key === "Enter" || e.key === " ") { e.preventDefault(); this.open(r.id); }
+          },
+        },
           el("td.when"), el("td"), el("td.sum"), el("td"),
           el("td.num"), el("td.num.r"), el("td.num.r"), el("td.num.r"));
         if (newIds && newIds.has(r.id)) {
@@ -996,14 +1005,21 @@ const Requests = {
   async open(id) {
     this.selectedId = id;
     this.render();
+    // Remember what opened it, then make everything behind the drawer inert so
+    // Tab can't walk out of it into a page the user can't even see.
+    this.returnFocus = document.activeElement;
     $("#drawer").classList.add("open");
     $("#drawer").setAttribute("aria-hidden", "false");
     $("#drawerScrim").classList.add("open");
+    pageInert(true);
+    $("#drawerClose").focus();
     clear($("#drawerBody")).appendChild(el("div.skl", { style: "height:120px" }));
     try {
       const d = await api("GET", "/requests/" + id);
+      if (this.selectedId !== id) return;      // a newer row won the race
       txt($("#drawerTitle"), `${d.model || d.path || "Request"} · ${clock(d.ts)}`);
       $("#drawerBody").innerHTML = detailHTML(d);
+      clampTurns($("#drawerBody"));
       $("#drawerCopy").onclick = async () => {
         const ok = await copyText(JSON.stringify(d, null, 2), document.body);
         toast(ok ? "ok" : "err", ok ? "Request JSON copied" : "Couldn't copy");
@@ -1017,10 +1033,41 @@ const Requests = {
     $("#drawer").classList.remove("open");
     $("#drawer").setAttribute("aria-hidden", "true");
     $("#drawerScrim").classList.remove("open");
+    pageInert(false);
     this.selectedId = null;
     this.render();
+    if (this.returnFocus && this.returnFocus.isConnected) this.returnFocus.focus();
+    this.returnFocus = null;
   },
 };
+
+/** Seal (or unseal) the page behind an overlay. */
+function pageInert(on) {
+  for (const node of [$("#scroll"), $(".topbar")]) if (node) node.inert = on;
+}
+
+/** Clamp overlong prompt turns behind a toggle.
+ *
+ * They used to be `max-height` + `overflow-y: auto`, i.e. a scrollbox nested in
+ * the drawer's own scrollbox: reading one turn meant scrolling two things, and
+ * the wheel picked whichever the pointer happened to be over. */
+function clampTurns(root) {
+  for (const body of $$(".turn-body", root)) {
+    body.classList.add("clamped");
+    if (body.scrollHeight <= body.clientHeight + 4) { body.classList.remove("clamped"); continue; }
+    const more = el("button.turn-more", {
+      type: "button", "aria-expanded": "false",
+      text: `Show all — ${fmt(body.textContent.length)} characters`,
+      onclick: () => {
+        const open = body.classList.toggle("clamped");
+        att(more, "aria-expanded", String(!open));
+        txt(more, open ? `Show all — ${fmt(body.textContent.length)} characters` : "Show less");
+        if (open) body.parentNode.scrollIntoView({ block: "nearest" });
+      },
+    });
+    body.after(more);
+  }
+}
 
 function outcomeBadge(r) {
   if (r.outcome === "blocked") return badgeHTML("warn", "over budget");
@@ -1558,11 +1605,22 @@ async function loadAuditSummary() {
 // =====================================================================
 // Router
 // =====================================================================
+const scrollTops = new Map();
+
 function go(view, sub) {
   if (!VIEWS.includes(view)) view = "overview";
+  const changed = view !== currentView;
+  if (changed) scrollTops.set(currentView, $("#scroll").scrollTop);
   currentView = view;
-  $$("#nav button").forEach(b => att(b, "aria-selected", String(b.dataset.view === view)));
+  $$("#nav button").forEach(b => {
+    const on = b.dataset.view === view;
+    att(b, "aria-selected", String(on));
+    att(b, "tabindex", on ? "0" : "-1");
+  });
   $$(".view").forEach(v => cls(v, "active", v.id === "view-" + view));
+  // Each section keeps its own place, so coming back to a request log you had
+  // scrolled halfway down doesn't dump you at the top.
+  if (changed) $("#scroll").scrollTo({ top: scrollTops.get(view) || 0, behavior: "instant" });
   const target = view === "clients" && (sub || Clients.selected)
     ? `#clients/${enc(sub || Clients.selected)}` : "#" + view;
   if (location.hash !== target) history.replaceState(null, "", target);
@@ -1613,7 +1671,21 @@ $("#refreshBtn").onclick = () => {
   if (!es || es.readyState === 2) connectSSE();
 };
 $("#addTokenBtn").onclick = addToken;
+// Focus the scroll region directly rather than letting the browser write
+// "#scroll" into the hash, which the router would read as an unknown view.
+$(".skip").onclick = e => { e.preventDefault(); $("#scroll").focus(); };
 $$("#nav button").forEach(b => { b.onclick = () => go(b.dataset.view); });
+$("#nav").addEventListener("keydown", e => {
+  const step = { ArrowRight: 1, ArrowLeft: -1, Home: "first", End: "last" }[e.key];
+  if (step === undefined) return;
+  e.preventDefault();
+  const i = VIEWS.indexOf(currentView);
+  const next = step === "first" ? 0
+    : step === "last" ? VIEWS.length - 1
+    : (i + step + VIEWS.length) % VIEWS.length;
+  go(VIEWS[next]);
+  $(`#nav button[data-view="${VIEWS[next]}"]`).focus();
+});
 
 let searchTimer = null;
 $("#fSearch").addEventListener("input", e => {
