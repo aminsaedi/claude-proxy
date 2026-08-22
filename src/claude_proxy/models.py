@@ -113,7 +113,11 @@ class Audit(BaseModel):
 
 
 class AppConfig(BaseModel):
-    """Top-level, hot-reloadable proxy configuration (mirrors config.yaml)."""
+    """Top-level, hot-reloadable proxy configuration.
+
+    Stored as a single JSON row in the ``config`` table; ``config.yaml`` is only
+    the seed format read once by ``claude_proxy.migrate``.
+    """
 
     auto_rotation: AutoRotation = Field(default_factory=AutoRotation)
     health_probe_interval_seconds: int = 60

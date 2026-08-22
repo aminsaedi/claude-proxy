@@ -1,3 +1,12 @@
+# Input for the one-time importer, not a runtime file — nothing reads YAML while
+# the proxy is running. Copy to data/tokens.yaml, then:
+#
+#   python -m claude_proxy.migrate
+#
+# which inserts these into SQLite (skipping names that already exist). After
+# that, manage tokens in the admin console or `manage.py`; this file is dead.
+#
+# `default: true` marks the token the proxy starts out using as active.
 tokens:
   - name: personal
     token: "sk-ant-oat-..."

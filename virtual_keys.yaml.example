@@ -1,3 +1,13 @@
+# Input for the one-time importer, not a runtime file — nothing reads YAML while
+# the proxy is running. Copy to data/virtual_keys.yaml, then:
+#
+#   python -m claude_proxy.migrate
+#
+# which inserts these into SQLite (skipping names that already exist). After
+# that, manage clients in the admin console or `manage.py`; this file is dead.
+#
+# `key` is what a client sends as x-api-key / Authorization; `name` is the label
+# usage, cost, spend limits, and the audit log are attributed to.
 virtual_keys:
   - name: alice
     key: "vk-alice-secret-key"

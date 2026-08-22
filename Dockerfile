@@ -9,7 +9,8 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # Non-root runtime user. The bind-mounted ./data dir is chowned to this uid on
-# the host so the app can write config.yaml / usage_stats.json atomically.
+# the host so the app can create and write its two SQLite files there —
+# claude_proxy.db and audit.db, each with its own -wal and -shm siblings.
 RUN useradd -m -u 10001 app
 
 COPY requirements.txt .

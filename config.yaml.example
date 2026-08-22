@@ -1,6 +1,9 @@
-# Hot-reloadable proxy configuration. Copy to data/config.yaml (the proxy also
-# writes a default one on first run). All values are validated on load and on
-# every admin-UI save.
+# Seed configuration for the one-time importer, NOT a runtime file.
+#
+# The proxy keeps its config as a JSON row in SQLite and never reads this file.
+# `install.sh` copies it to data/config.yaml so that `python -m claude_proxy.migrate`
+# can import it into a fresh DB; after that, edit settings in the admin console
+# (Settings) or via `manage.py`. Every value is validated on load and on save.
 
 auto_rotation:
   enabled: false               # master switch for automatic token rotation
@@ -23,5 +26,15 @@ pricing:
   online: true                 # fetch per-token rates from source_url; off = use the cached copy
   refresh_hours: 12            # hours between fetches (1–720)
   source_url: https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json
+
+# Request/prompt audit log (its own SQLite file, data/audit.db).
+audit:
+  mode: full                   # off | meta (no prompt text) | full (prompt + completion)
+  retention_days: 7            # drop records older than this (1–365)
+  max_gb: 2.0                  # and drop the oldest until the file fits (0.05–512)
+  max_body_kb: 256             # per-body cap before compression (1–8192)
+                               # at this cap a captured request costs ~105KB on disk,
+                               # so 2GB is roughly 20k requests — lower this before
+                               # raising max_gb if volume outgrows the budget.
 
 usage_retention_days: 400      # days of hourly usage kept on disk (>= 40)

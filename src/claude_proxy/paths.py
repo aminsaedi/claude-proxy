@@ -1,8 +1,10 @@
 """Filesystem locations for data files.
 
-All paths default to the current working directory (``/app`` in the container,
-where the YAML/JSON files are bind-mounted) and can be overridden with the
-``CLAUDE_PROXY_DATA_DIR`` env var — handy for tests.
+Everything hangs off ``CLAUDE_PROXY_DATA_DIR``, which defaults to the current
+working directory and is set to ``/app/data`` in the image and ``/data`` in k8s.
+Individual files can also be pointed elsewhere (``CLAUDE_PROXY_DB``,
+``CLAUDE_PROXY_AUDIT_DB``, ``CLAUDE_PROXY_PRICING_CACHE``); mount the *directory*
+rather than the files, since SQLite writes ``-wal``/``-shm`` siblings next to each DB.
 """
 
 from __future__ import annotations

@@ -11,7 +11,8 @@ services:
     env_file:
       - .env
     volumes:
-      # Single data dir (not per-file) so atomic temp+rename writes work.
+      # Mount the directory, never the individual files: SQLite writes -wal
+      # and -shm siblings next to each DB, and a per-file bind mount hides them.
       - ./data:/app/data
     logging:
       options:
