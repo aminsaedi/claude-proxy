@@ -75,9 +75,8 @@ Manifests in `k8s/claude-proxy.yaml`. API is public via Traefik Ingress
 tailnet-only via a Tailscale L4 `LoadBalancer` service — and **unauthenticated**,
 because the pod sets no `ADMIN_PASSWORD`. The tailnet is the access control. DB
 on a `local-path` PVC (pod pinned to its node), seeded once from a
-`claude-proxy-seed` Secret via an initContainer, non-root uid 10001. Also
-runnable via `docker compose` (see README), which publishes 8080→8181 and
-8090→8182 on the host.
+`claude-proxy-seed` Secret via an initContainer, non-root uid 10001. k3s is the
+only deployment target; Docker is a build tool here, nothing more.
 
 **Rollouts are zero-downtime** (`RollingUpdate`, `maxSurge: 1`,
 `maxUnavailable: 0`). Four things make the overlap safe, and each has a
@@ -100,12 +99,19 @@ Deploy with `KUBECTL_SSH=amin@mx ./scripts/rollout.sh <tag>` — it probes
 
 - Run locally: `pip install -e ".[dev]"` then `CLAUDE_PROXY_DATA_DIR=./data python -m claude_proxy`
 - Tests / lint / types: `pytest` · `ruff check .` · `mypy`
+- Watch for failing requests: `python scripts/watch-failures.py http://100.103.221.89:8090`
+  (add `--since 24 --once` for a summary that exits non-zero if anything failed).
 - Console smoke test: `python scripts/ui-smoke.py http://127.0.0.1:8090` —
   run it against a scratch instance; it writes a spend limit, and refuses to
   write to a non-loopback target without `--allow-writes`.
-- Rebuild container: `docker compose up -d --build`
-- Logs: `docker compose logs -f`
-- TUI: `docker compose exec -it proxy python manage.py`
+- Build + ship an image: `docker build -t 100.69.180.101:31500/claude-proxy:<tag> .`
+  then `docker push …`, then roll it out (below). `rollout.sh` only *sets* the
+  image; it does not build one.
+- Deploy: `KUBECTL_SSH=amin@mx ./scripts/rollout.sh <tag>` — trust its verdict.
+  It probes throughout and fails on a single dropped request; that is how the
+  ClusterIP-bypass regression below was caught.
+- Logs: `ssh amin@mx kubectl -n claude-proxy logs deploy/claude-proxy`
+- TUI: `ssh amin@mx kubectl -n claude-proxy exec -it deploy/claude-proxy -- python manage.py`
 
 ## Architecture notes
 
@@ -144,11 +150,67 @@ Deploy with `KUBECTL_SSH=amin@mx ./scripts/rollout.sh <tag>` — it probes
   `America/Toronto`); hourly buckets line up with those edges for whole-hour zones.
   `AppState.limit_breach()` is checked *before* forwarding and reads only memory.
   Spend is booked after a response completes, so in-flight requests can overshoot.
+- **The edge read timeout, and `sse_keepalive_seconds`**: Cloudflare gives the
+  origin a fixed budget to produce the *first byte* — measured at **125s** on
+  this zone, returning **524**, and raisable only on Enterprise. It is not a
+  budget on total duration: a response that has already started streaming runs
+  as long as it likes (measured 304s). Large-context requests can leave
+  Anthropic silent for 50–60s before the first token, which is close enough to
+  that ceiling to hit it. Setting `sse_keepalive_seconds` (currently 15 in
+  prod) makes a `stream: true` request answer immediately with SSE comment
+  frames while the failover loop runs behind it, so the edge clock never
+  starts. The cost is that the response commits to `200 text/event-stream`
+  before upstream's status is known, so upstream failures come back as
+  in-stream `error` events; `_keepalive_stream` still records the real status
+  in the audit. Set it to 0 to turn the whole path off at runtime.
+- **Every outcome is recorded, and `ok` means the caller got the answer.** A
+  killed request used to leave no trace at all, which is why the 524s were
+  invisible in the audit log for weeks. Every arm now writes a row: the handler
+  catches `CancelledError` around the send and the body read,
+  `_keepalive_stream` catches it around its wait, `_stream_and_track` catches it
+  (and `GeneratorExit`) around the relay, and the buffered path asks
+  `_caller_gone()` before claiming delivery. The vocabulary is `ok` · `error` ·
+  `aborted` (caller hung up) · `incomplete` (stream ended with no
+  `message_stop`) · `blocked` · `rejected`, listed in `audit.FAILURE_OUTCOMES`
+  and queryable in one shot with `?failed=1`.
+- **How each arm actually finds out the caller left**, measured against a real
+  uvicorn server with a real TCP reset (not an httpx timeout — see below):
+  a `StreamingResponse` races the body against the disconnect message, so both
+  streaming arms are cancelled and record `aborted` within milliseconds. A plain
+  `Response` has no such listener and never notices, which is why the buffered
+  arm has to ask `is_disconnected()` explicitly — without it, an answer nobody
+  received was recorded as `ok`. Note the one soft edge: nothing cancels the
+  handler *during* `_open_upstream`, so a caller who leaves before the first
+  byte is recorded correctly but only once upstream finally answers. The verdict
+  is right; the row is late, and the upstream work is spent either way.
+- **Do not test disconnects with an HTTP client timeout.** An httpx `ReadTimeout`
+  raises client-side without closing the socket, so the server is still writing
+  to a live peer and correctly reports `ok`. A test built that way "proves" the
+  abort path is broken when it is fine. Use a raw socket with `SO_LINGER` 0, or
+  drive raw ASGI with an `http.disconnect` message — which is what
+  `test_a_buffered_answer_to_a_caller_who_left_is_not_recorded_as_ok` does.
+- **A stream's status line is not its verdict.** Upstream commits to `200
+  text/event-stream` before generating a token, so a completion that dies
+  half-way, carries an in-band `error` frame, or is abandoned by the caller all
+  begin life as a success. `_stream_and_track` decides the verdict from the
+  event stream instead — that is what `_PARSED_EVENTS` includes `error` for,
+  and what `saw_start`/`saw_stop` are for. Recording those as a clean 200 is
+  worse than not recording them: the log then actively asserts the user got an
+  answer they never received.
+- **`_submit` is the one chokepoint**, and increments
+  `proxy_request_outcomes_total{outcome}` before it touches the audit log. A
+  path that concludes without going through it produces neither a metric nor a
+  row, so the omission is loud rather than silent. Keep it that way.
+- **What monitoring still cannot see.** Two things, both by design: a record
+  dropped because the audit queue was full (counted in `dropped`, reported by
+  `watch-failures.py`), and anything the edge answered on the proxy's behalf —
+  a Cloudflare 524 never reaches this process. A quiet watcher plus a client
+  still reporting errors means the fault is in front of the proxy.
 
 ## What NOT to do
 
 - Do not commit anything under `data/` or `.env` — secrets.
-- Do not expose the admin port (8090 in the container, 8182 under Compose)
+- Do not expose the admin port (8090)
   publicly. In k8s it has **no auth at all** — the Tailscale LoadBalancer is the
   only thing standing in front of it. Outside k8s, set `ADMIN_PASSWORD`.
 - Do not add per-file bind mounts for the data files — SQLite creates `-wal` and
@@ -174,3 +236,15 @@ Deploy with `KUBECTL_SSH=amin@mx ./scripts/rollout.sh <tag>` — it probes
 - Do not run a second proxy process against the same data dir except during a
   deliberate rollout overlap — it is safe now, but it doubles health probes,
   which cost real subscription quota.
+- Do not point the Cloudflare Tunnel straight at the `claude-proxy` ClusterIP to
+  "skip a hop". It was tried: cloudflared holds keep-alive connections, and a
+  ClusterIP is DNAT'd per *connection*, not per request — so through a rollout
+  it keeps talking to the draining pod and hands its readiness 503s to real
+  callers. `rollout.sh` measured 6 dropped requests that way and 0 through
+  Traefik. Traefik load-balances per request over live endpoints, which is
+  precisely the property the zero-downtime rollout depends on.
+- Do not assume a 5xx the caller reports was produced by this proxy. Cloudflare
+  rewrites the body of an origin **502/504** to a bare `error code: NNN` and
+  passes 500/503/529 through untouched, and its own timeout is a **524**. Check
+  the audit log for the status before theorising: if there is no row at all,
+  the request never finished here and the answer is in front of the proxy.

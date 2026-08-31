@@ -1,5 +1,12 @@
 # claude-proxy on k3s.
 #   API   -> internet via Traefik Ingress + Cloudflare Tunnel (claude-proxy.aminsaedi.com)
+#
+# Routing the tunnel straight at the Service instead — bypassing Traefik — has
+# been tried and reverted. cloudflared holds keep-alive connections, and a
+# ClusterIP is DNAT'd per *connection*, so during a rollout it keeps talking to
+# the draining pod and serves its readiness 503s to real callers. Traefik
+# load-balances per request over live endpoints and does not have that problem.
+# Measured: 6 dropped requests bypassing it, 0 through it.
 #   Admin -> tailnet only via a Tailscale L4 LoadBalancer (claude-proxy-admin.<tailnet>.ts.net)
 #
 # Admin UI is unauthenticated by design — reachable only via the tailnet-only
@@ -94,7 +101,7 @@ spec:
       initContainers:
         # Seed the SQLite DB into the PVC on first run only (idempotent).
         - name: seed-db
-          image: 100.69.180.101:31500/claude-proxy:v13
+          image: 100.69.180.101:31500/claude-proxy:v16
           command: ["sh", "-c", "test -f /data/claude_proxy.db || cp /seed/claude_proxy.db /data/claude_proxy.db"]
           volumeMounts:
             - name: data
@@ -104,7 +111,7 @@ spec:
               readOnly: true
       containers:
         - name: proxy
-          image: 100.69.180.101:31500/claude-proxy:v13
+          image: 100.69.180.101:31500/claude-proxy:v16
           imagePullPolicy: Always
           env:
             - name: CLAUDE_PROXY_DATA_DIR

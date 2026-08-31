@@ -34,6 +34,13 @@ COST_USD = Counter(
     "Estimated spend in USD per virtual key and model, priced at request time",
     ["key_name", "model"],
 )
+OUTCOMES = Counter(
+    "proxy_request_outcomes_total",
+    "Requests by terminal outcome: ok, error, aborted, incomplete, blocked, rejected. "
+    "Incremented from the one place every request is recorded, so a path that "
+    "reaches a conclusion without landing here does not exist",
+    ["outcome"],
+)
 LIMIT_BLOCKS = Counter(
     "proxy_limit_blocks_total",
     "Requests rejected because a virtual key was over one of its spend limits",

@@ -11,6 +11,7 @@ path opens a file or takes a lock it could wait on.
 
 from __future__ import annotations
 
+import asyncio
 import gzip
 import json
 import logging
@@ -56,9 +57,13 @@ _seen_models: set[str] = set()
 
 # SSE event names worth the cost of a json.loads. Everything else — the ping
 # events, block starts and stops — is skipped without parsing, which is most of
-# the events in a long completion.
-_USAGE_EVENTS = (b"message_start", b"message_delta")
+# the events in a long completion. `error` is in here despite carrying no usage
+# because upstream reports a mid-stream failure *inside* a 200 response: the
+# status line already said OK, so this frame is the only evidence the caller
+# did not get what they asked for.
+_PARSED_EVENTS = (b"message_start", b"message_delta", b"error")
 _TEXT_EVENT = b"content_block_delta"
+_STOP_EVENT = b"message_stop"
 
 
 def _decode_body(body: bytes, encoding: str) -> bytes:
@@ -164,6 +169,18 @@ def _extract_model(body: bytes) -> str:
         return "-"
 
 
+def _wants_stream(body: bytes) -> bool:
+    """Whether the caller asked for SSE, judged from the request it sent.
+
+    Deliberately not the response's content-type: the point of asking is to
+    decide whether we can answer *before* upstream has replied at all.
+    """
+    try:
+        return json.loads(body).get("stream") is True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _model_label(model: str) -> str:
     """Bound the `model` metric label to models we've actually seen before."""
     if model in _seen_models:
@@ -195,6 +212,212 @@ def _retry_after(headers: httpx.Headers) -> float | None:
         return float(ra) if ra is not None else None
     except ValueError:
         return None
+
+
+async def _open_upstream(state, request: Request, path: str, body: bytes,  # noqa: ANN001
+                         base_headers: dict[str, str], order: list[str], model: str):  # noqa: ANN202
+    """Send the request upstream, failing over across tokens.
+
+    Returns ``(response, token_name, attempts, last_error)`` with the response
+    left open and unread; ``response`` is None when every token was exhausted.
+    """
+    upstream = None
+    used = ""
+    attempts = 0
+    last_error = ""
+    for attempt, token_name in enumerate(order):
+        attempts = attempt + 1
+        headers = dict(base_headers)
+        try:
+            headers["authorization"] = f"Bearer {state.tokens.secret(token_name)}"
+        except KeyError:  # token deleted between ordering and use
+            continue
+        sent = time.monotonic()
+        try:
+            req = state.client.build_request(
+                method=request.method, url=f"/v1/{path}",
+                headers=headers, content=body, params=request.query_params,
+            )
+            resp = await state.client.send(req, stream=True)
+        except httpx.HTTPError as e:
+            last_error = f"{type(e).__name__}: {e}"
+            log.warning("upstream error via %s: %s", token_name, e)
+            continue
+
+        latency = time.monotonic() - sent
+        state.tokens.record_headers(token_name, dict(resp.headers))
+        metrics.update_util_gauges(token_name, dict(resp.headers))
+        status = resp.status_code
+
+        if status == 429:
+            state.tokens.mark_rate_limited(token_name, _retry_after(resp.headers))
+        elif 200 <= status < 300:
+            state.tokens.mark_healthy(token_name)
+
+        if status in RETRYABLE and attempt < len(order) - 1:
+            await resp.aclose()
+            metrics.FAILOVERS.inc()
+            last_error = f"HTTP {status}"
+            log.info("failover: %s returned %d, trying next token", token_name, status)
+            continue
+
+        upstream, used = resp, token_name
+        metrics.UPSTREAM_TTFB.labels(model=_model_label(model)).observe(latency)
+        break
+
+    return upstream, used, attempts, last_error
+
+
+def _abort(rec: Record, t0: float, where: str) -> None:
+    """Mark a record as abandoned by the caller before it could be answered.
+
+    499 is the ingress convention for "client closed request" — the same status
+    the caller's own tooling reports — so the audit ends up describing the event
+    in the words the person investigating it will be searching for.
+    """
+    rec.status, rec.outcome = 499, "aborted"
+    rec.error = f"client disconnected {where}"
+    rec.latency_ms = (time.monotonic() - t0) * 1000
+
+
+async def _caller_gone(request: Request) -> bool:
+    """Has the caller hung up? Never raises -- a bad answer here must not fail a
+    request that is otherwise fine, so anything unexpected reads as "still there"."""
+    try:
+        return await request.is_disconnected()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def _close_quietly(resp) -> None:  # noqa: ANN001 - httpx.Response
+    """Release the upstream connection without letting teardown mask a failure.
+
+    Called from except/finally paths that are already unwinding, where a second
+    exception out of ``aclose`` would replace the one worth reporting.
+    """
+    try:
+        await resp.aclose()
+    except Exception:  # noqa: BLE001
+        pass
+    except asyncio.CancelledError:
+        pass
+
+
+def _sse_error(message: str, etype: str = "api_error") -> bytes:
+    """An Anthropic-shaped SSE error frame.
+
+    Once the preamble has gone out the status line is spent, so this is the
+    only channel left for reporting a failure to the caller.
+    """
+    payload = json.dumps({"type": "error", "error": {"type": etype, "message": message}})
+    return b"event: error\ndata: " + payload.encode() + b"\n\n"
+
+
+async def _keepalive_stream(state, request: Request, path: str, body: bytes,  # noqa: ANN001
+                            base_headers: dict[str, str], order: list[str], model: str,
+                            key_name: str, rec: Record, t0: float, keepalive: int):
+    """Hold the connection open with SSE comments, then relay the real stream.
+
+    Comment frames (``: ...``) are the SSE no-op: every compliant client
+    discards them, so this is invisible to the caller apart from the response
+    starting immediately. Nothing here is written to the audit record that
+    ``_stream_and_track`` would not have written itself.
+    """
+    task = asyncio.ensure_future(
+        _open_upstream(state, request, path, body, base_headers, order, model))
+    try:
+        while True:
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=keepalive)
+                break
+            except TimeoutError:
+                yield b": waiting for upstream\n\n"
+    except (asyncio.CancelledError, GeneratorExit):
+        # Caller hung up while we were still waiting; don't leak the attempt.
+        # This is the keepalive path's version of the vanishing request, and it
+        # is the one that matters most: if the edge ever times out *despite* the
+        # comment frames, this row is the evidence.
+        task.cancel()
+        _abort(rec, t0, "while waiting for upstream")
+        _submit(state.audit, rec)
+        raise
+
+    try:
+        upstream, used, attempts, last_error = task.result()
+    except Exception as e:  # noqa: BLE001
+        rec.status, rec.outcome = 502, "error"
+        rec.error = f"{type(e).__name__}: {e}"
+        rec.latency_ms = (time.monotonic() - t0) * 1000
+        _submit(state.audit, rec)
+        yield _sse_error(f"upstream request failed: {e}")
+        return
+
+    rec.attempts = attempts
+
+    if upstream is None:
+        rec.status, rec.outcome = 502, "error"
+        rec.error = last_error or "all upstream tokens failed"
+        rec.latency_ms = (time.monotonic() - t0) * 1000
+        metrics.REQUESTS.labels(key_name=key_name, model=_model_label(model),
+                                status="502").inc()
+        _submit(state.audit, rec)
+        yield _sse_error(rec.error, "api_error")
+        return
+
+    status = upstream.status_code
+    is_stream = "text/event-stream" in upstream.headers.get("content-type", "")
+    rec.token_name = used
+    rec.status = status
+    rec.streamed = is_stream
+    rec.outcome = "ok" if 200 <= status < 300 else "error"
+    metrics.REQUESTS.labels(key_name=key_name, model=_model_label(model),
+                            status=str(status)).inc()
+
+    if is_stream and 200 <= status < 300:
+        inner = _stream_and_track(state, upstream, key_name, model, rec, t0)
+        try:
+            async for chunk in inner:
+                yield chunk
+        finally:
+            # Close explicitly rather than leaving it to the garbage collector.
+            # That generator's `finally` is what writes the audit row, and when
+            # the caller hangs up mid-stream the GC may not get to it for an
+            # arbitrarily long time — a row that lands minutes later is a row
+            # that was missing when someone went looking for it.
+            await inner.aclose()
+        return
+
+    # Upstream refused, or answered with a non-SSE body despite `stream: true`.
+    # The 200 is already committed, so the status has to be restated in-band.
+    try:
+        out = await upstream.aread()
+    except (asyncio.CancelledError, GeneratorExit):
+        _abort(rec, t0, "while the error body was being read")
+        await _close_quietly(upstream)
+        _submit(state.audit, rec)
+        raise
+    except Exception as e:  # noqa: BLE001
+        rec.outcome = "error"
+        rec.error = f"upstream read failed: {type(e).__name__}: {e}"
+        rec.latency_ms = (time.monotonic() - t0) * 1000
+        await _close_quietly(upstream)
+        _submit(state.audit, rec)
+        yield _sse_error(rec.error)
+        return
+    await upstream.aclose()
+    encoding = upstream.headers.get("content-encoding", "")
+    if encoding and encoding.lower() != "identity":
+        out = _decode_body(out, encoding.lower())
+    rec.ttfb_ms = rec.ttfb_ms or (time.monotonic() - t0) * 1000
+    rec.latency_ms = (time.monotonic() - t0) * 1000
+    rec.resp_bytes = len(out)
+    if state.audit.keep_bodies:
+        rec.resp_body = out
+    if not rec.error:
+        rec.error = _error_message(out)
+    _submit(state.audit, rec)
+    log.warning("upstream %d under keepalive stream via %s: %s", status, used, rec.error)
+    yield _sse_error(rec.error or f"upstream returned HTTP {status}")
 
 
 def build_proxy_app(state) -> FastAPI:  # noqa: ANN001
@@ -272,49 +495,43 @@ def build_proxy_app(state) -> FastAPI:  # noqa: ANN001
         base_headers["x-proxy-request-id"] = request_id
         order = state.tokens.failover_order()[:MAX_ATTEMPTS]
 
-        upstream = None
-        used = ""
-        attempts = 0
-        last_error = ""
-        for attempt, token_name in enumerate(order):
-            attempts = attempt + 1
-            headers = dict(base_headers)
-            try:
-                headers["authorization"] = f"Bearer {state.tokens.secret(token_name)}"
-            except KeyError:  # token deleted between ordering and use
-                continue
-            sent = time.monotonic()
-            try:
-                req = state.client.build_request(
-                    method=request.method, url=f"/v1/{path}",
-                    headers=headers, content=body, params=request.query_params,
-                )
-                resp = await state.client.send(req, stream=True)
-            except httpx.HTTPError as e:
-                last_error = f"{type(e).__name__}: {e}"
-                log.warning("upstream error via %s: %s", token_name, e)
-                continue
+        # A `stream: true` caller can be answered before upstream has said
+        # anything, which is the only way past an edge read timeout that large
+        # contexts can otherwise exceed while Anthropic is still thinking. The
+        # whole failover loop moves inside the response body for that case.
+        keepalive = state.config.sse_keepalive_seconds
+        if keepalive and request.method == "POST" and _wants_stream(body):
+            log.info(">>> %s(%s) /v1/%s -> streaming with %ds keepalive rid=%s",
+                     _client_host(request), key_name, path, keepalive, request_id)
+            return StreamingResponse(
+                _keepalive_stream(state, request, path, body, base_headers, order,
+                                  model, key_name, rec, t0, keepalive),
+                status_code=200,
+                headers={"x-proxy-request-id": request_id},
+                media_type="text/event-stream",
+            )
 
-            latency = time.monotonic() - sent
-            state.tokens.record_headers(token_name, dict(resp.headers))
-            metrics.update_util_gauges(token_name, dict(resp.headers))
-            status = resp.status_code
-
-            if status == 429:
-                state.tokens.mark_rate_limited(token_name, _retry_after(resp.headers))
-            elif 200 <= status < 300:
-                state.tokens.mark_healthy(token_name)
-
-            if status in RETRYABLE and attempt < len(order) - 1:
-                await resp.aclose()
-                metrics.FAILOVERS.inc()
-                last_error = f"HTTP {status}"
-                log.info("failover: %s returned %d, trying next token", token_name, status)
-                continue
-
-            upstream, used = resp, token_name
-            metrics.UPSTREAM_TTFB.labels(model=_model_label(model)).observe(latency)
-            break
+        try:
+            upstream, used, attempts, last_error = await _open_upstream(
+                state, request, path, body, base_headers, order, model)
+        except asyncio.CancelledError:
+            # Cancellation lands *here*, on the send, before any response object
+            # or its `finally` exists. This is the case that used to leave no
+            # trace at all — the reason "no audit row" could not be read as "the
+            # request never happened". Now it can.
+            _abort(rec, t0, "before upstream responded")
+            log.warning("ABORTED %s(%s) /v1/%s rid=%s after %.1fs",
+                        _client_host(request), key_name, path, request_id,
+                        (rec.latency_ms or 0) / 1000)
+            _submit(audit, rec)
+            raise
+        except Exception as e:  # noqa: BLE001 - anything unhandled still gets a row
+            rec.status, rec.outcome = 502, "error"
+            rec.error = f"{type(e).__name__}: {e}"
+            rec.latency_ms = (time.monotonic() - t0) * 1000
+            log.exception("upstream open failed rid=%s", request_id)
+            _submit(audit, rec)
+            return _upstream_error(f"upstream request failed: {e}")
 
         rec.attempts = attempts
         rec.ttfb_ms = (time.monotonic() - t0) * 1000
@@ -355,7 +572,21 @@ def build_proxy_app(state) -> FastAPI:  # noqa: ANN001
                 status_code=status, headers=resp_headers, media_type="text/event-stream",
             )
 
-        out = await upstream.aread()
+        try:
+            out = await upstream.aread()
+        except asyncio.CancelledError:
+            _abort(rec, t0, "while the response body was being read")
+            await _close_quietly(upstream)
+            _submit(audit, rec)
+            raise
+        except Exception as e:  # noqa: BLE001 - a body that dies mid-read is a failure
+            rec.status, rec.outcome = 502, "error"
+            rec.error = f"upstream read failed: {type(e).__name__}: {e}"
+            rec.latency_ms = (time.monotonic() - t0) * 1000
+            await _close_quietly(upstream)
+            log.warning("upstream read failed rid=%s: %s", request_id, e)
+            _submit(audit, rec)
+            return _upstream_error(rec.error)
         await upstream.aclose()
         encoding = upstream.headers.get("content-encoding", "")
         if encoding and encoding.lower() != "identity":
@@ -374,6 +605,15 @@ def build_proxy_app(state) -> FastAPI:  # noqa: ANN001
                 rec.cost_usd = await state.usage.record(key_name, rec.model, *counts)
         elif not rec.error:
             rec.error = _error_message(out)
+        # A buffered response has no disconnect listener behind it the way a
+        # StreamingResponse does, so nothing has noticed if the caller left while
+        # we were reading upstream. Ask before claiming we delivered anything.
+        # The usage above still stands -- upstream was consumed either way.
+        if await _caller_gone(request):
+            rec.outcome = "aborted"
+            rec.error = rec.error or "client disconnected before the response was sent"
+            log.info("ABORTED %s(%s) /v1/%s buffered rid=%s",
+                     _client_host(request), key_name, path, request_id)
         _submit(audit, rec)
         return Response(content=out, status_code=status,
                         headers=resp_headers, media_type=content_type or "application/json")
@@ -403,6 +643,21 @@ def _record(request: Request, request_id: str, start: float, key_name: str,
 
 
 def _submit(audit, rec: Record) -> None:  # noqa: ANN001 - AuditLog
+    """Record a finished request — the single point every path converges on.
+
+    The outcome counter is incremented here rather than at each call site so
+    that "every request is accounted for" is a structural property instead of a
+    convention someone has to remember: a code path that concludes without
+    passing through this function does not produce an audit row either, which
+    makes the omission loud rather than silent.
+
+    It is deliberately outside the try below, and ahead of it: the counter is
+    the last line of defence if the audit database itself is what has failed.
+    """
+    try:
+        metrics.OUTCOMES.labels(outcome=rec.outcome or "unknown").inc()
+    except Exception:  # noqa: BLE001 - a metric must never fail a request
+        pass
     try:
         audit.submit(rec)
     except Exception as e:  # noqa: BLE001 - auditing must never fail a request
@@ -446,8 +701,16 @@ async def _stream_and_track(state, upstream, key_name: str, req_model: str,  # n
     The client's bytes are yielded *before* any inspection, so nothing here sits
     between upstream and the caller. The inspection itself is kept cheap by
     dispatching on the ``event:`` line: a long completion is overwhelmingly
-    ``content_block_delta`` and ``ping`` frames, and only the two usage-bearing
-    event types are worth deserializing when body capture is off.
+    ``content_block_delta`` and ``ping`` frames, and only the few notable event
+    types are worth deserializing when body capture is off.
+
+    It also decides the request's verdict, which for a stream cannot be read off
+    the status line: upstream commits to ``200`` before it has generated a
+    single token, so a completion that dies half-way, or that carries an
+    ``error`` frame, or that the caller walks away from, all still began life as
+    a success. Those three are separated out here as ``incomplete``, ``error``
+    and ``aborted`` — otherwise every one of them is recorded as a clean 200 and
+    the audit log agrees the user got an answer they never received.
     """
     buf = b""
     model = req_model
@@ -458,6 +721,7 @@ async def _stream_and_track(state, upstream, key_name: str, req_model: str,  # n
     cap = state.audit.max_body_bytes
     parts: list[str] = rec.resp_parts
     captured = 0
+    saw_start = saw_stop = complete = False
     try:
         async for chunk in upstream.aiter_bytes():
             yield chunk
@@ -470,6 +734,8 @@ async def _stream_and_track(state, upstream, key_name: str, req_model: str,  # n
                 line = line.strip()
                 if line.startswith(b"event: "):
                     event = line[7:]
+                    if event == _STOP_EVENT:
+                        saw_stop = True
                     continue
                 if not line.startswith(b"data: ") or line == b"data: [DONE]":
                     continue
@@ -477,7 +743,7 @@ async def _stream_and_track(state, upstream, key_name: str, req_model: str,  # n
                 # in that case fall back to parsing so we don't miss usage.
                 interesting = (
                     not event
-                    or event in _USAGE_EVENTS
+                    or event in _PARSED_EVENTS
                     or (capture and event == _TEXT_EVENT)
                 )
                 if not interesting:
@@ -487,7 +753,18 @@ async def _stream_and_track(state, upstream, key_name: str, req_model: str,  # n
                 except Exception:  # noqa: BLE001
                     continue
                 etype = data.get("type")
-                if etype == "message_start":
+                if etype == "message_stop":
+                    saw_stop = True
+                elif etype == "error":
+                    # A 200 that failed anyway. Upstream is telling the caller
+                    # in-band because the status line was spent long ago.
+                    err = data.get("error")
+                    err = err if isinstance(err, dict) else {}
+                    rec.outcome = "error"
+                    rec.error = str(err.get("message") or "upstream stream error")[:500]
+                    log.warning("in-stream error from upstream: %s", rec.error)
+                elif etype == "message_start":
+                    saw_start = True
                     msg = data.get("message", {})
                     u = msg.get("usage", {})
                     inp += u.get("input_tokens", 0)
@@ -507,19 +784,43 @@ async def _stream_and_track(state, upstream, key_name: str, req_model: str,  # n
                         captured += len(text)
                         if captured >= cap:
                             rec.truncated = True
+        complete = True
+    except (asyncio.CancelledError, GeneratorExit):
+        # The caller went away mid-completion. Everything streamed so far was
+        # real and is still billed; what changes is the verdict, because a
+        # truncated answer recorded as `ok` is worse than no record at all.
+        rec.outcome = "aborted"
+        rec.error = "client disconnected mid-stream"
+        raise
     except Exception as e:  # noqa: BLE001 - a broken stream still gets accounted
         rec.outcome = "error"
         rec.error = f"{type(e).__name__}: {e}"
         raise
     finally:
-        await upstream.aclose()
         rec.model = model
         rec.input_tokens, rec.output_tokens = inp, out
         rec.cache_read, rec.cache_creation = cache_r, cache_w
         rec.latency_ms = (time.monotonic() - t0) * 1000
-        metrics.REQUEST_LATENCY.labels(model=_model_label(model)).observe(rec.latency_ms / 1000)
         rec.resp_bytes = captured
-        rec.cost_usd = await state.usage.record(key_name, model, inp, out, cache_r, cache_w)
+        # Upstream ended the stream on its own terms but never said it was
+        # finished. Only judged when we saw a `message_start`, so endpoints with
+        # a different event vocabulary are not accused of truncating.
+        if complete and saw_start and not saw_stop and rec.outcome == "ok":
+            rec.outcome = "incomplete"
+            rec.error = rec.error or "stream ended without message_stop"
+        metrics.REQUEST_LATENCY.labels(model=_model_label(model)).observe(rec.latency_ms / 1000)
+        # Bookkeeping is best-effort; the audit row is not. When this generator
+        # is unwinding under cancellation, an await here can be cancelled in
+        # turn, and losing the cost of one request is a far smaller loss than
+        # losing the only record that the request failed.
+        try:
+            await _close_quietly(upstream)
+            rec.cost_usd = await state.usage.record(
+                key_name, model, inp, out, cache_r, cache_w)
+        except Exception as e:  # noqa: BLE001
+            log.warning("post-stream bookkeeping failed rid=%s: %s", rec.request_id, e)
+        except asyncio.CancelledError:
+            log.warning("post-stream bookkeeping cancelled rid=%s", rec.request_id)
         _submit(state.audit, rec)
 
 

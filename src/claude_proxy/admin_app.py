@@ -428,6 +428,10 @@ def build_admin_app(state) -> FastAPI:  # noqa: ANN001
                 outcome=q.get("outcome") or None,
                 since=float(q["since"]) if q.get("since") else None,
                 search=q.get("q") or None,
+                # One switch for "anything that did not reach the caller".
+                # Spelling out the failure outcomes at each caller would
+                # mean every future one has to be retro-fitted here.
+                failed=q.get("failed") in ("1", "true", "yes"),
             )
         except (TypeError, ValueError) as e:
             return JSONResponse(status_code=400, content={"error": f"bad filter: {e}"})
@@ -513,7 +517,8 @@ def build_admin_app(state) -> FastAPI:  # noqa: ANN001
             if isinstance(sub, dict):
                 merged[section].update(sub)
         for k in ("health_probe_interval_seconds", "active_probe_interval_seconds",
-                  "upstream_timeout_seconds", "timezone", "usage_retention_days"):
+                  "upstream_timeout_seconds", "sse_keepalive_seconds", "timezone",
+                  "usage_retention_days"):
             if k in body:
                 merged[k] = body[k]
         try:

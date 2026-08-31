@@ -50,6 +50,13 @@ log = logging.getLogger("claude_proxy.audit")
 #   full — also record the prompt and the completion, capped and compressed.
 MODES = ("off", "meta", "full")
 
+# Every outcome that means the caller did not get a complete answer. Kept as one
+# list because "show me what failed" must not depend on remembering which of
+# these exist — a new outcome added to the proxy and not added here would be
+# silently missing from the failure views, which is the exact blindness this
+# whole vocabulary exists to remove.
+FAILURE_OUTCOMES = ("error", "aborted", "incomplete", "blocked", "rejected")
+
 # How many finished requests may be waiting for the writer thread. At ~1KB of
 # retained Python objects per record this is a couple of MB worst case, and it
 # absorbs a multi-second disk stall without dropping anything.
@@ -71,7 +78,12 @@ CREATE TABLE IF NOT EXISTS requests (
     model       TEXT,
     status      INTEGER,
     streamed    INTEGER NOT NULL DEFAULT 0,
-    outcome     TEXT,                      -- ok | error | blocked | rejected
+    -- ok         served to completion
+    -- error      upstream refused, or the stream carried an error event
+    -- aborted    the caller (or the edge) hung up before we finished
+    -- incomplete the stream ended without message_stop — a truncated answer
+    -- blocked    over a spend limit;  rejected  bad virtual key
+    outcome     TEXT,
     input_tokens                INTEGER NOT NULL DEFAULT 0,
     output_tokens               INTEGER NOT NULL DEFAULT 0,
     cache_read_input_tokens     INTEGER NOT NULL DEFAULT 0,
@@ -570,12 +582,18 @@ class AuditLog:
         outcome: str | None = None,
         since: float | None = None,
         search: str | None = None,
+        failed: bool = False,
     ) -> list[dict]:
         """Newest-first page of request rows, blobs excluded.
 
         ``before_id`` is a keyset cursor rather than an OFFSET so paging stays
         O(limit) however deep the operator scrolls, and doesn't skip or repeat
         rows when new requests land mid-scroll.
+
+        ``failed`` selects every non-``ok`` outcome at once. It exists so that
+        watching for trouble is a single query with no client-side filtering:
+        polling for failures must not mean paging through every success to find
+        them, or a busy proxy makes its own monitoring expensive.
         """
         where: list[str] = []
         params: list[Any] = []
@@ -597,6 +615,16 @@ class AuditLog:
         if outcome:
             where.append("outcome = ?")
             params.append(outcome)
+        if failed:
+            # A row written before this vocabulary existed can have a NULL or
+            # empty outcome; judge those on the status line instead of assuming
+            # they were fine.
+            placeholders = ", ".join("?" * len(FAILURE_OUTCOMES))
+            where.append(
+                f"(outcome IN ({placeholders}) OR status >= 400 "
+                "OR (outcome IS NULL AND status >= 400))"
+            )
+            params += list(FAILURE_OUTCOMES)
         if since:
             where.append("ts >= ?")
             params.append(float(since))
@@ -672,7 +700,8 @@ class AuditLog:
         """
         out = {
             "since": since, "requests": 0, "errors": 0, "blocked": 0,
-            "rejected": 0, "forwarded": 0, "cost_usd": 0.0, "tokens": 0,
+            "rejected": 0, "aborted": 0, "incomplete": 0,
+            "forwarded": 0, "cost_usd": 0.0, "tokens": 0,
             "ttfb_p50": None, "ttfb_p95": None,
             "latency_p50": None, "latency_p95": None,
         }
@@ -685,6 +714,8 @@ class AuditLog:
                 "SELECT COUNT(*) AS n, "
                 "SUM(outcome = 'error') AS errors, SUM(outcome = 'blocked') AS blocked, "
                 "SUM(outcome = 'rejected') AS rejected, "
+                "SUM(outcome = 'aborted') AS aborted, "
+                "SUM(outcome = 'incomplete') AS incomplete, "
                 "SUM(ttfb_ms IS NOT NULL) AS forwarded, "
                 "SUM(cost_usd) AS cost, "
                 "SUM(input_tokens + output_tokens + cache_read_input_tokens + "
@@ -695,6 +726,8 @@ class AuditLog:
             out["errors"] = row["errors"] or 0
             out["blocked"] = row["blocked"] or 0
             out["rejected"] = row["rejected"] or 0
+            out["aborted"] = row["aborted"] or 0
+            out["incomplete"] = row["incomplete"] or 0
             out["forwarded"] = row["forwarded"] or 0
             out["cost_usd"] = row["cost"] or 0.0
             out["tokens"] = row["tokens"] or 0

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Claude Proxy Manager — interactive TUI for keys, tokens, and settings.
 
-Run inside the container:  docker compose exec -it proxy python manage.py
+Run inside the pod:  kubectl -n claude-proxy exec -it deploy/claude-proxy -- python manage.py
 CRUD goes straight to the SQLite DB; live actions (switch token, probe, save
 config) go through the admin API so the running proxy picks them up immediately.
 Virtual-key changes are hot-reloaded by the proxy within ~5s; token changes

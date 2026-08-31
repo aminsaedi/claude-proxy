@@ -123,6 +123,21 @@ class AppConfig(BaseModel):
     health_probe_interval_seconds: int = 60
     active_probe_interval_seconds: int = 300
     upstream_timeout_seconds: int = 600
+    # SSE keepalive for `stream: true` requests, in seconds; 0 disables it.
+    #
+    # Cloudflare's proxy read timeout (measured: 125s on this zone, adjustable
+    # only on Enterprise) is a deadline on *time to first byte*, not on total
+    # duration — a response that has started streaming survives indefinitely
+    # (measured: 304s). Large-context requests can leave Anthropic silent for
+    # well over a minute before the first token, which puts them within reach
+    # of that ceiling; when it fires the caller gets a 524 and the proxy never
+    # even records the request. Setting this makes the proxy answer immediately
+    # with SSE comment frames while it waits, so the edge clock never starts.
+    #
+    # The cost: the response is committed to `200 text/event-stream` before
+    # upstream's status is known, so an upstream failure has to arrive as an
+    # in-stream `error` event rather than an HTTP status.
+    sse_keepalive_seconds: int = 0
     # Calendar boundaries for the daily views and for every spend limit.
     timezone: str = DEFAULT_TIMEZONE
     pricing: Pricing = Field(default_factory=Pricing)
@@ -165,4 +180,14 @@ class AppConfig(BaseModel):
     def _timeout(cls, v: int) -> int:
         if v < 10:
             raise ValueError("upstream_timeout_seconds must be >= 10")
+        return v
+
+    @field_validator("sse_keepalive_seconds")
+    @classmethod
+    def _keepalive(cls, v: int) -> int:
+        # The upper bound is what makes this useful: a gap longer than the
+        # edge's read timeout would let the very deadline this exists to
+        # defeat fire between two keepalives.
+        if v and not (1 <= v <= 30):
+            raise ValueError("sse_keepalive_seconds must be 0 (off) or between 1 and 30")
         return v

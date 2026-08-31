@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import time
 
 import httpx
@@ -294,6 +296,10 @@ _SSE = (
     b'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"lo"}}\n\n'
     b'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":3}}\n\n'
     b'event: message_delta\ndata: {"type":"message_delta","usage":{"output_tokens":9}}\n\n'
+    # Real Anthropic streams always close with message_stop, and the proxy
+    # treats its absence as a truncated answer — so a fixture without one is
+    # not a simplification, it is a different scenario.
+    b'event: message_stop\ndata: {"type":"message_stop"}\n\n'
     b'data: [DONE]\n\n'
 )
 
@@ -359,5 +365,309 @@ async def test_healthz_reports_draining_so_the_ingress_removes_the_pod():
             # Traffic already in flight is still served — only readiness changes.
             assert (await ac.post("/v1/messages", headers={"x-api-key": "vk-alice"},
                                   json={"model": "m"})).status_code == 200
+    finally:
+        await state.client.aclose()
+
+
+# =====================================================================
+# SSE keepalive: answering before upstream has spoken
+# =====================================================================
+#
+# Cloudflare's proxy read timeout is a deadline on time-to-first-byte, not on
+# total duration, and a large-context request can leave Anthropic silent for
+# long enough to trip it. These cover the preamble that buys past it.
+
+def _slow_sse_handler(delay: float):
+    async def handler(request):
+        await asyncio.sleep(delay)
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=_SSE)
+    return handler
+
+
+async def test_keepalive_off_by_default_leaves_streaming_untouched(tmp_path):
+    state = _audited(_sse_handler, tmp_path)
+    assert state.config.sse_keepalive_seconds == 0
+    app = build_proxy_app(state)
+    try:
+        async with _asgi(app) as ac:
+            r = await ac.post("/v1/messages", headers={"x-api-key": "vk-alice"},
+                              json={"model": "claude-opus-5", "stream": True})
+        assert r.status_code == 200
+        assert r.content == _SSE, "no preamble may appear while the feature is off"
+    finally:
+        await state.client.aclose()
+
+
+async def test_keepalive_emits_comments_while_upstream_is_silent(tmp_path):
+    """The whole point: bytes reach the caller before upstream has replied."""
+    # Upstream must outlast the keepalive interval, or no comment is ever due.
+    state = _audited(_slow_sse_handler(1.4), tmp_path)
+    state.config.sse_keepalive_seconds = 1
+    app = build_proxy_app(state)
+    try:
+        async with _asgi(app) as ac:
+            async with ac.stream("POST", "/v1/messages", headers={"x-api-key": "vk-alice"},
+                                 json={"model": "claude-opus-5", "stream": True}) as r:
+                assert r.status_code == 200
+                assert "text/event-stream" in r.headers["content-type"]
+                first = None
+                chunks = []
+                async for chunk in r.aiter_bytes():
+                    if first is None:
+                        first = chunk
+                    chunks.append(chunk)
+        body = b"".join(chunks)
+        # A comment frame is the SSE no-op, so the real stream is still intact.
+        assert body.startswith(b":"), f"expected a preamble comment, got {body[:40]!r}"
+        assert _SSE in body, "the upstream stream must still arrive verbatim"
+
+        _wait(state)
+        row = state.audit.query()[0]
+        assert row["status"] == 200
+        assert row["streamed"] == 1
+        assert row["input_tokens"] == 7, "usage accounting survives the preamble"
+    finally:
+        await state.client.aclose()
+
+
+async def test_keepalive_reports_upstream_failure_as_an_sse_error_event(tmp_path):
+    """The 200 is already spent, so a refusal has to come back in-band."""
+    def handler(request):
+        return httpx.Response(400, json={"error": {"message": "prompt is too long"}})
+
+    state = _audited(handler, tmp_path)
+    state.config.sse_keepalive_seconds = 1
+    app = build_proxy_app(state)
+    try:
+        async with _asgi(app) as ac:
+            r = await ac.post("/v1/messages", headers={"x-api-key": "vk-alice"},
+                              json={"model": "claude-opus-5", "stream": True})
+        assert r.status_code == 200, "committed before upstream's status was known"
+        assert b"event: error" in r.content
+        assert b"prompt is too long" in r.content
+
+        _wait(state)
+        row = state.audit.query()[0]
+        assert row["status"] == 400, "the audit keeps the real upstream status"
+        assert row["outcome"] == "error"
+    finally:
+        await state.client.aclose()
+
+
+async def test_keepalive_reports_total_upstream_failure_in_band(tmp_path):
+    def handler(request):
+        raise httpx.ConnectError("boom")
+
+    state = _audited(handler, tmp_path)
+    state.config.sse_keepalive_seconds = 1
+    app = build_proxy_app(state)
+    try:
+        async with _asgi(app) as ac:
+            r = await ac.post("/v1/messages", headers={"x-api-key": "vk-alice"},
+                              json={"model": "claude-opus-5", "stream": True})
+        assert r.status_code == 200
+        assert b"event: error" in r.content
+        _wait(state)
+        assert state.audit.query()[0]["status"] == 502
+    finally:
+        await state.client.aclose()
+
+
+async def test_keepalive_does_not_touch_non_streaming_requests(tmp_path):
+    """`stream` absent means the status line is still ours to use."""
+    def handler(request):
+        return httpx.Response(400, json={"error": {"message": "nope"}})
+
+    state = _audited(handler, tmp_path)
+    state.config.sse_keepalive_seconds = 1
+    app = build_proxy_app(state)
+    try:
+        async with _asgi(app) as ac:
+            r = await ac.post("/v1/messages", headers={"x-api-key": "vk-alice"},
+                              json={"model": "claude-opus-5"})
+        assert r.status_code == 400, "a non-stream caller still gets a real status"
+    finally:
+        await state.client.aclose()
+
+
+# =====================================================================
+# Failure visibility
+#
+# A streaming request commits to `200 text/event-stream` before a single token
+# exists, so the status line cannot be the verdict. Everything below is a way
+# for a caller to end up without the answer they asked for while the status
+# says otherwise — each one used to be recorded as a clean success, or as
+# nothing at all.
+# =====================================================================
+
+_SSE_TRUNCATED = _SSE.replace(b'event: message_stop\ndata: {"type":"message_stop"}\n\n', b"")
+
+_SSE_WITH_ERROR = (
+    b'event: message_start\n'
+    b'data: {"type":"message_start","message":{"model":"claude-opus-5","usage":'
+    b'{"input_tokens":7}}}\n\n'
+    b'event: error\n'
+    b'data: {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}\n\n'
+)
+
+
+async def test_a_stream_that_stops_early_is_not_recorded_as_success(tmp_path):
+    """Upstream hung up mid-answer. The 200 is already spent; the row must not agree."""
+    state = _audited(lambda req: httpx.Response(
+        200, headers={"content-type": "text/event-stream"}, content=_SSE_TRUNCATED), tmp_path)
+    app = build_proxy_app(state)
+    try:
+        async with _asgi(app) as ac:
+            r = await ac.post("/v1/messages", headers={"x-api-key": "vk-alice"},
+                              json={"model": "claude-opus-5", "stream": True})
+        assert r.status_code == 200, "the bytes already went out; we cannot restate the status"
+        _wait(state)
+        row = state.audit.query(limit=1)[0]
+        assert row["outcome"] == "incomplete", row
+        assert "message_stop" in row["error"]
+    finally:
+        await state.client.aclose()
+
+
+async def test_an_in_stream_error_event_is_not_recorded_as_success(tmp_path):
+    """Anthropic reports a mid-stream failure inside a 200. So must the audit."""
+    state = _audited(lambda req: httpx.Response(
+        200, headers={"content-type": "text/event-stream"}, content=_SSE_WITH_ERROR), tmp_path)
+    app = build_proxy_app(state)
+    try:
+        async with _asgi(app) as ac:
+            r = await ac.post("/v1/messages", headers={"x-api-key": "vk-alice"},
+                              json={"model": "claude-opus-5", "stream": True})
+        assert r.status_code == 200
+        _wait(state)
+        row = state.audit.query(limit=1)[0]
+        assert row["outcome"] == "error", row
+        assert row["error"] == "Overloaded"
+        # Still a 200 on the wire — which is exactly why `status` alone is not
+        # enough to find these, and why the outcome column has to carry it.
+        assert row["status"] == 200
+    finally:
+        await state.client.aclose()
+
+
+async def test_a_caller_that_walks_away_mid_stream_is_recorded_as_aborted(tmp_path):
+    """Closing the tracker early must still write a row, and not call it ok.
+
+    Driven against the generator directly rather than through a client, because
+    what is being tested is precisely what happens when nobody is left to
+    receive the response — a condition an HTTP client cannot reliably stage.
+    """
+    from claude_proxy.audit import Record
+    from claude_proxy.proxy_app import _stream_and_track
+
+    state = _audited(_sse_handler, tmp_path)
+    try:
+        req = state.client.build_request("POST", "/v1/messages")
+        upstream = await state.client.send(req, stream=True)
+        rec = Record(ts=time.time(), request_id="deadbeef", key_name="alice")
+        gen = _stream_and_track(state, upstream, "alice", "claude-opus-5",
+                                rec, time.monotonic())
+        async for _chunk in gen:
+            break  # the caller is gone after the first chunk
+        await gen.aclose()
+
+        _wait(state)
+        row = state.audit.query(limit=1)[0]
+        assert row["outcome"] == "aborted", row
+        assert "disconnected" in row["error"]
+    finally:
+        await state.client.aclose()
+
+
+async def test_a_caller_that_hangs_up_before_upstream_replies_leaves_a_row(tmp_path):
+    """The case that used to vanish: cancelled on the send, before any response.
+
+    This is the shape of a Cloudflare read timeout, and for months it produced
+    no log line and no audit row — which is why an empty audit log could not be
+    read as "the request never happened".
+    """
+    state = _audited(_slow_sse_handler(5), tmp_path)
+    app = build_proxy_app(state)
+    try:
+        async with _asgi(app) as ac:
+            task = asyncio.ensure_future(
+                ac.post("/v1/messages", headers={"x-api-key": "vk-alice"},
+                        json={"model": "claude-opus-5", "messages": []}))
+            await asyncio.sleep(0.3)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, httpx.HTTPError):
+                await task
+
+        _wait(state)
+        row = state.audit.query(limit=1)[0]
+        assert row["outcome"] == "aborted", row
+        assert row["status"] == 499, "the audit should speak the same language as the caller"
+        assert row["ttfb_ms"] is None, "it never got a response to time"
+    finally:
+        await state.client.aclose()
+
+
+async def test_the_failed_filter_returns_every_kind_of_failure(tmp_path):
+    """One query for "what went wrong", so watching cannot miss a category."""
+    state = _audited(_sse_handler, tmp_path)
+    app = build_proxy_app(state)
+    try:
+        async with _asgi(app) as ac:
+            # One success, one rejection — different outcomes, one filter.
+            await ac.post("/v1/messages", headers={"x-api-key": "vk-alice"},
+                          json={"model": "claude-opus-5", "stream": True})
+            await ac.post("/v1/messages", headers={"x-api-key": "nope"},
+                          json={"model": "claude-opus-5"})
+        _wait(state, 2)
+        assert len(state.audit.query(limit=50)) == 2
+        failed = state.audit.query(limit=50, failed=True)
+        assert [r["outcome"] for r in failed] == ["rejected"], failed
+    finally:
+        await state.client.aclose()
+
+
+async def test_a_buffered_answer_to_a_caller_who_left_is_not_recorded_as_ok(tmp_path):
+    """A non-streaming response has no disconnect listener behind it.
+
+    A StreamingResponse races the body against the disconnect message, so it
+    finds out; a plain Response just writes into the void and used to report
+    `ok` for an answer nobody received. Driven over raw ASGI because staging a
+    disconnect is the whole point, and an HTTP client cannot schedule one.
+    """
+    state = _audited(lambda req: httpx.Response(200, json={
+        "model": "claude-opus-5",
+        "usage": {"input_tokens": 12, "output_tokens": 34},
+    }), tmp_path)
+    app = build_proxy_app(state)
+    body = json.dumps({"model": "claude-opus-5", "messages": []}).encode()
+    events = [
+        {"type": "http.request", "body": body, "more_body": False},
+        {"type": "http.disconnect"},
+    ]
+
+    async def receive():
+        return events.pop(0) if events else {"type": "http.disconnect"}
+
+    async def send(_message):
+        pass
+
+    try:
+        await app({
+            "type": "http", "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1", "method": "POST", "scheme": "http",
+            "path": "/v1/messages", "raw_path": b"/v1/messages", "root_path": "",
+            "query_string": b"", "client": ("127.0.0.1", 5555), "server": ("t", 80),
+            "headers": [(b"host", b"t"), (b"x-api-key", b"vk-alice"),
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode())],
+        }, receive, send)
+
+        _wait(state)
+        row = state.audit.query(limit=1)[0]
+        assert row["outcome"] == "aborted", row
+        assert row["status"] == 200, "the upstream status is still worth knowing"
+        # Upstream was consumed whether or not anyone read the answer, so the
+        # spend has to be booked against the key regardless.
+        assert row["input_tokens"] == 12 and row["output_tokens"] == 34, row
     finally:
         await state.client.aclose()

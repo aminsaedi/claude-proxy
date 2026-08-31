@@ -35,9 +35,8 @@ clients (virtual API key)
   which is why the port is never exposed beyond a tailnet. (The k3s deployment
   in `k8s/` runs it without auth on purpose — see below.)
 
-Under Docker Compose these are published on host ports `8181` and `8182`
-respectively; the k3s deployment uses the container ports directly. Both apps
-run in one process, on one asyncio loop, as a **non-root** user (uid 10001).
+The k3s deployment uses these container ports directly. Both apps run in one
+process, on one asyncio loop, as a **non-root** user (uid 10001).
 
 The app is a typed Python package under `src/claude_proxy/` (see `CLAUDE.md` for
 the module map).
@@ -55,7 +54,6 @@ never blocks on I/O.
 | `data/claude_proxy.db` | SQLite: tokens, keys, config, usage, spend limits | Yes |
 | `data/audit.db` | SQLite: the request/prompt audit log (own file, own budget) | Yes |
 | `data/model_prices.json` | Cached copy of the online model price list | Yes |
-| `.env` | `TAILSCALE_IP`, `ADMIN_USER`, `ADMIN_PASSWORD` (Compose only) | Yes |
 
 Each `.db` has `-wal` and `-shm` siblings that SQLite creates next to it, so the
 **directory** has to be writable and mounted — bind-mounting individual files
@@ -68,33 +66,32 @@ Manage tokens/keys/settings with the TUI (`manage.py`) or the admin UI. Nothing
 reads YAML at runtime — the `*.yaml.example` files are the format of the
 **one-time importer** only: `python -m claude_proxy.migrate` reads
 `tokens.yaml` / `virtual_keys.yaml` / `config.yaml` / `usage_stats.json` from
-the data dir into the DB, and `install.sh` uses that path to seed a new install.
+the data dir into the DB, which is how an existing install is seeded.
 
-## Setup (Docker Compose)
+## Setup
+
+k3s is the only deployment target — see **Deploy on k3s** below. To run it
+locally instead:
 
 ```bash
-cp .env.example .env          # set TAILSCALE_IP + ADMIN_PASSWORD
-./install.sh                  # prompts for a token + key, seeds the DB, starts
+pip install -e ".[dev]"
+CLAUDE_PROXY_DATA_DIR=./data python -m claude_proxy
 ```
 
-`install.sh` writes `data/tokens.yaml`, `data/virtual_keys.yaml`, and
-`data/config.yaml` from your answers, `chown`s `data/` to uid 10001, runs
-`docker compose build`, imports the YAML into `data/claude_proxy.db` via
-`claude_proxy.migrate` (only if the DB does not exist yet), and starts the stack
-with `docker compose up -d`. Add more tokens/keys later via `manage.py` or the
-console — not by editing the YAML, which is never read again.
+Add tokens and keys via `manage.py` or the console — not by editing the YAML,
+which is only ever read by `claude_proxy.migrate` and never again.
 
 ## Usage
 
 ```bash
-ANTHROPIC_BASE_URL=http://localhost:8181 \
+ANTHROPIC_BASE_URL=https://claude-proxy.aminsaedi.com \
 ANTHROPIC_API_KEY=vk-alice-secret-key \
   claude ...
 ```
 
 ## Admin console
 
-Open `http://<tailscale-ip>:8182` (Compose) or
+Open `http://<tailscale-ip>:8090` or
 `http://claude-proxy-admin.<tailnet>.ts.net:8090` (k3s). Five views:
 
 | View | What it shows |
@@ -229,9 +226,9 @@ volume never contends with the tokens/keys/usage tables.
 
 ## Prometheus metrics
 
-At `/metrics` on the **admin** port — `http://<tailscale-ip>:8182/metrics` under
-Compose. This endpoint is deliberately exempt from Basic auth so a scraper
-doesn't need credentials:
+At `/metrics` on the **admin** port — `http://<tailscale-ip>:8090/metrics`.
+This endpoint is deliberately exempt from Basic auth so a scraper doesn't need
+credentials:
 
 `proxy_requests_total`, `proxy_input_tokens_total`, `proxy_output_tokens_total`,
 `proxy_cache_read_input_tokens_total`,
@@ -247,7 +244,7 @@ doesn't need credentials:
 ## Managing keys/tokens (TUI)
 
 ```bash
-docker compose exec -it proxy python manage.py
+ssh amin@mx kubectl -n claude-proxy exec -it deploy/claude-proxy -- python manage.py
 ```
 
 ## Deploy on k3s

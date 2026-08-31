@@ -114,9 +114,18 @@ const Overview = {
     // Rate over *forwarded* requests: a rejected key never reached upstream, so
     // counting it would both inflate the rate and let a flood of bad-key
     // retries drown out a real upstream problem.
-    const errRate = o.forwarded ? (o.errors || 0) / o.forwarded : 0;
+    //
+    // `incomplete` counts as a failure: the caller was promised an answer and
+    // got half of one. `aborted` deliberately does not — a person pressing Esc
+    // in their client is the single most common way a request ends early, and
+    // folding that in would make the error rate a measure of how impatient the
+    // users are. It gets its own line instead, because when it climbs on its
+    // own that is the edge timing requests out, not people changing their mind.
+    const failed = (o.errors || 0) + (o.incomplete || 0);
+    const errRate = o.forwarded ? failed / o.forwarded : 0;
     const errSev = errRate >= 0.1 ? "crit" : errRate >= 0.02 ? "warn" : "good";
-    const bits = [o.errors && `${fmt(o.errors)} failed`, o.blocked && `${fmt(o.blocked)} blocked`,
+    const bits = [failed && `${fmt(failed)} failed`, o.aborted && `${fmt(o.aborted)} aborted`,
+      o.blocked && `${fmt(o.blocked)} blocked`,
       o.rejected && `${fmt(o.rejected)} rejected`].filter(Boolean);
     const tiles = [
       { k: "Spend today", v: usd(t.win["1d"]), sub: state.timezone || "local", accent: true },
@@ -913,7 +922,10 @@ const Requests = {
     const p = new URLSearchParams();
     if (requestFilters.q) p.set("q", requestFilters.q);
     if (requestFilters.key) p.set("key", requestFilters.key);
-    if (requestFilters.outcome) p.set("outcome", requestFilters.outcome);
+    // "failed" is not an outcome, it is every outcome that is not `ok`;
+    // the server owns that list so the console cannot fall behind it.
+    if (requestFilters.outcome === "failed") p.set("failed", "1");
+    else if (requestFilters.outcome) p.set("outcome", requestFilters.outcome);
     if (requestFilters.hours) p.set("since", String(Date.now() / 1000 - Number(requestFilters.hours) * 3600));
     p.set("limit", "100");
     for (const k in extra || {}) p.set(k, extra[k]);
@@ -1071,6 +1083,8 @@ function clampTurns(root) {
 
 function outcomeBadge(r) {
   if (r.outcome === "blocked") return badgeHTML("warn", "over budget");
+  if (r.outcome === "aborted") return badgeHTML("warn", "aborted");
+  if (r.outcome === "incomplete") return badgeHTML("warn", "incomplete");
   if (r.outcome === "rejected") return badgeHTML("crit", "rejected");
   if (r.outcome === "error" || r.status >= 400) return badgeHTML("crit", String(r.status || "error"));
   return badgeHTML("good", r.streamed ? "stream" : "ok");
