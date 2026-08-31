@@ -201,6 +201,22 @@ Deploy with `KUBECTL_SSH=amin@mx ./scripts/rollout.sh <tag>` — it probes
   `proxy_request_outcomes_total{outcome}` before it touches the audit log. A
   path that concludes without going through it produces neither a metric nor a
   row, so the omission is loud rather than silent. Keep it that way.
+- **`CF-Connecting-IP`, not `X-Forwarded-For`.** Traefik does not trust
+  cloudflared, so it *rewrites* XFF to its own immediate peer — the cloudflared
+  pod. Reading XFF therefore recorded `10.42.x.y` as the client for every
+  request that came through the tunnel, collapsing the whole internet onto two
+  addresses. Cloudflare sets `CF-Connecting-IP` at the edge and overwrites
+  whatever the client sent, so it is both correct and unspoofable here.
+  `_client_host` prefers it, falls back to XFF, then to the peer.
+- **The auth throttle is consulted only after a key has already failed.**
+  `AuthGuard` (`authguard.py`, `config.auth_guard`, 0 disables) counts invalid
+  keys per caller and answers 429 past the threshold. Ordering it after the
+  vkey lookup is the whole safety argument: a valid key is never delayed, so
+  even a completely wrong idea of the caller's address cannot lock anyone out —
+  which is exactly the trap that the XFF bug above had set. Eviction never
+  drops a currently-blocked entry, or flooding the table from fresh addresses
+  would clear your own block. It bounds *guesses*, not volume; dropping traffic
+  before it reaches the origin is the edge's job.
 - **What monitoring still cannot see.** Two things, both by design: a record
   dropped because the audit queue was full (counted in `dropped`, reported by
   `watch-failures.py`), and anything the edge answered on the proxy's behalf —

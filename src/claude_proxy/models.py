@@ -112,6 +112,18 @@ class Audit(BaseModel):
         return self.max_body_kb * 1024
 
 
+class AuthGuard(BaseModel):
+    """Throttle for repeated invalid-key attempts, per caller address.
+
+    Consulted only after a key has already failed to resolve, so it can never
+    delay an authenticated request. Set ``max_failures`` to 0 to disable.
+    """
+
+    max_failures: int = 20
+    window_seconds: int = 300
+    block_seconds: int = 300
+
+
 class AppConfig(BaseModel):
     """Top-level, hot-reloadable proxy configuration.
 
@@ -142,6 +154,7 @@ class AppConfig(BaseModel):
     timezone: str = DEFAULT_TIMEZONE
     pricing: Pricing = Field(default_factory=Pricing)
     audit: Audit = Field(default_factory=Audit)
+    auth_guard: AuthGuard = Field(default_factory=AuthGuard)
     # How long the hourly usage series is kept on disk (memory keeps ~40 days).
     usage_retention_days: int = 400
 

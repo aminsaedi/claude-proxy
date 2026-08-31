@@ -1173,6 +1173,11 @@ const CFG = [
     ["audit.max_gb", "num", "Storage cap (GB)", "If the audit DB exceeds this, the oldest records are dropped until it fits"],
     ["audit.max_body_kb", "num", "Per-body cap (KB)", "Prompts and responses are truncated past this, so one huge context can't eat the budget"],
   ] },
+  { g: "Auth throttle", rows: [
+    ["auth_guard.max_failures", "num", "Invalid keys before block", "Failed attempts from one address before it gets 429s. 0 disables the throttle. Only ever applies to requests whose key already failed, so a valid key is never delayed"],
+    ["auth_guard.window_seconds", "num", "Counting window", "Seconds the failure count accumulates over before resetting"],
+    ["auth_guard.block_seconds", "num", "Block for", "Seconds an address is refused after tripping the threshold"],
+  ] },
   { g: "Probes & timeouts", rows: [
     ["health_probe_interval_seconds", "num", "Health probe interval", "Re-probe unhealthy tokens (seconds)"],
     ["active_probe_interval_seconds", "num", "Active probe interval", "Validate the active token (seconds)"],

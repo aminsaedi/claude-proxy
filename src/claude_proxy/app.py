@@ -14,7 +14,7 @@ import httpx
 import uvicorn
 
 from . import audit as audit_mod
-from . import budgets, db, health, metrics, pricing, rotation
+from . import authguard, budgets, db, health, metrics, pricing, rotation
 from .admin_app import admin_auth_enabled, build_admin_app
 from .config import load_config
 from .proxy_app import build_proxy_app
@@ -55,6 +55,11 @@ class AppState:
         self.pricing = pricing.PricingTable(url=self.config.pricing.source_url)
         self.usage = UsageTracker(pricing=self.pricing)
         self.limits = budgets.LimitStore()
+        self.auth_guard = authguard.AuthGuard(
+            max_failures=self.config.auth_guard.max_failures,
+            window_seconds=self.config.auth_guard.window_seconds,
+            block_seconds=self.config.auth_guard.block_seconds,
+        )
         self.audit = audit_mod.AuditLog(
             audit_mod.default_path(),
             mode=self.config.audit.mode,
@@ -100,6 +105,8 @@ class AppState:
         the size budget, takes effect on the next request and the next sweep
         without a restart.
         """
+        guard = self.config.auth_guard
+        self.auth_guard.configure(guard.max_failures, guard.window_seconds, guard.block_seconds)
         cfg = self.config.audit
         self.audit.mode = cfg.mode
         self.audit.retention_days = cfg.retention_days

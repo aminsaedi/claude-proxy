@@ -41,6 +41,16 @@ OUTCOMES = Counter(
     "reaches a conclusion without landing here does not exist",
     ["outcome"],
 )
+AUTH_FAILURES = Counter(
+    "proxy_auth_failures_total",
+    "Requests rejected because the virtual key did not resolve. A sustained "
+    "non-zero rate is either a stale client or someone guessing keys",
+)
+AUTH_THROTTLED = Counter(
+    "proxy_auth_throttled_total",
+    "Invalid-key attempts refused with 429 because the caller had already "
+    "failed too often. Never incremented for an authenticated request",
+)
 LIMIT_BLOCKS = Counter(
     "proxy_limit_blocks_total",
     "Requests rejected because a virtual key was over one of its spend limits",

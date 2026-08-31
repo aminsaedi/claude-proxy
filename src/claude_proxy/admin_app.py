@@ -512,7 +512,7 @@ def build_admin_app(state) -> FastAPI:  # noqa: ANN001
     async def set_config(request: Request) -> JSONResponse:
         body = await request.json()
         merged = state.config.model_dump()
-        for section in ("auto_rotation", "pricing", "audit"):
+        for section in ("auto_rotation", "pricing", "audit", "auth_guard"):
             sub = body.get(section)
             if isinstance(sub, dict):
                 merged[section].update(sub)

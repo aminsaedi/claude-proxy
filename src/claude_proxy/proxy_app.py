@@ -146,19 +146,39 @@ def _mask(key: str) -> str:
     return key[:6] + "…" if len(key) > 7 else "…"
 
 
-def _client_host(request: Request) -> str:
-    """The caller's address, preferring what the ingress says it is.
+def _throttled_error(retry_after: int) -> JSONResponse:
+    """Anthropic's rate-limit shape, so a client's existing backoff handles it."""
+    return JSONResponse(
+        status_code=429,
+        headers={"retry-after": str(retry_after)},
+        content={"type": "error", "error": {
+            "type": "rate_limit_error",
+            "message": "too many failed authentication attempts; slow down",
+        }},
+    )
 
-    Behind Traefik + a Cloudflare Tunnel every connection appears to come from
-    a pod IP, so the direct peer address is useless for an audit trail. Trust
-    the left-most X-Forwarded-For entry — this proxy is only ever reachable
-    through that ingress, so the header is set by infrastructure we control.
+
+def _client_host(request: Request) -> str:
+    """The caller's address, preferring what the edge says it is.
+
+    `CF-Connecting-IP` first, and it has to be first. Traefik does not trust
+    cloudflared, so it *rewrites* X-Forwarded-For to its own immediate peer —
+    which is the cloudflared pod. Reading XFF therefore reported `10.42.x.y`
+    for every request that came through the tunnel, collapsing the whole
+    internet onto two pod IPs and making the audit trail useless for saying who
+    anyone was. Cloudflare sets CF-Connecting-IP at the edge and overwrites
+    whatever the client sent, so it is both correct and unspoofable here.
+
+    XFF stays as the fallback for a caller that reaches Traefik without going
+    through Cloudflare; the peer address is the last resort for in-cluster
+    callers hitting the service directly.
     """
-    fwd = request.headers.get("x-forwarded-for")
-    if fwd:
-        first = fwd.split(",")[0].strip()
-        if first:
-            return first[:64]
+    for header in ("cf-connecting-ip", "x-forwarded-for"):
+        value = request.headers.get(header)
+        if value:
+            first = value.split(",")[0].strip()
+            if first:
+                return first[:64]
     return request.client.host if request.client else "-"
 
 
@@ -463,15 +483,35 @@ def build_proxy_app(state) -> FastAPI:  # noqa: ANN001
                 key = auth[7:]
         key_name = state.vkeys.resolve(key)
         if not key_name:
-            log.warning("REJECTED %s %s /v1/%s key=%s",
-                        _client_host(request), request.method, path,
-                        _mask(key) if key else "<none>")
-            # Deliberately recorded without a body: an unauthenticated caller
-            # must not be able to write arbitrary bytes into the audit store.
+            caller = _client_host(request)
+            # The guard is consulted *only* on this branch, after the key has
+            # already failed. An authenticated request never reaches it, so a
+            # wrong idea of the caller's address can throttle an attacker but
+            # can never lock out a client holding a valid key.
+            guard = state.auth_guard
+            wait = guard.retry_after(caller)
+            if wait is None:
+                metrics.AUTH_FAILURES.inc()
+                tripped = guard.record_failure(caller)
+                if tripped is not None:
+                    log.warning("THROTTLING %s — %d invalid keys in %ds, blocking for %ds",
+                                caller, guard.max_failures, guard.window_seconds, tripped)
+                log.warning("REJECTED %s %s /v1/%s key=%s", caller, request.method, path,
+                            _mask(key) if key else "<none>")
+                # Deliberately recorded without a body: an unauthenticated caller
+                # must not be able to write arbitrary bytes into the audit store.
+                _submit(audit, _record(request, request_id, start, "", path,
+                                       status=401, outcome="rejected",
+                                       error="invalid x-api-key", t0=t0))
+                return _auth_error("invalid x-api-key")
+            metrics.AUTH_THROTTLED.inc()
             _submit(audit, _record(request, request_id, start, "", path,
-                                   status=401, outcome="rejected",
-                                   error="invalid x-api-key", t0=t0))
-            return _auth_error("invalid x-api-key")
+                                   status=429, outcome="rejected",
+                                   error="too many invalid keys", t0=t0))
+            return _throttled_error(wait)
+
+        # A caller that gets it right has nothing held against it.
+        state.auth_guard.forget(_client_host(request))
 
         now = time.time()
         breach = state.limit_breach(key_name, now)
