@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import sqlite3
+import threading
 import time
 
 import pytest
@@ -282,3 +284,76 @@ def test_clip_cuts_on_a_utf8_boundary():
     clipped.decode("utf-8")             # must not raise
     assert len(clipped) <= 15
     assert audit._clip(b"short", 100) == (b"short", False)
+
+
+# --- write contention -----------------------------------------------------
+#
+# Note the busy_timeout in these tests. `_connect` gives SQLite a 10s budget to
+# wait out a lock on its own, so a short lock never reaches our retry loop at
+# all -- a test that holds one briefly passes with or without the fix and
+# proves nothing. The production window was an admin purge whose post-delete
+# `incremental_vacuum` held the write lock for ~8 minutes, far past that
+# budget. Dropping busy_timeout to a few milliseconds reproduces "SQLite has
+# already given up" deterministically and in about a second.
+
+def _impatient(log):
+    """A writer connection that surfaces a lock instead of waiting it out."""
+    conn = log._connect()
+    conn.execute("PRAGMA busy_timeout=5")
+    return conn
+
+
+def _hold_lock_for(path, seconds):
+    """Hold an exclusive write lock, released after `seconds`, in the background."""
+    ready = threading.Event()
+
+    def run():
+        conn = sqlite3.connect(path, timeout=30)
+        conn.execute("BEGIN EXCLUSIVE")
+        ready.set()
+        time.sleep(seconds)
+        conn.rollback()
+        conn.close()
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    ready.wait(5)
+    return t
+
+
+def test_a_record_written_while_the_db_is_locked_is_kept_not_discarded(tmp_path):
+    """The failure this reproduces cost ~20 real records in production.
+
+    The writer used to catch "database is locked", log it, and throw the batch
+    away. It must instead wait for the lock to clear and still write the row.
+    """
+    log = _log(tmp_path)
+    try:
+        conn = _impatient(log)
+        holder = _hold_lock_for(tmp_path / "audit.db", 1.0)
+        log._write(conn, [_rec(request_id="held")])
+        holder.join(10)
+        assert log.write_errors == 0, "gave up on a lock that was temporary"
+        assert any(r["request_id"] == "held" for r in log.query()), \
+            "record written during the lock window was lost"
+        conn.close()
+    finally:
+        log.stop()
+
+
+def test_records_lost_to_a_permanent_lock_are_counted_by_row(tmp_path):
+    """A batch count would understate the hole; the number has to mean records."""
+    log = _log(tmp_path)
+    try:
+        conn = _impatient(log)
+        original, audit._WRITE_DEADLINE = audit._WRITE_DEADLINE, 0.0
+        holder = _hold_lock_for(tmp_path / "audit.db", 1.0)
+        try:
+            log._write(conn, [_rec(request_id=f"r{i}") for i in range(3)])
+        finally:
+            audit._WRITE_DEADLINE = original
+            holder.join(10)
+            conn.close()
+        assert log.write_errors == 3, f"counted {log.write_errors}, expected 3 rows"
+    finally:
+        log.stop()

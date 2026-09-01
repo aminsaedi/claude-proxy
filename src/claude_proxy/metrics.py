@@ -114,6 +114,11 @@ AUDIT_DROPPED = Gauge(
     "proxy_audit_records_dropped",
     "Audit records discarded because the queue was full (never blocks a request)",
 )
+AUDIT_WRITE_ERRORS = Gauge(
+    "proxy_audit_write_errors",
+    "Audit records lost because the database stayed locked past the write "
+    "deadline — the audit trail is incomplete by this many requests",
+)
 AUDIT_BYTES = Gauge(
     "proxy_audit_db_bytes",
     "On-disk size of the audit database",

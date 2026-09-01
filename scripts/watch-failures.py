@@ -7,11 +7,13 @@ hung up, a blocked budget, a bad key.
 
 Two things about this are worth knowing before you trust it.
 
-**"No output" is only good news if the audit log is whole.** A request can also
-disappear because the audit queue overflowed and dropped it. That counter is
-polled alongside the rows and reported the moment it moves, because otherwise
-silence here would be ambiguous in exactly the way that hid the original
-timeouts for weeks.
+**"No output" is only good news if the audit log is whole.** A request can
+disappear two ways: the audit queue overflowed and dropped it, or the write
+never landed because the database stayed locked (a purge's post-delete vacuum
+holds the write lock for minutes on a large file, and that is not theoretical
+— it cost ~20 records once). Both counters are polled alongside the rows and
+reported the moment either moves, because otherwise silence here would be
+ambiguous in exactly the way that hid the original timeouts for weeks.
 
 **It cannot see what never arrived.** If the edge answers on the proxy's behalf
 — a Cloudflare 524, a 502 from something in front — there is no row to find and
@@ -126,14 +128,24 @@ def main() -> int:
         top = sorted(by_source.items(), key=lambda kv: -kv[1])[:5]
         print(f"{DIM}— from: " + ", ".join(f"{s} ({n})" for s, n in top) + RST)
 
+    # Two separate ways a request can end up with no row, and they fail for
+    # different reasons: the queue overflowed (the proxy outran the disk), or
+    # the write itself never landed (the database stayed locked — a purge's
+    # vacuum is the one that has actually happened here). Either way the list
+    # above is incomplete, so both are reported and both fail --once.
     dropped = stats.get("dropped", 0)
     if dropped:
         print(f"{RED}audit dropped {dropped} record(s) — some requests have no row "
               f"at all, so this list is incomplete{RST}")
+    write_errors = stats.get("write_errors", 0)
+    if write_errors:
+        print(f"{RED}audit lost {write_errors} record(s) to write failures "
+              f"({stats.get('last_error') or 'unknown error'}) — this list is "
+              f"incomplete{RST}")
 
     if ONCE:
         real = sum(n for k, n in counts.items() if k not in BENIGN)
-        return 1 if (real or dropped) else 0
+        return 1 if (real or dropped or write_errors) else 0
 
     # Follow. `after_id` is a keyset cursor, so each poll returns only what has
     # landed since the last one however busy the proxy gets.
@@ -149,11 +161,18 @@ def main() -> int:
                 print(describe(row), flush=True)
             newest = get("/requests?limit=1")["requests"]
             cursor = max([cursor] + [r["id"] for r in newest] + [r["id"] for r in fresh])
-            now = get("/audit/stats").get("dropped", 0)
+            st = get("/audit/stats")
+            now = st.get("dropped", 0)
             if now > dropped:
                 print(f"{RED}audit dropped {now - dropped} more record(s) — "
                       f"failures may be going unrecorded{RST}", flush=True)
                 dropped = now
+            now_we = st.get("write_errors", 0)
+            if now_we > write_errors:
+                print(f"{RED}audit lost {now_we - write_errors} more record(s) to "
+                      f"write failures ({st.get('last_error') or '?'}) — "
+                      f"failures may be going unrecorded{RST}", flush=True)
+                write_errors = now_we
         except KeyboardInterrupt:
             return 0
         except (urllib.error.URLError, OSError) as e:

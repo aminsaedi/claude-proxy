@@ -217,11 +217,31 @@ Deploy with `KUBECTL_SSH=amin@mx ./scripts/rollout.sh <tag>` — it probes
   drops a currently-blocked entry, or flooding the table from fresh addresses
   would clear your own block. It bounds *guesses*, not volume; dropping traffic
   before it reaches the origin is the edge's job.
-- **What monitoring still cannot see.** Two things, both by design: a record
-  dropped because the audit queue was full (counted in `dropped`, reported by
-  `watch-failures.py`), and anything the edge answered on the proxy's behalf —
-  a Cloudflare 524 never reaches this process. A quiet watcher plus a client
-  still reporting errors means the fault is in front of the proxy.
+- **A purge holds the write lock long after it looks finished.** `AuditLog.
+  purge()` runs from the admin API on its *own* connection: the `DELETE`
+  commits in seconds, but the `_reclaim` that follows can hold the write lock
+  for **minutes** on a multi-gigabyte file — measured at ~8 minutes freeing
+  1.6GB. `_connect` gives SQLite a 10s `busy_timeout`, which is nowhere near
+  enough, so the writer thread used to catch "database is locked", log it, and
+  **discard the batch**; a real purge cost ~20 records that way. `_write` now
+  retries to `_WRITE_DEADLINE` (10 min) with backoff, bailing out early if
+  `_stop` is set so a drain cannot outlive the shutdown grace period. The queue
+  is what absorbs the stall — that is what QUEUE_MAX is for. Note the sweep is
+  *not* a source of this: it runs on the writer thread with the writer's own
+  connection, so it cannot contend with itself.
+- **Test a lock with a lock that outlasts `busy_timeout`.** A test that holds
+  the DB for a second passes with or without the retry, because SQLite quietly
+  waits it out — it proves nothing. Drop `busy_timeout` to a few milliseconds
+  to reproduce "SQLite has already given up", which is the state the writer
+  actually has to handle. Same trap in shape as the httpx-timeout one above.
+- **What monitoring still cannot see.** One thing now, by design: anything the
+  edge answered on the proxy's behalf — a Cloudflare 524 never reaches this
+  process. A quiet watcher plus a client still reporting errors means the fault
+  is in front of the proxy. The two ways a request can lose its row are both
+  counted and both reported by `watch-failures.py` (and both fail `--once`):
+  `dropped` (queue full — the proxy outran the disk) and `write_errors` (the
+  write never landed; counted in **rows**, not batches, because a batch count
+  understates the hole). `write_errors` is also `proxy_audit_write_errors`.
 
 ## What NOT to do
 

@@ -179,6 +179,7 @@ async def _audit_metrics_loop(state: AppState) -> None:
             metrics.AUDIT_QUEUED.set(state.audit.depth())
             metrics.AUDIT_WRITTEN.set(state.audit.written)
             metrics.AUDIT_DROPPED.set(state.audit.dropped)
+            metrics.AUDIT_WRITE_ERRORS.set(state.audit.write_errors)
             if state.audit.enabled:
                 stats = await asyncio.to_thread(state.audit.stats)
                 state.audit_stats = stats

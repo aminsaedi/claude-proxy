@@ -66,6 +66,16 @@ QUEUE_MAX = 4096
 FLUSH_INTERVAL = 0.5
 BATCH_MAX = 256
 
+# How long the writer keeps retrying a locked batch before conceding it is
+# lost. A purge's post-delete `incremental_vacuum` can hold the write lock for
+# *minutes* on a multi-gigabyte file, which is far longer than a couple of
+# retries would cover. Waiting is the right answer rather than a wider lock
+# budget: `submit()` never blocks on the writer, and QUEUE_MAX records is
+# hours of traffic at this volume, so the queue absorbs the stall. If it does
+# fill, those records are counted as `dropped`, which is visible.
+_WRITE_DEADLINE = 600.0
+_WRITE_BACKOFF_MAX = 5.0
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS requests (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -433,14 +443,48 @@ class AuditLog:
             return
         placeholders = ", ".join("?" * len(_COLUMNS))
         sql = f"INSERT INTO requests ({', '.join(_COLUMNS)}) VALUES ({placeholders})"
-        try:
-            with conn:
-                conn.executemany(sql, rows)
-            self.written += len(rows)
-        except Exception as e:  # noqa: BLE001 - keep serving even if audit I/O fails
-            self.write_errors += 1
-            self.last_error = str(e)
-            log.warning("Audit write failed (%d rows): %s", len(rows), e)
+        # A lock here is transient and the records are already in hand, so
+        # retry before giving up. The window that motivated this is a purge
+        # from the admin API: its DELETE commits quickly, but the
+        # `incremental_vacuum` that follows can hold the write lock for
+        # *minutes* on a multi-gigabyte file, and every batch written in that
+        # window used to be discarded outright. Sleeping the writer thread is
+        # safe -- `submit()` never blocks on it, the queue absorbs the pause,
+        # and a full queue is separately counted as `dropped`.
+        deadline = time.monotonic() + _WRITE_DEADLINE
+        backoff, attempts = 0.1, 0
+        while True:
+            attempts += 1
+            try:
+                with conn:
+                    conn.executemany(sql, rows)
+                self.written += len(rows)
+                if attempts > 1:
+                    log.info("Audit write recovered after %d attempts (%d rows)",
+                             attempts, len(rows))
+                return
+            except sqlite3.OperationalError as e:
+                if "locked" not in str(e) and "busy" not in str(e):
+                    self.last_error = str(e)
+                    break
+                self.last_error = str(e)
+            except Exception as e:  # noqa: BLE001 - keep serving even if audit I/O fails
+                self.last_error = str(e)
+                break
+            # Shutting down beats completeness: blocking here would hold the
+            # drain past the grace period and earn a SIGKILL, which loses the
+            # whole queue rather than one batch.
+            if self._stop.is_set() or time.monotonic() >= deadline:
+                break
+            time.sleep(backoff)
+            backoff = min(backoff * 2, _WRITE_BACKOFF_MAX)
+        # Conceded: these records are gone. Count the *rows* lost, not the
+        # batches -- a batch count silently understates the hole, and this
+        # number is what `watch-failures.py` and the console read to say the
+        # audit trail is incomplete.
+        self.write_errors += len(rows)
+        log.warning("Audit write failed after %d attempt(s) (%d rows lost): %s",
+                    attempts, len(rows), self.last_error)
 
     # --- retention --------------------------------------------------------
 
