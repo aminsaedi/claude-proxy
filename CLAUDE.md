@@ -142,6 +142,18 @@ Deploy with `KUBECTL_SSH=amin@mx ./scripts/rollout.sh <tag>` — it probes
   has already started the response — so the buffered path, which has no such
   cover, is capped at `_BUFFERED_RETRY_CAP` to stay inside the edge's 125s
   first-byte budget.
+- **The pod runs `ndots:1`, and that is load-bearing.** Everything it resolves
+  is an external FQDN; nothing is a short in-cluster service name. Under the
+  k8s default of `ndots:5`, `api.anthropic.com` (2 dots) is tried as a
+  *relative* name first, so every fresh connection walks the search list —
+  `…claude-proxy.svc.cluster.local`, `…svc.cluster.local`, `…cluster.local`,
+  `…forest-forel.ts.net` — and only then the absolute name: ten queries
+  counting AAAA, eight guaranteed NXDOMAIN. That amplification is why a
+  CoreDNS restart (sandbox change on `mx`, 2026-09-02) surfaced as
+  `ConnectError: [Errno -3] Temporary failure in name resolution` and reached
+  callers as a 502 three times in twelve minutes. The `dnsConfig` block in the
+  manifest is the fix; `retry_budget_seconds` is the safety net behind it, and
+  they address different halves — do not delete one because the other exists.
 - **A 429's cooldown comes from upstream, not from a guess.** Anthropic's OAuth
   429s carry no `retry-after`; they carry `anthropic-ratelimit-unified-reset`,
   an absolute epoch. Reading only the former meant the one authoritative answer

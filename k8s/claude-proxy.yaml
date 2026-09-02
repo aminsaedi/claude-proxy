@@ -94,6 +94,21 @@ spec:
       # local-path PVC binds to a node; toronto is the public front door with clean egress.
       nodeSelector:
         kubernetes.io/hostname: toronto
+      # Everything this pod resolves is an external FQDN — api.anthropic.com and
+      # the pricing source — and nothing is a short in-cluster service name.
+      # The default ndots:5 therefore costs us four guaranteed NXDOMAINs before
+      # every real lookup: `api.anthropic.com` has 2 dots, so the resolver walks
+      # the whole search list (…claude-proxy.svc.cluster.local, …svc.cluster.local,
+      # …cluster.local, …forest-forel.ts.net) as *relative* names first, and only
+      # then tries the absolute one. Ten queries per fresh connection counting
+      # AAAA, eight of them certain to fail. That storm is what turns a CoreDNS
+      # restart or one dropped UDP packet into `Temporary failure in name
+      # resolution`, which reached callers as a 502 three times in 12 minutes on
+      # 2026-09-02. ndots:1 makes the FQDN resolve on the first query.
+      dnsConfig:
+        options:
+          - name: ndots
+            value: "1"
       securityContext:
         runAsUser: 10001
         runAsGroup: 10001
