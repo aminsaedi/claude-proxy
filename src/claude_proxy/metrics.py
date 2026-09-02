@@ -89,6 +89,19 @@ FAILOVERS = Counter(
     "proxy_failovers_total",
     "Per-request failovers to an alternate token after a retryable upstream error",
 )
+RETRY_WAITS = Counter(
+    "proxy_upstream_retry_waits_total",
+    "Times every token was unavailable at once and the request waited for the "
+    "pool to recover instead of failing — each one is an error the caller "
+    "never saw",
+    ["status"],
+)
+RETRY_EXHAUSTED = Counter(
+    "proxy_upstream_retry_exhausted_total",
+    "Times the retry budget ran out and a transient upstream error reached the "
+    "caller anyway — this is the number that should stay at zero",
+    ["status"],
+)
 REQUEST_LATENCY = Histogram(
     "proxy_request_latency_seconds",
     "End-to-end request duration in seconds (for streams, until the last byte)",

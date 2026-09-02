@@ -23,13 +23,24 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from . import __version__, metrics
+from . import __version__, metrics, stores
 from .audit import Record
 
 log = logging.getLogger("claude_proxy.proxy")
 
 RETRYABLE = {429, 500, 502, 503, 529}
 MAX_ATTEMPTS = 3
+# Backoff between whole-pool retries for the retryable statuses that carry no
+# reset time of their own (500/502/503/529 and transport failures). A 429 does
+# carry one and ignores these entirely.
+_RETRY_BACKOFF_BASE = 1.0
+_RETRY_BACKOFF_MAX = 8.0
+# A buffered response has no way to tell the caller "still working", so its wait
+# is spent inside the edge's first-byte budget — measured at 125s on this zone,
+# after which Cloudflare answers 524 and the proxy never learns the request
+# existed. Streaming callers are not bound by this: `sse_keepalive_seconds`
+# starts the response immediately, so their wait is covered by comment frames.
+_BUFFERED_RETRY_CAP = 20.0
 _EXCLUDED_REQ_HEADERS = {
     "host", "x-api-key", "authorization", "content-length", "transfer-encoding",
     "accept-encoding",
@@ -227,20 +238,84 @@ def _base_upstream_headers(request: Request) -> dict[str, str]:
 
 
 def _retry_after(headers: httpx.Headers) -> float | None:
-    ra = headers.get("retry-after")
-    try:
-        return float(ra) if ra is not None else None
-    except ValueError:
-        return None
+    return stores.recovery_seconds(headers)
 
 
 async def _open_upstream(state, request: Request, path: str, body: bytes,  # noqa: ANN001
-                         base_headers: dict[str, str], order: list[str], model: str):  # noqa: ANN202
-    """Send the request upstream, failing over across tokens.
+                         base_headers: dict[str, str], order: list[str], model: str,
+                         retry_budget: float = 0.0):  # noqa: ANN202
+    """Send the request upstream, failing over across tokens and then over time.
 
     Returns ``(response, token_name, attempts, last_error)`` with the response
     left open and unread; ``response`` is None when every token was exhausted.
+
+    Failing over across tokens only helps while some token is healthy. When the
+    whole pool is briefly unavailable — every token rate-limited at once, or
+    upstream returning 529 to everyone — there is nothing left to fail over
+    *to*, and the caller used to receive the error even though the condition
+    routinely cleared within seconds. ``retry_budget`` buys the request a
+    bounded wait instead: the pool is re-read and retried until it recovers or
+    the budget runs out. Only a genuinely exhausted quota, whose reset is
+    further away than the budget, still reaches the caller — and that one is a
+    capacity problem that no amount of waiting inside the proxy can solve.
     """
+    deadline = time.monotonic() + max(0.0, retry_budget)
+    total_attempts = 0
+    round_no = 0
+    while True:
+        round_no += 1
+        upstream, used, attempts, last_error = await _try_order(
+            state, request, path, body, base_headers, order, model)
+        total_attempts += attempts
+
+        # Anything the caller can use, including a non-retryable error that
+        # would say the same thing however long we waited.
+        if upstream is not None and upstream.status_code not in RETRYABLE:
+            return upstream, used, total_attempts, last_error
+
+        wait = _recovery_wait(state, order, upstream, round_no)
+        remaining = deadline - time.monotonic()
+        if wait is None or wait > remaining:
+            if upstream is not None:
+                status = str(upstream.status_code)
+                metrics.RETRY_EXHAUSTED.labels(status=status).inc()
+                log.warning("pool exhausted: every token returned %s and recovery is "
+                            "%s away (budget %.0fs) — surfacing it",
+                            status, "unknown" if wait is None else f"{wait:.0f}s",
+                            max(0.0, retry_budget))
+            return upstream, used, total_attempts, last_error
+
+        # Worth waiting for. Drop the response we are not going to use, sleep,
+        # and re-read the pool: a token whose cooldown lapsed while we waited is
+        # only visible in a freshly computed order.
+        if upstream is not None:
+            metrics.RETRY_WAITS.labels(status=str(upstream.status_code)).inc()
+            await _close_quietly(upstream)
+        else:
+            metrics.RETRY_WAITS.labels(status="transport").inc()
+        log.info("pool exhausted, waiting %.1fs for capacity (round %d, %.0fs left)",
+                 wait, round_no, remaining)
+        await asyncio.sleep(wait)
+        order = state.tokens.failover_order()[:MAX_ATTEMPTS]
+
+
+def _recovery_wait(state, order: list[str], upstream, round_no: int) -> float | None:  # noqa: ANN001
+    """How long to wait before retrying the whole pool, or None to give up.
+
+    A 429 is the case upstream actually dates for us: ``mark_rate_limited`` has
+    just written each token's recovery time from its own headers, so the pool
+    knows when it is next worth asking. The other retryable statuses (and a
+    transport failure, where there is no response at all) carry no such hint,
+    so they get plain exponential backoff.
+    """
+    if upstream is not None and upstream.status_code == 429:
+        return state.tokens.soonest_recovery(order)
+    return min(_RETRY_BACKOFF_MAX, _RETRY_BACKOFF_BASE * (2 ** (round_no - 1)))
+
+
+async def _try_order(state, request: Request, path: str, body: bytes,  # noqa: ANN001
+                     base_headers: dict[str, str], order: list[str], model: str):  # noqa: ANN202
+    """One pass over the token order. See ``_open_upstream`` for the contract."""
     upstream = None
     used = ""
     attempts = 0
@@ -335,7 +410,8 @@ def _sse_error(message: str, etype: str = "api_error") -> bytes:
 
 async def _keepalive_stream(state, request: Request, path: str, body: bytes,  # noqa: ANN001
                             base_headers: dict[str, str], order: list[str], model: str,
-                            key_name: str, rec: Record, t0: float, keepalive: int):
+                            key_name: str, rec: Record, t0: float, keepalive: int,
+                            retry_budget: float = 0.0):
     """Hold the connection open with SSE comments, then relay the real stream.
 
     Comment frames (``: ...``) are the SSE no-op: every compliant client
@@ -344,7 +420,8 @@ async def _keepalive_stream(state, request: Request, path: str, body: bytes,  # 
     ``_stream_and_track`` would not have written itself.
     """
     task = asyncio.ensure_future(
-        _open_upstream(state, request, path, body, base_headers, order, model))
+        _open_upstream(state, request, path, body, base_headers, order, model,
+                       retry_budget=retry_budget))
     try:
         while True:
             try:
@@ -539,13 +616,14 @@ def build_proxy_app(state) -> FastAPI:  # noqa: ANN001
         # anything, which is the only way past an edge read timeout that large
         # contexts can otherwise exceed while Anthropic is still thinking. The
         # whole failover loop moves inside the response body for that case.
+        budget = float(state.config.retry_budget_seconds)
         keepalive = state.config.sse_keepalive_seconds
         if keepalive and request.method == "POST" and _wants_stream(body):
             log.info(">>> %s(%s) /v1/%s -> streaming with %ds keepalive rid=%s",
                      _client_host(request), key_name, path, keepalive, request_id)
             return StreamingResponse(
                 _keepalive_stream(state, request, path, body, base_headers, order,
-                                  model, key_name, rec, t0, keepalive),
+                                  model, key_name, rec, t0, keepalive, budget),
                 status_code=200,
                 headers={"x-proxy-request-id": request_id},
                 media_type="text/event-stream",
@@ -553,7 +631,8 @@ def build_proxy_app(state) -> FastAPI:  # noqa: ANN001
 
         try:
             upstream, used, attempts, last_error = await _open_upstream(
-                state, request, path, body, base_headers, order, model)
+                state, request, path, body, base_headers, order, model,
+                retry_budget=min(budget, _BUFFERED_RETRY_CAP))
         except asyncio.CancelledError:
             # Cancellation lands *here*, on the send, before any response object
             # or its `finally` exists. This is the case that used to leave no

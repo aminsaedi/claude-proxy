@@ -14,6 +14,43 @@ log = logging.getLogger("claude_proxy.stores")
 
 HealthStatus = Literal["unchecked", "healthy", "rate_limited", "unhealthy"]
 
+# What to assume a 429 costs us when upstream gives no usable hint at all.
+# Deliberately small: the old blind 60s treated a burst limit that clears in
+# seconds as if the whole quota were gone, which sidelined half a two-token
+# pool for a minute and turned a brief squeeze into a visible outage.
+DEFAULT_COOLDOWN = 5.0
+# Nothing upstream tells us to wait for is worth more than this; a reset that
+# far out means the window itself is exhausted, and the answer to that is
+# capacity, not patience.
+MAX_COOLDOWN = 6 * 3600.0
+
+
+def recovery_seconds(headers, now: float | None = None) -> float | None:
+    """Seconds until a rate-limited token is worth trying again, or None.
+
+    Anthropic's OAuth 429s do not carry ``retry-after``; they carry
+    ``anthropic-ratelimit-unified-reset``, an absolute epoch. Reading only the
+    former meant the one authoritative answer we already receive was thrown
+    away and replaced with a guess. Distance to that reset is also what
+    separates the two kinds of 429 without having to guess at status
+    vocabulary: seconds away is a burst limit worth waiting out, hours away is
+    an exhausted window that no amount of waiting will fix.
+    """
+    now = time.time() if now is None else now
+    ra = headers.get("retry-after")
+    if ra is not None:
+        try:
+            return max(0.0, min(float(ra), MAX_COOLDOWN))
+        except (TypeError, ValueError):
+            pass
+    reset = headers.get("anthropic-ratelimit-unified-reset")
+    if reset is not None:
+        try:
+            return max(0.0, min(float(reset) - now, MAX_COOLDOWN))
+        except (TypeError, ValueError):
+            pass
+    return None
+
 
 @dataclass
 class TokenHealth:
@@ -121,8 +158,26 @@ class TokenStore:
         h = self.health[name]
         h.status = "rate_limited"
         h.last_checked = time.time()
-        # Default cooldown of 60s if upstream gave no hint.
-        h.rate_limited_until = time.time() + (retry_after_seconds or 60.0)
+        if retry_after_seconds is None:
+            retry_after_seconds = recovery_seconds(h.headers)
+        h.rate_limited_until = time.time() + (
+            DEFAULT_COOLDOWN if retry_after_seconds is None else retry_after_seconds)
+
+    def soonest_recovery(self, names: list[str], now: float | None = None) -> float:
+        """Seconds until the first of ``names`` is usable again.
+
+        0.0 when one already is — which is the common case right after a
+        cooldown lapses, and the reason a caller should re-read
+        ``failover_order`` rather than reuse the list it started with.
+        """
+        now = time.time() if now is None else now
+        waits = []
+        for n in names:
+            h = self.health.get(n)
+            if h is None or h.status == "unhealthy":
+                continue
+            waits.append(max(0.0, h.rate_limited_until - now) if h.status == "rate_limited" else 0.0)
+        return min(waits) if waits else 0.0
 
     def mark_unhealthy(self, name: str) -> None:
         h = self.health[name]

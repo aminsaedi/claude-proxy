@@ -150,6 +150,11 @@ class AppConfig(BaseModel):
     # upstream's status is known, so an upstream failure has to arrive as an
     # in-stream `error` event rather than an HTTP status.
     sse_keepalive_seconds: int = 0
+    # How long a request may wait for the token pool to recover before the
+    # error is handed to the caller. Failover only helps while *some* token is
+    # healthy; this covers the window where none is, which upstream normally
+    # clears in seconds. 0 restores the old behaviour of failing immediately.
+    retry_budget_seconds: int = 60
     # Calendar boundaries for the daily views and for every spend limit.
     timezone: str = DEFAULT_TIMEZONE
     pricing: Pricing = Field(default_factory=Pricing)
@@ -203,4 +208,14 @@ class AppConfig(BaseModel):
         # defeat fire between two keepalives.
         if v and not (1 <= v <= 30):
             raise ValueError("sse_keepalive_seconds must be 0 (off) or between 1 and 30")
+        return v
+
+    @field_validator("retry_budget_seconds")
+    @classmethod
+    def _retry_budget(cls, v: int) -> int:
+        # The ceiling is the upstream request timeout's neighbour: waiting
+        # longer than a few minutes for capacity is indistinguishable from
+        # hanging, and the honest answer at that point is the 429.
+        if not (0 <= v <= 300):
+            raise ValueError("retry_budget_seconds must be between 0 (off) and 300")
         return v

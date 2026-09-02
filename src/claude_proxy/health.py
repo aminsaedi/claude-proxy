@@ -14,7 +14,7 @@ import time
 
 import httpx
 
-from . import metrics
+from . import metrics, stores
 from .stores import TokenStore
 
 log = logging.getLogger("claude_proxy.health")
@@ -24,13 +24,12 @@ PROBE_TIMEOUT = 30.0
 
 
 def _retry_after(headers: httpx.Headers) -> float | None:
-    ra = headers.get("retry-after")
-    if ra is not None:
-        try:
-            return float(ra)
-        except ValueError:
-            return None
-    return None
+    """Shared with the request path — see ``stores.recovery_seconds``.
+
+    The prober and the proxy must agree on how long a token stays sidelined,
+    or one of them silently overrides the other's view of the pool.
+    """
+    return stores.recovery_seconds(headers)
 
 
 def _set_health_gauge(store: TokenStore, name: str) -> None:

@@ -124,6 +124,35 @@ Deploy with `KUBECTL_SSH=amin@mx ./scripts/rollout.sh <tag>` — it probes
   token in `TokenStore.failover_order` before the client sees an error, up to
   `MAX_ATTEMPTS = 3` tokens. 429 marks a token *rate_limited* (recoverable),
   401/403 marks it *unhealthy* (dead) — these are distinct.
+- **Failover across tokens is only half of it; the other half is across time.**
+  Failing over helps while *some* token is healthy. When the whole pool is
+  briefly unusable — every token 429 at once, or upstream 529ing everyone —
+  there is nothing to fail over *to*, and the caller used to get the error even
+  though the condition normally cleared within seconds. That is exactly what
+  users reported as "an API error that recovers by itself": four requests in
+  one 42s window, each with `attempts: 2` (the whole two-token pool), and the
+  client's own retry succeeded moments later. `config.retry_budget_seconds`
+  (default 60, 0 disables) buys a bounded wait instead — `_open_upstream` re-
+  reads `failover_order` and retries until the pool recovers or the budget runs
+  out. **Anything a client's own retry would have fixed, the proxy fixes
+  first.** What still reaches the caller is the genuinely exhausted window
+  whose reset is further away than the budget; that one is a capacity problem,
+  and `proxy_upstream_retry_exhausted_total` is the number that should stay at
+  zero. Streaming callers pay nothing for the wait — `sse_keepalive_seconds`
+  has already started the response — so the buffered path, which has no such
+  cover, is capped at `_BUFFERED_RETRY_CAP` to stay inside the edge's 125s
+  first-byte budget.
+- **A 429's cooldown comes from upstream, not from a guess.** Anthropic's OAuth
+  429s carry no `retry-after`; they carry `anthropic-ratelimit-unified-reset`,
+  an absolute epoch. Reading only the former meant the one authoritative answer
+  we already receive was discarded in favour of a blind 60s, which parked a
+  token for a full minute over a burst limit that cleared in ~3s — with two
+  tokens that is a guaranteed hole in capacity far longer than the limit it was
+  reacting to. `stores.recovery_seconds` is the single reader of both headers,
+  shared by the request path and the prober so they cannot disagree about what
+  the pool looks like. Distance to that reset is also what separates the two
+  kinds of 429 without guessing at status vocabulary: seconds away is a burst
+  limit worth waiting out, hours away is a spent window that waiting cannot fix.
 - **Rotation**: switches the active token on high 5h utilization OR when it's
   unusable; an unusable active token fails over regardless of `target_max_util_5h`.
 - **Usage**: parsed from SSE (`message_start` for input+cache, `message_delta` for
@@ -252,6 +281,13 @@ Deploy with `KUBECTL_SSH=amin@mx ./scripts/rollout.sh <tag>` — it probes
 - Do not add per-file bind mounts for the data files — SQLite creates `-wal` and
   `-shm` siblings next to each DB, so the `data/` **directory** must be mounted.
 - Do not revert usage tracking to input/output only — cache tokens dominate real spend.
+- Do not "simplify" a pool-wide retryable failure back into an immediate error,
+  and do not restore a fixed cooldown for a 429. Both were measured causing
+  user-visible errors that cleared on their own seconds later. A test for
+  either must assert against the *caller's* status, not the token's health —
+  the two halves live in different modules (`proxy_app._retry_after` and
+  `stores.mark_rate_limited`), so reverting one and finding the test still
+  green proves only that the other one covered for it.
 - Do not make the usage flush replace-all again, and do not point the liveness
   probe at `/healthz` — both quietly break zero-downtime rollouts.
 - Do not do audit work on the event loop (no compression, no JSON encoding, no

@@ -97,6 +97,10 @@ async def test_retryable_exhausted_passes_through_last_status():
         return httpx.Response(529, json={"error": "overloaded"})
 
     state = _make_state(handler)
+    # This test is about what the caller gets once we have *stopped* retrying;
+    # the waiting itself is covered below. Without pinning the budget it would
+    # sit through it first and assert the same thing 20s later.
+    state.config.retry_budget_seconds = 0
     app = build_proxy_app(state)
     async with _asgi(app) as ac:
         r = await ac.post("/v1/messages", headers={"x-api-key": "vk-alice"}, json={"model": "m"})
@@ -158,6 +162,7 @@ async def test_connection_errors_everywhere_return_502():
         raise httpx.ConnectError("boom")
 
     state = _make_state(handler)
+    state.config.retry_budget_seconds = 0  # see above: the give-up path, not the wait
     app = build_proxy_app(state)
     async with _asgi(app) as ac:
         r = await ac.post("/v1/messages", headers={"x-api-key": "vk-alice"}, json={"model": "m"})
@@ -460,6 +465,7 @@ async def test_keepalive_reports_total_upstream_failure_in_band(tmp_path):
 
     state = _audited(handler, tmp_path)
     state.config.sse_keepalive_seconds = 1
+    state.config.retry_budget_seconds = 0  # see above: the give-up path, not the wait
     app = build_proxy_app(state)
     try:
         async with _asgi(app) as ac:
@@ -671,3 +677,126 @@ async def test_a_buffered_answer_to_a_caller_who_left_is_not_recorded_as_ok(tmp_
         assert row["input_tokens"] == 12 and row["output_tokens"] == 34, row
     finally:
         await state.client.aclose()
+
+
+# =====================================================================
+# Waiting out a pool-wide outage
+#
+# Failing over across tokens only helps while some token is healthy. These
+# cover the window where none is -- the shape that reached real users as a
+# 429 that "recovered by itself a few seconds later", which is precisely a
+# window the proxy could have waited out on their behalf.
+# =====================================================================
+
+
+async def test_a_pool_wide_429_is_waited_out_instead_of_reaching_the_caller():
+    """The production incident, reproduced: every token 429s, then recovers.
+
+    Four requests failed this way in one 42s window with `attempts: 2` -- the
+    whole two-token pool -- and the client's own retry succeeded shortly after.
+    Anything the client's retry would have fixed, the proxy can fix without
+    ever showing an error.
+    """
+    calls = []
+
+    def handler(request):
+        calls.append(time.monotonic())
+        # Rate-limited until the third attempt, exactly like a burst limit
+        # clearing on its own. `retry-after` is deliberately absent: Anthropic's
+        # OAuth 429s carry the reset as an absolute epoch instead.
+        if len(calls) <= 2:
+            return httpx.Response(429, headers={
+                "anthropic-ratelimit-unified-reset": str(int(time.time()) + 1),
+            }, json={"type": "error", "error": {"type": "rate_limit_error"}})
+        return httpx.Response(200, json={"model": "m", "usage": {"input_tokens": 1,
+                                                                 "output_tokens": 1}})
+
+    state = _make_state(handler)
+    state.config.retry_budget_seconds = 30
+    app = build_proxy_app(state)
+    async with _asgi(app) as ac:
+        r = await ac.post("/v1/messages", headers={"x-api-key": "vk-alice"},
+                          json={"model": "m"})
+    assert r.status_code == 200, "a recoverable pool-wide 429 reached the caller"
+    assert len(calls) > 2, "gave up without retrying the pool"
+    await state.client.aclose()
+
+
+async def test_the_wait_is_bounded_by_the_budget():
+    """Waiting must not become hanging: past the budget the caller gets the 429.
+
+    An exhausted 5h window resets hours away, and no amount of patience inside
+    the proxy will change that -- the honest answer is the rate-limit error, so
+    the client's own backoff can take over.
+    """
+    def handler(request):
+        return httpx.Response(429, headers={
+            # Hours out: a spent window, not a burst limit.
+            "anthropic-ratelimit-unified-reset": str(int(time.time()) + 7200),
+        }, json={"type": "error", "error": {"type": "rate_limit_error"}})
+
+    state = _make_state(handler)
+    state.config.retry_budget_seconds = 30
+    app = build_proxy_app(state)
+    started = time.monotonic()
+    async with _asgi(app) as ac:
+        r = await ac.post("/v1/messages", headers={"x-api-key": "vk-alice"},
+                          json={"model": "m"})
+    elapsed = time.monotonic() - started
+    assert r.status_code == 429
+    # It must not have waited at all: the reset is further away than the budget,
+    # so there was never a point at which retrying could have helped.
+    assert elapsed < 5, f"waited {elapsed:.1f}s for a reset that was hours away"
+    await state.client.aclose()
+
+
+async def test_a_recovering_5xx_is_also_waited_out():
+    """529 is Anthropic's 'overloaded', and it clears on its own too.
+
+    The user's requirement is that no transient error reaches them, not that no
+    *429* does, so the retry covers every retryable status. These carry no reset
+    time, hence the plain backoff.
+    """
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        if len(calls) <= 2:
+            return httpx.Response(529, json={"type": "error",
+                                             "error": {"type": "overloaded_error"}})
+        return httpx.Response(200, json={"model": "m", "usage": {"input_tokens": 1,
+                                                                 "output_tokens": 1}})
+
+    state = _make_state(handler)
+    state.config.retry_budget_seconds = 30
+    app = build_proxy_app(state)
+    async with _asgi(app) as ac:
+        r = await ac.post("/v1/messages", headers={"x-api-key": "vk-alice"},
+                          json={"model": "m"})
+    assert r.status_code == 200, "a recovering 529 reached the caller"
+    await state.client.aclose()
+
+
+async def test_a_burst_429_no_longer_sidelines_a_token_for_a_minute():
+    """The blind 60s cooldown was half the outage, not just a detail.
+
+    A 429 with no `retry-after` used to park the token for a flat minute. With
+    a two-token pool that is a guaranteed hole in capacity far longer than the
+    limit it was reacting to; upstream had told us the real reset all along.
+    """
+    reset = int(time.time()) + 3
+
+    def handler(request):
+        return httpx.Response(429, headers={
+            "anthropic-ratelimit-unified-reset": str(reset),
+        }, json={"type": "error", "error": {"type": "rate_limit_error"}})
+
+    state = _make_state(handler)
+    state.config.retry_budget_seconds = 0
+    app = build_proxy_app(state)
+    async with _asgi(app) as ac:
+        await ac.post("/v1/messages", headers={"x-api-key": "vk-alice"}, json={"model": "m"})
+    until = state.tokens.health["a"].rate_limited_until
+    assert until - time.time() < 10, (
+        f"token parked for {until - time.time():.0f}s when upstream said ~3s")
+    await state.client.aclose()
