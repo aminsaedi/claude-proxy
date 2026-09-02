@@ -800,3 +800,33 @@ async def test_a_burst_429_no_longer_sidelines_a_token_for_a_minute():
     assert until - time.time() < 10, (
         f"token parked for {until - time.time():.0f}s when upstream said ~3s")
     await state.client.aclose()
+
+
+async def test_a_transient_dns_failure_is_retried_rather_than_surfaced():
+    """Observed in production: `ConnectError: [Errno -3] Temporary failure in
+    name resolution`, 0.7s, never forwarded.
+
+    A DNS blip inside the pod is the same shape of problem as a pool-wide 429 --
+    nothing is wrong with the request, and it works moments later -- but it
+    arrives as a transport error with no response and no reset hint, so it takes
+    the backoff path rather than the header-driven one. Worth pinning
+    separately: `upstream is None` is a different branch from "every token
+    answered", and it is the branch a caller reaches as a 502.
+    """
+    calls = []
+
+    def handler(request):
+        calls.append(1)
+        if len(calls) <= 2:
+            raise httpx.ConnectError("[Errno -3] Temporary failure in name resolution")
+        return httpx.Response(200, json={"model": "m", "usage": {"input_tokens": 1,
+                                                                 "output_tokens": 1}})
+
+    state = _make_state(handler)
+    state.config.retry_budget_seconds = 30
+    app = build_proxy_app(state)
+    async with _asgi(app) as ac:
+        r = await ac.post("/v1/messages", headers={"x-api-key": "vk-alice"},
+                          json={"model": "m"})
+    assert r.status_code == 200, "a transient DNS failure reached the caller as a 502"
+    await state.client.aclose()
