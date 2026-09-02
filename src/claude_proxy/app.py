@@ -208,7 +208,8 @@ async def main() -> None:
             "Relying on network isolation (Tailscale) alone."
         )
 
-    timeout = httpx.Timeout(float(state.config.upstream_timeout_seconds), connect=10.0)
+    timeout = httpx.Timeout(float(state.config.upstream_timeout_seconds),
+                            connect=float(state.config.upstream_connect_timeout_seconds))
     state.client = httpx.AsyncClient(base_url=UPSTREAM, timeout=timeout, limits=POOL_LIMITS)
     state.probe_client = state.client
 

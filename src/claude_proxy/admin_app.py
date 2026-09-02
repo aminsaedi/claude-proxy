@@ -518,7 +518,8 @@ def build_admin_app(state) -> FastAPI:  # noqa: ANN001
                 merged[section].update(sub)
         for k in ("health_probe_interval_seconds", "active_probe_interval_seconds",
                   "upstream_timeout_seconds", "sse_keepalive_seconds", "timezone",
-                  "retry_budget_seconds", "usage_retention_days"):
+                  "retry_budget_seconds", "upstream_connect_timeout_seconds",
+                  "usage_retention_days"):
             if k in body:
                 merged[k] = body[k]
         try:

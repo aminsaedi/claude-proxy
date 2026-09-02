@@ -155,6 +155,13 @@ class AppConfig(BaseModel):
     # healthy; this covers the window where none is, which upstream normally
     # clears in seconds. 0 restores the old behaviour of failing immediately.
     retry_budget_seconds: int = 60
+    # How long to wait for the TCP connection itself. This is not a throughput
+    # setting — it is how fast a dead path is *detected*, and therefore how many
+    # retries fit inside retry_budget_seconds. At the old 10s a single round
+    # across a two-token pool spent the entire buffered budget, so a connect
+    # failure got no retry at all. A handshake to Anthropic's edge is well under
+    # a second in practice; 5s is already generous.
+    upstream_connect_timeout_seconds: int = 5
     # Calendar boundaries for the daily views and for every spend limit.
     timezone: str = DEFAULT_TIMEZONE
     pricing: Pricing = Field(default_factory=Pricing)
@@ -208,6 +215,13 @@ class AppConfig(BaseModel):
         # defeat fire between two keepalives.
         if v and not (1 <= v <= 30):
             raise ValueError("sse_keepalive_seconds must be 0 (off) or between 1 and 30")
+        return v
+
+    @field_validator("upstream_connect_timeout_seconds")
+    @classmethod
+    def _connect_timeout(cls, v: int) -> int:
+        if not (1 <= v <= 60):
+            raise ValueError("upstream_connect_timeout_seconds must be between 1 and 60")
         return v
 
     @field_validator("retry_budget_seconds")
