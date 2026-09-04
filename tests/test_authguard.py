@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import httpx
 from starlette.requests import Request
-from tests.test_proxy import _asgi, _make_state
 
 from claude_proxy.authguard import AuthGuard
 from claude_proxy.proxy_app import _client_host, build_proxy_app
+from test_proxy import _asgi, _make_state
 
 
 def _guard(**kw):
