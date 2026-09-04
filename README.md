@@ -89,6 +89,39 @@ ANTHROPIC_API_KEY=vk-alice-secret-key \
   claude ...
 ```
 
+## Troubleshooting: long waits on large contexts
+
+Both failure modes below look identical from the client — a big session starts
+erroring while a small one is fine — and neither is the proxy misbehaving. At
+300-400k tokens Anthropic can stay silent for a long time before the first
+token, and everything with a clock on it reacts to that silence.
+
+**`499` — the caller hung up.** The client gave up before the answer arrived.
+Claude Code caps each request at roughly five minutes unless told otherwise,
+which a large-context turn can exceed. Nothing on this side can prevent it: a
+server cannot stop a client from disconnecting. Raise the cap on the machine
+running `claude`, in `~/.claude/settings.json`:
+
+```json
+{ "env": { "API_TIMEOUT_MS": "1800000" } }
+```
+
+Write the number plainly — `1e6` and `64_000` are accepted but were misparsed
+before v2.1.211, which sets a far *smaller* timeout and makes things worse. The
+setting is read at startup, so restart `claude`. Confirm the diagnosis first
+with `GET /requests?outcome=aborted`: an `aborted` row whose `error` reads
+`while waiting for upstream` is the client leaving mid-request, and its
+`latency_ms` will cluster at whatever cap is in force.
+
+**`504`/`524` — the edge gave up.** Only when something sits in front of the
+proxy. Cloudflare budgets the origin ~125s to produce the *first byte* (not to
+finish), and a long silent head blows it. `sse_keepalive_seconds` (15 in prod)
+answers `200 text/event-stream` immediately and emits SSE comment frames while
+the failover loop runs behind it, so the edge clock never starts; see the
+`sse_keepalive_seconds` note in CLAUDE.md for the trade-off it makes. A request
+killed at the edge may never reach the origin at all, so absence of an audit row
+is itself the signal — distinct from the 499 case, which always leaves one.
+
 ## Admin console
 
 Open `http://<tailscale-ip>:8090` or
