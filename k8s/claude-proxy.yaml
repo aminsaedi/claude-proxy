@@ -272,3 +272,37 @@ spec:
   selector:
     matchLabels:
       app: claude-proxy
+---
+# PATH C — direct to the internet, no CDN, no tunnel.
+#   client -> 159.89.115.233:443 -> traefik `public-edge` (toronto) -> this pod
+#
+# Runs ALONGSIDE the Path B ingress above; the two are independent front doors
+# onto the same Service and can be used interchangeably. Path C suits this
+# service particularly well: SSE streaming with no extra hop, and no 100 MB
+# Cloudflare body cap on large prompt payloads.
+#
+# No tls: block is needed — the public edge serves the shared *.aminsaedi.com
+# cert from its default TLSStore. Baseline rate limiting and security headers
+# are applied at the edge entrypoint automatically.
+#
+# ⚠️ port 8080 (proxy, virtual-API-key authenticated) ONLY.
+#    NEVER expose 8090 here: the admin console runs without auth by design and
+#    is reachable on the tailnet only, via the claude-proxy-admin Service.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: claude-proxy-direct
+  namespace: claude-proxy
+spec:
+  ingressClassName: public-edge
+  rules:
+    - host: claude-direct.aminsaedi.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: claude-proxy
+                port:
+                  number: 8080
