@@ -89,12 +89,13 @@ ANTHROPIC_API_KEY=vk-alice-secret-key \
   claude ...
 ```
 
-## Troubleshooting: long waits on large contexts
+## Troubleshooting: requests that die after a long wait
 
-Both failure modes below look identical from the client — a big session starts
-erroring while a small one is fine — and neither is the proxy misbehaving. At
-300-400k tokens Anthropic can stay silent for a long time before the first
-token, and everything with a clock on it reacts to that silence.
+Three failure modes, all of which reach the client as one unhelpful error after
+a long pause. The first two are about *silence*: at 300-400k tokens Anthropic
+can take a long time to produce the first token, and everything with a clock on
+it reacts to that. The third is about *capacity* and has nothing to do with
+context size — telling them apart starts with how long the client waited.
 
 **`499` — the caller hung up.** The client gave up before the answer arrived.
 Claude Code caps each request at roughly five minutes unless told otherwise,
@@ -121,6 +122,36 @@ the failover loop runs behind it, so the edge clock never starts; see the
 `sse_keepalive_seconds` note in CLAUDE.md for the trade-off it makes. A request
 killed at the edge may never reach the origin at all, so absence of an audit row
 is itself the signal — distinct from the 499 case, which always leaves one.
+
+**Failing at ~`retry_budget_seconds` — the pool was empty.** The tell is the
+duration: a request that dies at almost exactly `retry_budget_seconds` (60 by
+default) waited the entire budget and never found a usable token. This is *not*
+a large-context problem — it hits trivial requests just as hard, which is what
+distinguishes it from the two modes above.
+
+Failing over across tokens only helps while some token is healthy. When every
+token is rate-limited at once, there is nothing to fail over to, so
+`_open_upstream` re-reads the pool and waits — but only until the budget runs
+out. A two-token pool has no depth: one burst limit removes half the capacity,
+and two removes all of it.
+
+Confirm with `proxy_upstream_retry_exhausted_total`, which is meant to sit at
+zero, or `GET /requests?failed=1`. Then, in order of effect:
+
+1. **Add tokens.** The only change that raises real throughput. Everything else
+   just waits longer for the same scarce capacity.
+2. **Raise `retry_budget_seconds`** (validator allows up to 300) via `POST
+   /config` on the admin app. For streaming callers this is nearly free —
+   `sse_keepalive_seconds` has already committed the response, so no edge clock
+   is running and the caller sees keepalive frames while the pool recovers. The
+   buffered path is separately capped at `_BUFFERED_RETRY_CAP` (20s) and is
+   unaffected, so raising this cannot blow the edge's first-byte budget.
+
+Note this is a runtime setting held in the config table, not in the manifest or
+the source default — editing the repo does not change a running deployment.
+
+Clients can do nothing about this one except retry; these windows usually clear
+in seconds.
 
 ## Admin console
 
